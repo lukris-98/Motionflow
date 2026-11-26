@@ -20,6 +20,7 @@ import android.opengl.GLES20
 import android.opengl.GLUtils
 import android.os.Build
 import android.os.Environment
+import android.provider.DocumentsContract
 import android.provider.MediaStore
 import android.util.Base64
 import android.view.Surface
@@ -54,6 +55,7 @@ class NativeMp4Exporter(
     private var totalFrames = 0
     private var outFile: File? = null
     private var outputName: String = "MotionFlow_Export.mp4"
+    private var customOutputUri: Uri? = null
 
     @Volatile
     private var cancelled = false
@@ -89,7 +91,8 @@ class NativeMp4Exporter(
         bitrateMbps: Int,
         totalFrames: Int,
         includeAudio: Boolean,
-        fileName: String
+        fileName: String,
+        customUri: Uri? = null
     ) {
         cleanup()
         cancelled = false
@@ -100,6 +103,7 @@ class NativeMp4Exporter(
         this.totalFrames = totalFrames.coerceAtLeast(1)
         this.hasAudio = includeAudio
         this.outputName = if (fileName.endsWith(".mp4", ignoreCase = true)) fileName else "$fileName.mp4"
+        this.customOutputUri = customUri
 
         exportsDir.mkdirs()
         val tempFile = File(exportsDir, "export_${System.currentTimeMillis()}.mp4")
@@ -240,12 +244,27 @@ class NativeMp4Exporter(
         val internalFile = outFile ?: throw IllegalStateException("No output file")
         releaseCodecsOnly()
 
-        val savedUri = saveToPublicMovies(internalFile, outputName)
+        val targetCustomUri = customOutputUri
+        customOutputUri = null
+
+        var isCustomLocation = false
+        var savedUri: Uri? = null
+        if (targetCustomUri != null) {
+            savedUri = writeToCustomUri(internalFile, targetCustomUri)
+            if (savedUri != null) {
+                isCustomLocation = true
+            }
+        }
+        if (savedUri == null) {
+            savedUri = saveToPublicMovies(internalFile, outputName)
+        }
+
         return JSONObject().apply {
             put("fileName", outputName)
             put("internalUrl", "https://${MediaStorageHelper.APP_HOST}/exports/${internalFile.name}")
             put("internalPath", internalFile.absolutePath)
             put("contentUri", savedUri?.toString() ?: "")
+            put("isCustomLocation", isCustomLocation)
             put("sizeBytes", internalFile.length())
         }
     }
@@ -254,8 +273,15 @@ class NativeMp4Exporter(
     fun cancel() {
         cancelled = true
         val f = outFile
+        val pendingUri = customOutputUri
+        customOutputUri = null
         cleanup()
         f?.delete()
+        if (pendingUri != null) {
+            try {
+                DocumentsContract.deleteDocument(context.contentResolver, pendingUri)
+            } catch (_: Exception) {}
+        }
     }
 
     private fun drainVideoEncoder(encoder: MediaCodec, endOfStream: Boolean) {
@@ -352,6 +378,17 @@ class NativeMp4Exporter(
                 if (audioTrackIndex >= 0) m.writeSampleData(audioTrackIndex, ByteBuffer.wrap(s.data), s.info)
             }
             pendingAudioSamples.clear()
+        }
+    }
+
+    private fun writeToCustomUri(source: File, targetUri: Uri): Uri? {
+        return try {
+            context.contentResolver.openOutputStream(targetUri, "wt")?.use { out ->
+                FileInputStream(source).use { inp -> inp.copyTo(out) }
+            } ?: return null
+            targetUri
+        } catch (_: Exception) {
+            null
         }
     }
 

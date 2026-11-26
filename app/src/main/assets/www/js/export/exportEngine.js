@@ -75,7 +75,19 @@ export class ExportEngine {
     }
   }
 
-  async exportProject({ project, mediaMap, resPreset, fps, quality, includeAudio, trimTrailingEmpty = true, fileName, onProgress }) {
+  async exportProject({
+    project,
+    mediaMap,
+    resPreset,
+    fps,
+    quality,
+    includeAudio,
+    trimTrailingEmpty = true,
+    fileName,
+    customUri = '',
+    fileHandle = null,
+    onProgress
+  }) {
     this.cancelled = false;
     const safeFps = Math.max(12, Math.min(60, Math.round(Number(fps) || 30)));
     const { width, height } = this.computeOutputDimensions(project, resPreset);
@@ -86,7 +98,8 @@ export class ExportEngine {
       1,
       Math.round((effProjectFrames / (project.fps || 30)) * safeFps)
     );
-    const safeName = (fileName || `${project.name || 'MotionFlow'}.mp4`).replace(/[\\/:*?"<>|]/g, '_');
+    const baseName = (fileName || `${project.name || 'MotionFlow'}.mp4`).replace(/[\\/:*?"<>|]/g, '_');
+    const safeName = /\.mp4$/i.test(baseName) ? baseName : `${baseName}.mp4`;
 
     const offscreen = document.createElement('canvas');
     offscreen.width = width;
@@ -108,7 +121,8 @@ export class ExportEngine {
             bitrateMbps,
             totalFrames: totalExportFrames,
             includeAudio: Boolean(pcmBase64),
-            fileName: safeName
+            fileName: safeName,
+            customUri: customUri || ''
           })
         )
       );
@@ -152,10 +166,21 @@ export class ExportEngine {
     }
 
     // Browser fallback (WebM via MediaRecorder if tested outside Android WebView)
-    return this.exportWebFallback({ project, mediaMap, offscreen, width, height, fps, totalExportFrames, fileName, onProgress });
+    return this.exportWebFallback({
+      project,
+      mediaMap,
+      offscreen,
+      width,
+      height,
+      fps: safeFps,
+      totalExportFrames,
+      fileName: safeName,
+      fileHandle,
+      onProgress
+    });
   }
 
-  async exportWebFallback({ project, mediaMap, offscreen, width, height, fps, totalExportFrames, fileName, onProgress }) {
+  async exportWebFallback({ project, mediaMap, offscreen, width, height, fps, totalExportFrames, fileName, fileHandle = null, onProgress }) {
     const stream = offscreen.captureStream(fps);
     const mimeType = typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported?.('video/webm')
       ? 'video/webm'
@@ -166,18 +191,31 @@ export class ExportEngine {
       if (e.data && e.data.size > 0) chunks.push(e.data);
     };
     const donePromise = new Promise((resolve) => {
-      recorder.onstop = () => {
+      recorder.onstop = async () => {
         const blob = new Blob(chunks, { type: 'video/webm' });
+        const outName = (fileName || 'MotionFlow_Export').replace(/\.mp4$/i, '.webm');
+        let savedCustom = false;
+        if (fileHandle && typeof fileHandle.createWritable === 'function') {
+          try {
+            const writable = await fileHandle.createWritable();
+            await writable.write(blob);
+            await writable.close();
+            savedCustom = true;
+          } catch {}
+        }
         const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = (fileName || 'MotionFlow_Export').replace(/\.mp4$/i, '.webm');
-        a.click();
+        if (!savedCustom) {
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = outName;
+          a.click();
+        }
         resolve({
-          fileName: a.download,
+          fileName: fileHandle?.name || outName,
           sizeBytes: blob.size,
           internalPath: '',
-          contentUri: url
+          contentUri: url,
+          isCustomLocation: savedCustom
         });
       };
     });

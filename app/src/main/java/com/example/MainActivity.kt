@@ -11,6 +11,8 @@ import android.media.MediaMetadataRetriever
 import android.media.MediaRecorder
 import android.net.Uri
 import android.os.Bundle
+import android.provider.DocumentsContract
+import android.provider.OpenableColumns
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.view.ViewGroup
@@ -50,6 +52,7 @@ import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.io.FileInputStream
 import java.io.RandomAccessFile
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -63,6 +66,9 @@ class MainActivity : ComponentActivity() {
     private lateinit var mp4Exporter: NativeMp4Exporter
     private var webView: WebView? = null
     private var pendingJsonToExport: String? = null
+    private var selectedExportUri: Uri? = null
+    private var selectedExportDisplayName: String = ""
+    private var pendingInternalSavePath: String? = null
     private val isRecordingVoiceover = AtomicBoolean(false)
     private var voiceoverJob: Job? = null
     private var textToSpeech: TextToSpeech? = null
@@ -138,6 +144,73 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    private val pickExportLocationLauncher = registerForActivityResult(
+        ActivityResultContracts.CreateDocument("video/mp4")
+    ) { uri ->
+        if (uri != null) {
+            val prev = selectedExportUri
+            if (prev != null && prev != uri) {
+                try { DocumentsContract.deleteDocument(contentResolver, prev) } catch (_: Exception) {}
+            }
+            selectedExportUri = uri
+            val name = queryDisplayName(uri)
+            selectedExportDisplayName = name
+            val payload = JSONObject().apply {
+                put("uri", uri.toString())
+                put("displayName", name)
+            }.toString()
+            evalJs("window.__mfNative && window.__mfNative.onExportLocationPicked && window.__mfNative.onExportLocationPicked($payload);")
+        }
+    }
+
+    private val saveExportedAsLauncher = registerForActivityResult(
+        ActivityResultContracts.CreateDocument("video/mp4")
+    ) { uri ->
+        val srcPath = pendingInternalSavePath
+        pendingInternalSavePath = null
+        if (uri == null || srcPath.isNullOrBlank()) return@registerForActivityResult
+        ioScope.launch(Dispatchers.IO) {
+            var ok = false
+            var errMsg = ""
+            try {
+                val srcFile = File(srcPath)
+                if (srcFile.exists()) {
+                    contentResolver.openOutputStream(uri, "wt")?.use { out ->
+                        FileInputStream(srcFile).use { inp -> inp.copyTo(out) }
+                    }
+                    ok = true
+                } else {
+                    errMsg = "Exported file missing"
+                }
+            } catch (e: Exception) {
+                errMsg = e.message ?: "Save failed"
+            }
+            val displayName = queryDisplayName(uri)
+            val payload = JSONObject().apply {
+                put("ok", ok)
+                put("uri", uri.toString())
+                put("displayName", displayName)
+                put("error", errMsg)
+            }.toString()
+            withContext(Dispatchers.Main) {
+                evalJs("window.__mfNative && window.__mfNative.onExportSavedToLocation && window.__mfNative.onExportSavedToLocation($payload);")
+            }
+        }
+    }
+
+    private fun queryDisplayName(uri: Uri): String {
+        var result = ""
+        try {
+            contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val idx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    if (idx >= 0) result = cursor.getString(idx) ?: ""
+                }
+            }
+        } catch (_: Exception) {}
+        return result.ifBlank { uri.lastPathSegment?.substringAfterLast('/') ?: "MotionFlow_Export.mp4" }
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -547,9 +620,52 @@ class MainActivity : ComponentActivity() {
         }
 
         @JavascriptInterface
+        fun pickExportLocation(suggestedName: String) {
+            runOnUiThread {
+                val safeName = if (suggestedName.endsWith(".mp4", ignoreCase = true)) {
+                    suggestedName
+                } else {
+                    "${suggestedName.ifBlank { "MotionFlow_Export" }}.mp4"
+                }
+                pickExportLocationLauncher.launch(safeName)
+            }
+        }
+
+        @JavascriptInterface
+        fun clearExportLocation() {
+            val prev = selectedExportUri
+            selectedExportUri = null
+            selectedExportDisplayName = ""
+            if (prev != null) {
+                ioScope.launch(Dispatchers.IO) {
+                    try { DocumentsContract.deleteDocument(contentResolver, prev) } catch (_: Exception) {}
+                }
+            }
+        }
+
+        @JavascriptInterface
+        fun saveExportToLocation(internalPath: String, suggestedName: String) {
+            runOnUiThread {
+                pendingInternalSavePath = internalPath
+                val safeName = if (suggestedName.endsWith(".mp4", ignoreCase = true)) {
+                    suggestedName
+                } else {
+                    "${suggestedName.ifBlank { "MotionFlow_Export" }}.mp4"
+                }
+                saveExportedAsLauncher.launch(safeName)
+            }
+        }
+
+        @JavascriptInterface
         fun startVideoExport(configJson: String): String {
             return try {
                 val cfg = JSONObject(configJson)
+                val customUriStr = cfg.optString("customUri", "")
+                val targetUri = if (customUriStr.isNotBlank()) Uri.parse(customUriStr) else null
+                if (targetUri == null) {
+                    selectedExportUri = null
+                    selectedExportDisplayName = ""
+                }
                 mp4Exporter.begin(
                     reqWidth = cfg.optInt("width", 1280),
                     reqHeight = cfg.optInt("height", 720),
@@ -557,7 +673,8 @@ class MainActivity : ComponentActivity() {
                     bitrateMbps = cfg.optInt("bitrateMbps", 8),
                     totalFrames = cfg.optInt("totalFrames", 150),
                     includeAudio = cfg.optBoolean("includeAudio", false),
-                    fileName = cfg.optString("fileName", "MotionFlow_Export.mp4")
+                    fileName = cfg.optString("fileName", "MotionFlow_Export.mp4"),
+                    customUri = targetUri
                 )
                 JSONObject().put("ok", true).toString()
             } catch (e: Exception) {

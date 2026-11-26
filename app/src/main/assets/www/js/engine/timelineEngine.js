@@ -29,6 +29,7 @@ export function createBaseLayer(type, name, project, overrides = {}) {
     speedCurve: overrides.speedCurve || 'none',
     visible: true,
     locked: false,
+    trackCompact: Boolean(overrides.trackCompact),
     transform: {
       x: 0,
       y: 0,
@@ -186,6 +187,19 @@ export const TimelineEngine = {
     });
   },
 
+  createAdjustmentLayer(project, startFrame = 0) {
+    const fps = project.fps || 30;
+    const avail = Math.max(15, (project.durationFrames || fps * 4) - startFrame);
+    const len = Math.min(avail, fps * 4);
+    return createBaseLayer('adjustment', 'Adjustment FX', project, {
+      trackRole: 'overlay',
+      startFrame,
+      endFrame: startFrame + Math.max(15, len),
+      width: project.width || 1280,
+      height: project.height || 720
+    });
+  },
+
   createMediaLayer(project, mediaItem, startFrame = 0, overrides = {}) {
     const fps = project.fps || 30;
     const rawDurFrames = Math.max(15, Math.round(((mediaItem.durationMs || 4000) / 1000) * fps));
@@ -243,8 +257,10 @@ export const TimelineEngine = {
     const copy = deepClone(project.layers[idx]);
     copy.id = uid('layer');
     copy.name = `${copy.name} Copy`;
-    copy.transform.x += 24;
-    copy.transform.y += 24;
+    if (copy.type !== 'adjustment' && copy.type !== 'audio') {
+      copy.transform.x += 24;
+      copy.transform.y += 24;
+    }
     project.layers.splice(idx, 0, copy);
     return copy;
   },
@@ -394,16 +410,15 @@ export const TimelineEngine = {
     return right;
   },
 
-  moveClip(project, layerId, newStartFrame, snapEnabled = true, playheadFrame = 0) {
+  moveClip(project, layerId, newStartFrame, snapEnabled = true, playheadFrame = 0, threshold = 4) {
     const layer = project.layers.find((l) => l.id === layerId);
-    if (!layer || layer.locked) return;
+    if (!layer || layer.locked) return { startFrame: 0, endFrame: 0, snapInfo: { snapped: false, guideFrame: null, kind: null, label: null } };
     const oldStart = layer.startFrame;
     const len = layer.endFrame - oldStart;
-    let targetStart = Math.max(0, Math.round(newStartFrame));
+    const rawStart = Math.max(0, Math.round(newStartFrame));
 
-    if (snapEnabled) {
-      targetStart = this.snapFrame(project, layerId, targetStart, len, playheadFrame);
-    }
+    const snapInfo = this.snapFrameWithMeta(project, layerId, rawStart, len, playheadFrame, threshold, snapEnabled);
+    const targetStart = snapInfo.startFrame;
     const delta = targetStart - oldStart;
     layer.startFrame = targetStart;
     layer.endFrame = targetStart + len;
@@ -417,20 +432,29 @@ export const TimelineEngine = {
       }
     }
     this.ensureProjectDuration(project, layer.endFrame);
+    return { startFrame: layer.startFrame, endFrame: layer.endFrame, snapInfo };
   },
 
-  trimClip(project, layerId, edge, newFrame, snapEnabled = true, playheadFrame = 0) {
+  trimClip(project, layerId, edge, newFrame, snapEnabled = true, playheadFrame = 0, threshold = 4) {
     const layer = project.layers.find((l) => l.id === layerId);
-    if (!layer || layer.locked) return;
+    if (!layer || layer.locked) return { startFrame: 0, endFrame: 0, snapInfo: { snapped: false, guideFrame: null, kind: null, label: null } };
     const isRight = edge === 'right';
+    const minLen = 5;
+    const rawTarget = Math.max(0, Math.round(newFrame));
+    const bounds = isRight
+      ? { minFrame: layer.startFrame + minLen }
+      : { maxFrame: layer.endFrame - minLen };
+    const edgeSnap = this.snapEdgeFrameWithMeta(project, layerId, rawTarget, playheadFrame, snapEnabled, threshold, bounds);
+    const snappedTarget = edgeSnap.frame;
+
     const wasmRes = WasmBridge.trimBounds(
       isRight,
       layer.startFrame,
       layer.endFrame,
       layer.mediaOffsetFrames || 0,
-      Math.round(newFrame),
+      snappedTarget,
       layer.speed || 1,
-      snapEnabled,
+      false,
       playheadFrame
     );
     if (wasmRes) {
@@ -438,24 +462,20 @@ export const TimelineEngine = {
       layer.endFrame = wasmRes.endFrame;
       layer.mediaOffsetFrames = wasmRes.mediaOffsetFrames;
       if (isRight) this.ensureProjectDuration(project, layer.endFrame);
-      return;
+      return { startFrame: layer.startFrame, endFrame: layer.endFrame, snapInfo: edgeSnap };
     }
 
-    const minLen = 5;
-    let f = Math.max(0, Math.round(newFrame));
-    if (snapEnabled && Math.abs(f - playheadFrame) <= 4) {
-      f = Math.max(0, playheadFrame);
-    }
     if (!isRight) {
       const maxStart = layer.endFrame - minLen;
-      const clamped = Math.min(f, maxStart);
+      const clamped = Math.max(0, Math.min(snappedTarget, maxStart));
       const diff = clamped - layer.startFrame;
       layer.startFrame = clamped;
       layer.mediaOffsetFrames = Math.max(0, (layer.mediaOffsetFrames || 0) + Math.round(diff * (layer.speed || 1)));
     } else {
-      layer.endFrame = Math.max(layer.startFrame + minLen, f);
+      layer.endFrame = Math.max(layer.startFrame + minLen, snappedTarget);
       this.ensureProjectDuration(project, layer.endFrame);
     }
+    return { startFrame: layer.startFrame, endFrame: layer.endFrame, snapInfo: edgeSnap };
   },
 
   setClipSpeed(project, layerId, newSpeed) {
@@ -481,25 +501,123 @@ export const TimelineEngine = {
     this.ensureProjectDuration(project, layer.endFrame);
   },
 
-  snapFrame(project, movingLayerId, candidateStart, clipLen, playheadFrame) {
-    const threshold = 4;
-    const edges = [];
-    for (const l of project.layers) {
-      if (l.id === movingLayerId) continue;
-      edges.push(l.startFrame, l.endFrame);
-    }
-    if (Array.isArray(project.beatMarkers)) {
-      for (const bf of project.beatMarkers) edges.push(bf);
-    }
-    const wasmSnap = WasmBridge.snapFrame(candidateStart, clipLen, playheadFrame, edges, threshold);
-    if (wasmSnap !== null) return wasmSnap;
+  collectSnapPoints(project, excludeLayerId = null, playheadFrame = 0) {
+    const points = [];
+    const safePlayhead = Math.max(0, Math.round(Number(playheadFrame) || 0));
+    points.push({ frame: safePlayhead, kind: 'playhead', label: 'Playhead', priority: 0 });
 
-    const snapPoints = [0, playheadFrame, ...edges];
-    for (const sp of snapPoints) {
-      if (Math.abs(candidateStart - sp) <= threshold) return Math.max(0, sp);
-      if (Math.abs(candidateStart + clipLen - sp) <= threshold) return Math.max(0, sp - clipLen);
+    if (Array.isArray(project?.layers)) {
+      for (const l of project.layers) {
+        if (!l || l.id === excludeLayerId) continue;
+        const sf = Math.max(0, Math.round(Number(l.startFrame) || 0));
+        const ef = Math.max(0, Math.round(Number(l.endFrame) || 0));
+        points.push({ frame: sf, kind: 'clip', label: 'Clip', priority: 1 });
+        points.push({ frame: ef, kind: 'clip', label: 'Clip', priority: 1 });
+      }
     }
-    return Math.max(0, candidateStart);
+
+    if (Array.isArray(project?.markers)) {
+      for (const m of project.markers) {
+        const f = typeof m === 'number' ? m : Number(m?.frame);
+        if (!Number.isFinite(f)) continue;
+        const lbl = typeof m === 'object' && m?.label ? String(m.label) : 'Marker';
+        points.push({ frame: Math.max(0, Math.round(f)), kind: 'marker', label: lbl, priority: 2 });
+      }
+    }
+
+    if (Array.isArray(project?.beatMarkers)) {
+      for (const bf of project.beatMarkers) {
+        const f = Number(bf);
+        if (!Number.isFinite(f)) continue;
+        points.push({ frame: Math.max(0, Math.round(f)), kind: 'beat', label: 'Beat', priority: 3 });
+      }
+    }
+
+    points.push({ frame: 0, kind: 'zero', label: '0s', priority: 4 });
+    return points;
+  },
+
+  snapEdgeFrameWithMeta(project, excludeLayerId, candidateFrame, playheadFrame = 0, snapEnabled = true, threshold = 4, bounds = null) {
+    const raw = Math.round(Number(candidateFrame) || 0);
+    if (!snapEnabled) {
+      return { frame: raw, snapped: false, guideFrame: null, kind: null, label: null };
+    }
+    const maxDist = Math.max(1, Math.round(Number(threshold) || 4));
+    const points = this.collectSnapPoints(project, excludeLayerId, playheadFrame);
+    let best = null;
+    for (const sp of points) {
+      if (bounds?.minFrame !== undefined && sp.frame < bounds.minFrame) continue;
+      if (bounds?.maxFrame !== undefined && sp.frame > bounds.maxFrame) continue;
+      const dist = Math.abs(raw - sp.frame);
+      if (dist > maxDist) continue;
+      if (
+        !best ||
+        dist < best.dist ||
+        (dist === best.dist && sp.priority < best.priority)
+      ) {
+        best = { ...sp, dist };
+      }
+    }
+    if (!best) {
+      return { frame: raw, snapped: false, guideFrame: null, kind: null, label: null };
+    }
+    return { frame: best.frame, snapped: true, guideFrame: best.frame, kind: best.kind, label: best.label };
+  },
+
+  snapFrameWithMeta(project, movingLayerId, candidateStart, clipLen, playheadFrame = 0, threshold = 4, snapEnabled = true) {
+    const baseStart = Math.max(0, Math.round(Number(candidateStart) || 0));
+    const len = Math.max(1, Math.round(Number(clipLen) || 0));
+    if (!snapEnabled) {
+      return { startFrame: baseStart, snapped: false, guideFrame: null, edge: null, kind: null, label: null };
+    }
+    const maxDist = Math.max(1, Math.round(Number(threshold) || 4));
+    const points = this.collectSnapPoints(project, movingLayerId, playheadFrame);
+    const candidateEnd = baseStart + len;
+
+    let best = null;
+    for (const sp of points) {
+      const distStart = Math.abs(baseStart - sp.frame);
+      if (distStart <= maxDist) {
+        const score = { dist: distStart, edgeRank: 0, priority: sp.priority, startFrame: Math.max(0, sp.frame), guideFrame: sp.frame, edge: 'start', kind: sp.kind, label: sp.label };
+        if (
+          !best ||
+          score.dist < best.dist ||
+          (score.dist === best.dist && (score.priority < best.priority || (score.priority === best.priority && score.edgeRank < best.edgeRank)))
+        ) {
+          best = score;
+        }
+      }
+
+      if (sp.frame - len >= 0) {
+        const distEnd = Math.abs(candidateEnd - sp.frame);
+        if (distEnd <= maxDist) {
+          const score = { dist: distEnd, edgeRank: 1, priority: sp.priority, startFrame: sp.frame - len, guideFrame: sp.frame, edge: 'end', kind: sp.kind, label: sp.label };
+          if (
+            !best ||
+            score.dist < best.dist ||
+            (score.dist === best.dist && (score.priority < best.priority || (score.priority === best.priority && score.edgeRank < best.edgeRank)))
+          ) {
+            best = score;
+          }
+        }
+      }
+    }
+
+    if (!best) {
+      return { startFrame: baseStart, snapped: false, guideFrame: null, edge: null, kind: null, label: null };
+    }
+    return {
+      startFrame: best.startFrame,
+      snapped: true,
+      guideFrame: best.guideFrame,
+      edge: best.edge,
+      kind: best.kind,
+      label: best.label
+    };
+  },
+
+  snapFrame(project, movingLayerId, candidateStart, clipLen, playheadFrame, threshold = 4) {
+    return this.snapFrameWithMeta(project, movingLayerId, candidateStart, clipLen, playheadFrame, threshold, true).startFrame;
   },
 
   ensureProjectDuration(project, endFrame) {
@@ -661,6 +779,27 @@ export const TimelineEngine = {
     return freezeLayer;
   },
 
+  toggleTimelineMarker(project, frame, label = '') {
+    if (!Array.isArray(project.markers)) project.markers = [];
+    const f = Math.max(0, Math.round(frame));
+    const existingIdx = project.markers.findIndex((m) => {
+      const mf = typeof m === 'number' ? m : Number(m?.frame);
+      return Number.isFinite(mf) && Math.abs(mf - f) <= 2;
+    });
+    if (existingIdx >= 0) {
+      project.markers.splice(existingIdx, 1);
+      return false;
+    }
+    project.markers.push({
+      id: uid('mkr'),
+      frame: f,
+      label: label ? String(label) : `M${project.markers.length + 1}`,
+      color: '#34d399'
+    });
+    project.markers.sort((a, b) => (typeof a === 'number' ? a : a.frame) - (typeof b === 'number' ? b : b.frame));
+    return true;
+  },
+
   toggleBeatMarker(project, frame) {
     if (!Array.isArray(project.beatMarkers)) project.beatMarkers = [];
     const f = Math.max(0, Math.round(frame));
@@ -719,7 +858,7 @@ export const TimelineEngine = {
     if (!project || !sourceLayer) return 0;
     let count = 0;
     for (const l of project.layers) {
-      if (l.id === sourceLayer.id || l.type === 'audio' || l.type === 'group') continue;
+      if (l.id === sourceLayer.id || l.type === 'audio' || l.type === 'group' || l.type === 'adjustment') continue;
       l.filterId = sourceLayer.filterId || 'normal';
       l.filterIntensity = sourceLayer.filterIntensity ?? 1;
       l.fx = deepClone(sourceLayer.fx || {});
@@ -936,12 +1075,11 @@ export const TimelineEngine = {
     return true;
   },
 
-  trimMainOrClip(project, layerId, edge, newFrame, snapEnabled = true, playheadFrame = 0) {
+  trimMainOrClip(project, layerId, edge, newFrame, snapEnabled = true, playheadFrame = 0, threshold = 4) {
     const layer = project?.layers?.find((l) => l.id === layerId);
-    if (!layer || layer.locked) return;
+    if (!layer || layer.locked) return { startFrame: 0, endFrame: 0, snapInfo: { snapped: false, guideFrame: null, kind: null, label: null } };
     if (layer.trackRole !== 'main' || project.settings?.rippleMode === false) {
-      this.trimClip(project, layerId, edge, newFrame, snapEnabled, playheadFrame);
-      return;
+      return this.trimClip(project, layerId, edge, newFrame, snapEnabled, playheadFrame, threshold);
     }
 
     const mainSeq = this.getMainTrackClips(project);
@@ -951,11 +1089,9 @@ export const TimelineEngine = {
     const minLen = 5;
 
     if (edge === 'right') {
-      let f = Math.max(oldStart + minLen, Math.round(newFrame));
-      if (snapEnabled && Math.abs(f - playheadFrame) <= 4 && playheadFrame >= oldStart + minLen) {
-        f = playheadFrame;
-      }
-      layer.endFrame = f;
+      const rawEnd = Math.max(oldStart + minLen, Math.round(newFrame));
+      const snapInfo = this.snapEdgeFrameWithMeta(project, layerId, rawEnd, playheadFrame, snapEnabled, threshold, { minFrame: oldStart + minLen });
+      layer.endFrame = Math.max(oldStart + minLen, snapInfo.frame);
       const delta = layer.endFrame - oldEnd;
       if (delta !== 0 && idx >= 0) {
         for (let i = idx + 1; i < mainSeq.length; i++) {
@@ -966,17 +1102,24 @@ export const TimelineEngine = {
         }
       }
       this.ensureProjectDuration(project, this.getMainTrackEndFrame(project));
+      return { startFrame: layer.startFrame, endFrame: layer.endFrame, snapInfo };
     } else {
       const maxStart = oldEnd - minLen;
-      let f = Math.max(0, Math.min(maxStart, Math.round(newFrame)));
-      if (snapEnabled && Math.abs(f - playheadFrame) <= 4 && playheadFrame <= maxStart) {
-        f = Math.max(0, playheadFrame);
+      let f = Math.min(maxStart, Math.round(newFrame));
+      let snapInfo = { frame: f, snapped: false, guideFrame: null, kind: null, label: null };
+      if (snapEnabled && f >= -threshold) {
+        const edgeRes = this.snapEdgeFrameWithMeta(project, layerId, f, playheadFrame, true, threshold, { minFrame: 0, maxFrame: maxStart });
+        if (edgeRes.snapped) {
+          f = edgeRes.frame;
+          snapInfo = edgeRes;
+        }
       }
       const trimDelta = f - oldStart;
       layer.startFrame = f;
       layer.mediaOffsetFrames = Math.max(0, (layer.mediaOffsetFrames || 0) + Math.round(trimDelta * (layer.speed || 1)));
-      // Re-pack Main Track flush so trimming head doesn't leave a magnetic gap
+      // Re-pack Main Track flush so trimming/extending head keeps Main Track contiguous from 0
       this.reflowMainTrack(project, 0, mainSeq.map((c) => c.id));
+      return { startFrame: layer.startFrame, endFrame: layer.endFrame, snapInfo };
     }
   },
 
@@ -1297,12 +1440,14 @@ export const TimelineEngine = {
           project.layers.filter((l) => l.trackRole === 'main'),
           project.layers.filter((l) => l.trackRole !== 'main' && (l.type === 'video' || l.type === 'image')),
           project.layers.filter((l) => l.type === 'text'),
-          project.layers.filter((l) => l.type === 'shape')
+          project.layers.filter((l) => l.type === 'shape'),
+          project.layers.filter((l) => l.type === 'adjustment')
         ]
       : [
           project.layers.filter((l) => l.type === 'video' || l.type === 'image'),
           project.layers.filter((l) => l.type === 'text'),
-          project.layers.filter((l) => l.type === 'shape')
+          project.layers.filter((l) => l.type === 'shape'),
+          project.layers.filter((l) => l.type === 'adjustment')
         ];
     const junctions = [];
     const fps = Math.max(1, project.fps || 30);

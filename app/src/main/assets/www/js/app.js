@@ -7,7 +7,7 @@ import {
   renderStickerPngDataUrl,
   synthesizeSfxWavDataUrl
 } from './engine/capcutCatalog.js';
-import { KeyframeEngine } from './engine/keyframeEngine.js';
+import { KEYFRAME_LANE_GROUPS, KeyframeEngine } from './engine/keyframeEngine.js';
 import { RendererEngine } from './engine/rendererEngine.js';
 import { StabilizerEngine } from './engine/stabilizerEngine.js';
 import { TimelineEngine } from './engine/timelineEngine.js';
@@ -41,6 +41,7 @@ class MotionFlowApp {
     this.playToken = 0;
     this.lastTickMs = 0;
     this.autosaveTimer = null;
+    this._saveSeq = 0;
     this.copiedClipStyle = null;
     this.ttsStatusText = '';
     this._drawMode = 'doodle';
@@ -103,20 +104,55 @@ class MotionFlowApp {
         this.panels.renderInspector();
         this.panels.renderKeyframesPanel();
       },
-      onSelectLayer: (id) => this.selectLayer(id),
+      onSelectLayer: (id, opts) => this.selectLayer(id, opts),
+      onToggleMute: (id) => this.toggleMute(id),
       onToggleVisibility: (id) => this.toggleVisibility(id),
       onToggleLock: (id) => this.toggleLock(id),
+      onToggleTrackCompact: (id) => this.toggleTrackCompact(id),
       onPushUndo: () => this.pushUndo(),
       onPreviewRefresh: () => this.renderPreview(),
       onCommitTimelineChange: () => this.onTimelineMutated(),
       onPinchZoom: () => this.refreshTimelineOnly(),
-      onReorderLayerToIndex: (id, idx) => this.mutateProject(() => TimelineEngine.moveLayerToIndex(this.project, id, idx)),
+      onReorderLayerToIndex: (id, idx) => this.mutateProject(() => {
+        TimelineEngine.moveLayerToIndex(this.project, id, idx);
+        TimelineEngine.normalizeTrackZOrder(this.project);
+      }),
       onMoveKeyframeFrame: (layerId, oldF, newF) => {
         const layer = this.project.layers.find((l) => l.id === layerId);
         if (!layer) return;
         KeyframeEngine.moveAllKeyframesAtFrame(layer, oldF, newF);
         this.onTimelineMutated();
         this.showToast(`Moved keyframe F${oldF} → F${newF}`);
+      },
+      onToggleKfExpanded: (layerId) => this.toggleKfExpanded(layerId),
+      onTogglePropLaneKeyframe: (layerId, laneKey, frame) => this.togglePropLaneKeyframe(layerId, laneKey, frame),
+      onMovePropKeyframe: (layerId, propKeys, oldF, newF) => {
+        const layer = this.project.layers.find((l) => l.id === layerId);
+        if (!layer) return;
+        KeyframeEngine.movePropGroupKeyframe(layer, propKeys, oldF, newF);
+        this.onTimelineMutated();
+        this.showToast(`Keyframe digeser F${oldF} → F${newF}`);
+      },
+      onDeletePropKeyframe: (layerId, propKeys, frame) => {
+        const layer = this.project.layers.find((l) => l.id === layerId);
+        if (!layer) return;
+        this.mutateProject(() => KeyframeEngine.removePropGroupKeyframe(layer, propKeys, frame));
+        this.showToast(`Keyframe F${frame} dihapus`);
+      },
+      onSetPropKeyframeEasing: (layerId, propKeys, frame, easing) => {
+        const layer = this.project.layers.find((l) => l.id === layerId);
+        if (!layer) return;
+        this.mutateProject(() => KeyframeEngine.setPropGroupEasing(layer, propKeys, frame, easing));
+      },
+      onSetPropKeyframeColor: (layerId, frame, hexColor, easing) => {
+        const layer = this.project.layers.find((l) => l.id === layerId);
+        if (!layer) return;
+        this.mutateProject(() => KeyframeEngine.setKeyframe(layer, 'color', frame, hexColor, easing));
+      },
+      onFocusKeyframeProp: (layerId, propKey) => {
+        this.selectLayer(layerId, { force: true, skipTimelineRender: true });
+        if (propKey) this.panels.selectedKfProp = propKey;
+        this.openSheet('sheetKeyframes');
       },
       onOpenTransitionJunction: (leftId, rightId) => {
         this.openTransitionsSheet({ mode: 'junction', leftId, rightId, layerId: leftId });
@@ -155,6 +191,7 @@ class MotionFlowApp {
         }
       },
       onCloseMainGaps: () => this.closeMainTrackGaps(),
+      onSnapBypassChange: (bypassed) => this.updateSnapButtonState(bypassed),
       getPlayheadFrame: () => this.currentFrame
     });
 
@@ -217,6 +254,7 @@ class MotionFlowApp {
     this.bindNativeBridgeCallbacks();
 
     this.panels.renderMediaLibrary(this.mediaItems);
+    this.setSaveState(true);
     this.updateAllUI();
   }
 
@@ -254,13 +292,30 @@ class MotionFlowApp {
     this.updateAllUI();
   }
 
-  scheduleAutosave() {
+  setSaveState(isSaved) {
     const badge = document.getElementById('badgeSaveState');
-    badge.textContent = 'Saving...';
+    if (!badge) return;
+    badge.classList.toggle('is-saved', Boolean(isSaved));
+    badge.classList.toggle('is-unsaved', !isSaved);
+    badge.title = isSaved ? 'Saved' : 'Not saved';
+    badge.setAttribute('aria-label', isSaved ? 'Saved' : 'Not saved');
+  }
+
+  scheduleAutosave() {
+    this._saveSeq += 1;
+    const seq = this._saveSeq;
+    this.setSaveState(false);
     clearTimeout(this.autosaveTimer);
     this.autosaveTimer = setTimeout(async () => {
-      await ProjectStorage.saveProject(this.project);
-      badge.textContent = 'Saved';
+      try {
+        await ProjectStorage.saveProject(this.project);
+        if (seq === this._saveSeq) {
+          this.setSaveState(true);
+        }
+      } catch (err) {
+        console.error('Autosave failed:', err);
+        this.setSaveState(false);
+      }
     }, 400);
   }
 
@@ -269,13 +324,39 @@ class MotionFlowApp {
     document.getElementById('btnRedo').disabled = !this.history.canRedo();
   }
 
+  updateSnapButtonState(modifierBypass = this.timelineView?._modifierHeld) {
+    const snapBtn = document.getElementById('btnToggleSnap');
+    if (!snapBtn) return;
+    const enabled = Boolean(this.project?.settings?.snapToTimeline);
+    const bypassed = enabled && Boolean(modifierBypass);
+    snapBtn.classList.toggle('active', enabled);
+    snapBtn.classList.toggle('snap-bypassed', bypassed);
+    snapBtn.title = bypassed
+      ? 'Snapping nonaktif sementara (Modifier ditahan)'
+      : enabled
+        ? 'Snap: ON (Tahan Alt/Shift/Ctrl saat drag untuk matikan sementara)'
+        : 'Snap: OFF';
+  }
+
   updateAllUI() {
     document.getElementById('lblProjectName').textContent = this.project.name;
     document.getElementById('hudResFps').textContent = `${this.project.width}×${this.project.height} · ${this.project.fps} FPS`;
-    document.getElementById('btnToggleSnap').classList.toggle('active', Boolean(this.project.settings?.snapToTimeline));
+    this.updateSnapButtonState();
     document.getElementById('btnToggleRipple')?.classList.toggle('active', this.project.settings?.rippleMode !== false);
     document.getElementById('btnToggleGrid').classList.toggle('active', Boolean(this.project.settings?.showGrid));
     document.getElementById('btnOpenTrackerQuick')?.classList.toggle('tracking-active', Boolean(this.trackerState.active));
+    const btnCompactAll = document.getElementById('btnCompactAllTracks');
+    if (btnCompactAll) {
+      const hasAnyLayers = this.project.layers.length > 0;
+      const singleTracks = this.project.layers.filter((l) => l.trackRole !== 'main');
+      const hasMain = this.project.layers.some((l) => l.trackRole === 'main');
+      const allCompact = hasAnyLayers &&
+        singleTracks.every((l) => Boolean(l.trackCompact)) &&
+        (!hasMain || Boolean(this.project.settings?.mainTrackCompact));
+      btnCompactAll.classList.toggle('active', allCompact);
+      const ic = btnCompactAll.querySelector('i');
+      if (ic) ic.className = allCompact ? 'bi bi-arrows-expand' : 'bi bi-arrows-collapse';
+    }
     this.syncViewport3DUI();
     this.updateExportSpecPill();
 
@@ -388,9 +469,37 @@ class MotionFlowApp {
     document.getElementById('iconPlayPause').className = 'bi bi-play-fill';
   }
 
-  selectLayer(layerId) {
+  selectLayer(layerId, opts = {}) {
+    if (this.selectedLayerId === layerId && !opts.force) return;
     this.selectedLayerId = layerId;
+    if (opts.skipTimelineRender) {
+      this.updateTransportLabels();
+      this.renderPreview();
+      this.panels.refreshAll();
+      this.panels.renderRatioPanel();
+      this.renderBottomToolbar();
+      return;
+    }
     this.updateAllUI();
+  }
+
+  toggleMute(layerId) {
+    const l = this.project.layers.find((x) => x.id === layerId);
+    if (!l) return;
+    this.mutateProject(() => {
+      if (!l.audioProps) {
+        l.audioProps = {
+          volume: 1.0,
+          fadeInFrames: 0,
+          fadeOutFrames: 0,
+          muted: false,
+          voiceEffect: 'none',
+          reduceNoise: false,
+          normalize: false
+        };
+      }
+      l.audioProps.muted = !l.audioProps.muted;
+    });
   }
 
   toggleVisibility(layerId) {
@@ -403,6 +512,54 @@ class MotionFlowApp {
     const l = this.project.layers.find((x) => x.id === layerId);
     if (!l) return;
     this.mutateProject(() => { l.locked = !l.locked; });
+  }
+
+  toggleTrackCompact(layerId) {
+    const l = this.project.layers.find((x) => x.id === layerId);
+    if (!l) return;
+    this.mutateProject(() => { l.trackCompact = !l.trackCompact; });
+  }
+
+  toggleKfExpanded(layerId) {
+    const l = this.project.layers.find((x) => x.id === layerId);
+    if (!l) return;
+    l.kfExpanded = !l.kfExpanded;
+    if (l.kfExpanded) {
+      this.selectedLayerId = l.id;
+    }
+    this.scheduleAutosave();
+    this.updateAllUI();
+  }
+
+  togglePropLaneKeyframe(layerId, laneKey, frame = this.currentFrame) {
+    const l = this.project.layers.find((x) => x.id === layerId);
+    if (!l) return;
+    let res = null;
+    this.mutateProject(() => {
+      res = KeyframeEngine.togglePropLaneKeyframeAtFrame(l, laneKey, frame);
+    });
+    if (res) {
+      const group = KEYFRAME_LANE_GROUPS.find((g) => g.key === laneKey);
+      const label = group?.label || laneKey;
+      this.showToast(res.added ? `Keyframe ${label} + F${res.frame}` : `Keyframe ${label} @ F${res.frame} dihapus`);
+    }
+  }
+
+  toggleAllTracksCompact() {
+    if (!this.project.layers.length) return;
+    const singleTracks = this.project.layers.filter((l) => l.trackRole !== 'main');
+    const hasMain = this.project.layers.some((l) => l.trackRole === 'main');
+    const allCompact =
+      singleTracks.every((l) => Boolean(l.trackCompact)) &&
+      (!hasMain || Boolean(this.project.settings?.mainTrackCompact));
+    const next = !allCompact;
+    this.mutateProject(() => {
+      singleTracks.forEach((l) => { l.trackCompact = next; });
+      if (hasMain) {
+        if (!this.project.settings) this.project.settings = {};
+        this.project.settings.mainTrackCompact = next;
+      }
+    });
   }
 
   setLayerTransformProp(layer, prop, value, pushHistory = true) {
@@ -665,6 +822,27 @@ class MotionFlowApp {
       } else if (prop === 'locked') {
         const allLocked = mainClips.every((c) => c.locked);
         mainClips.forEach((c) => { c.locked = !allLocked; });
+      } else if (prop === 'muted') {
+        const audioClips = mainClips.filter((c) => c.audioProps);
+        if (audioClips.length > 0) {
+          const allMuted = audioClips.every((c) => c.audioProps.muted);
+          audioClips.forEach((c) => { c.audioProps.muted = !allMuted; });
+        } else {
+          mainClips.forEach((c) => {
+            c.audioProps = {
+              volume: 1.0,
+              fadeInFrames: 0,
+              fadeOutFrames: 0,
+              muted: true,
+              voiceEffect: 'none',
+              reduceNoise: false,
+              normalize: false
+            };
+          });
+        }
+      } else if (prop === 'compact') {
+        if (!this.project.settings) this.project.settings = {};
+        this.project.settings.mainTrackCompact = !this.project.settings.mainTrackCompact;
       }
     });
   }
@@ -722,6 +900,14 @@ class MotionFlowApp {
       this.selectedLayerId = null;
     });
     this.showToast('Ripple deleted clip & closed gap');
+  }
+
+  toggleMarkerAtPlayhead() {
+    let added = false;
+    this.mutateProject(() => {
+      added = TimelineEngine.toggleTimelineMarker(this.project, this.currentFrame);
+    });
+    this.showToast(added ? `Added Marker @ F${this.currentFrame}` : 'Removed Marker');
   }
 
   toggleBeatAtPlayhead() {
@@ -1405,7 +1591,18 @@ class MotionFlowApp {
         ['bi-stars text-info', 'Effects', () => { if (ensureVisualOrSelected()) this.openSheet('sheetStyle', 'fx', 'effects'); }],
         ['bi-palette-fill text-success', 'Filters', () => { if (ensureVisualOrSelected()) this.openSheet('sheetStyle', 'fx', 'filters'); }],
         ['bi-layers-half text-success', 'Overlay', () => this.triggerDeviceVisualPick('overlay_at_playhead')],
+        ['bi-sliders2-vertical text-warning', 'Adj Layer', () => {
+          this.mutateProject(() => {
+            const adj = TimelineEngine.createAdjustmentLayer(this.project, this.currentFrame);
+            TimelineEngine.addLayer(this.project, adj);
+            TimelineEngine.normalizeTrackZOrder(this.project);
+            this.selectedLayerId = adj.id;
+          });
+          this.openSheet('sheetStyle', 'fx', 'adjust');
+        }],
         ['bi-pentagon text-warning', 'Shapes', () => this.openSheet('sheetAddLayer')],
+        ['bi-bookmark-plus text-success', 'Marker', () => this.toggleMarkerAtPlayhead()],
+        ['bi-music-note-list text-warning', 'Beat', () => this.toggleBeatAtPlayhead()],
         ['bi-aspect-ratio', 'Canvas', () => this.openSheet('sheetRatio')],
         ['bi-badge-3d text-info', '3D Cam', () => {
           if (!this.viewport3D.enabled) this.toggleViewport3D();
@@ -1557,6 +1754,7 @@ class MotionFlowApp {
         ['bi-graph-up', 'Fade', () => this.openSheet('sheetStyle', 'layer')],
         ['bi-speedometer2 text-info', 'Speed', () => this.openSheet('sheetStyle', 'layer')],
         ['bi-music-note-list text-warning', 'Beat', () => this.toggleBeatAtPlayhead()],
+        ['bi-bookmark-plus text-success', 'Marker', () => this.toggleMarkerAtPlayhead()],
         ['bi-arrow-counterclockwise', 'Reverse', () => {
           this.mutateProject(() => { layer.reversed = !layer.reversed; });
           this.showToast(layer.reversed ? 'Audio Reversed' : 'Reverse Off');
@@ -1564,6 +1762,22 @@ class MotionFlowApp {
         ['bi-arrow-left-right', 'Replace', () => this.replaceSelectedClip()],
         commonDup,
         commonRippleDel,
+        commonDel
+      ];
+    } else if (layer.type === 'adjustment') {
+      ctxItems = [
+        commonSplit,
+        commonDelLeft,
+        commonDelRight,
+        ['bi-stars text-info', 'Effects', () => this.openSheet('sheetStyle', 'fx', 'effects')],
+        ['bi-palette-fill text-success', 'Filters', () => this.openSheet('sheetStyle', 'fx', 'filters')],
+        ['bi-sliders2 text-warning', 'Adjust/HSL', () => this.openSheet('sheetStyle', 'fx', 'adjust')],
+        ['bi-circle-half', 'Mask/Tr', () => this.openSheet('sheetStyle', 'mask')],
+        commonAnim,
+        commonTransform,
+        commonCopyStyle,
+        ...(commonPasteStyle ? [commonPasteStyle] : []),
+        commonDup,
         commonDel
       ];
     } else {
@@ -1974,6 +2188,7 @@ class MotionFlowApp {
     this.currentFrame = 0;
     this.selectedLayerId = this.project.layers[0]?.id || null;
     this.hideOpenSheets();
+    this.setSaveState(true);
     this.updateAllUI();
     this.showToast(`Opened "${this.project.name}"`);
   }
@@ -2004,6 +2219,7 @@ class MotionFlowApp {
       this.history.clear();
       this.currentFrame = 0;
       this.selectedLayerId = this.project.layers[0]?.id || null;
+      this.setSaveState(true);
       this.updateAllUI();
     }
     this.panels.renderProjectsList();
@@ -2622,7 +2838,21 @@ class MotionFlowApp {
     document.getElementById('btnToggleSnap').onclick = () => {
       this.project.settings.snapToTimeline = !this.project.settings.snapToTimeline;
       this.onTimelineMutated();
+      this.showToast(this.project.settings.snapToTimeline ? 'Snapping ON' : 'Snapping OFF');
     };
+    window.addEventListener('keydown', (e) => {
+      const tag = e.target?.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || e.target?.isContentEditable) return;
+      if (e.altKey || e.ctrlKey || e.metaKey) return;
+      const key = String(e.key || '').toLowerCase();
+      if (key === 'm') {
+        e.preventDefault();
+        this.toggleMarkerAtPlayhead();
+      } else if (key === 'b') {
+        e.preventDefault();
+        this.toggleBeatAtPlayhead();
+      }
+    });
     document.getElementById('btnToggleRipple')?.addEventListener('click', () => {
       this.toggleRippleMode();
     });
@@ -2639,10 +2869,14 @@ class MotionFlowApp {
       this.mutateProject(() => {
         const exists = KeyframeEngine.hasAnyKeyframeAtFrame(layer, this.currentFrame);
         if (exists) {
-          ['x', 'y', 'z', 'scaleX', 'scaleY', 'rotation', 'rotX', 'rotY', 'opacity'].forEach((p) =>
-            KeyframeEngine.removeKeyframe(layer, p, this.currentFrame)
-          );
+          if (layer.keyframes) {
+            Object.keys(layer.keyframes).forEach((p) => KeyframeEngine.removeKeyframe(layer, p, this.currentFrame));
+          }
           this.showToast(`Removed keyframes at F${this.currentFrame}`);
+        } else if (layer.type === 'audio') {
+          const vol = KeyframeEngine.getValueAtFrame(layer, 'volume', this.currentFrame, layer.audioProps?.volume ?? 1);
+          KeyframeEngine.setKeyframe(layer, 'volume', this.currentFrame, vol);
+          this.showToast(`Keyframed volume at F${this.currentFrame}`);
         } else {
           const tf = KeyframeEngine.getTransformAtFrame(layer, this.currentFrame);
           KeyframeEngine.setKeyframe(layer, 'x', this.currentFrame, tf.x);
@@ -2654,10 +2888,14 @@ class MotionFlowApp {
           KeyframeEngine.setKeyframe(layer, 'rotX', this.currentFrame, tf.rotX || 0);
           KeyframeEngine.setKeyframe(layer, 'rotY', this.currentFrame, tf.rotY || 0);
           KeyframeEngine.setKeyframe(layer, 'opacity', this.currentFrame, tf.opacity);
-          this.showToast(`Keyframed all 3D transforms at F${this.currentFrame}`);
+          this.showToast(`Keyframed transforms at F${this.currentFrame}`);
         }
       });
     };
+
+    document.getElementById('btnCompactAllTracks')?.addEventListener('click', () => {
+      this.toggleAllTracksCompact();
+    });
 
     document.getElementById('btnTimelineQuickAdd')?.addEventListener('click', () => {
       this.triggerDeviceVisualPick('main_append');
@@ -2674,6 +2912,7 @@ class MotionFlowApp {
       this.currentFrame = 0;
       this.selectedLayerId = null;
       this.hideOpenSheets();
+      this.setSaveState(true);
       this.updateAllUI();
     };
     document.getElementById('btnExportProjectJson').onclick = () => {
@@ -2812,6 +3051,16 @@ class MotionFlowApp {
     document.getElementById('btnAddShapeEllipse').onclick = () => addAndSelect(TimelineEngine.createShapeLayer(this.project, 'ellipse', this.currentFrame));
     document.getElementById('btnAddShapeLine').onclick = () => addAndSelect(TimelineEngine.createShapeLayer(this.project, 'line', this.currentFrame));
     document.getElementById('btnAddGroupLayer').onclick = () => addAndSelect(TimelineEngine.createGroupLayer(this.project, this.currentFrame));
+    document.getElementById('btnAddAdjustmentLayer')?.addEventListener('click', () => {
+      this.mutateProject(() => {
+        const adj = TimelineEngine.createAdjustmentLayer(this.project, this.currentFrame);
+        TimelineEngine.addLayer(this.project, adj);
+        TimelineEngine.normalizeTrackZOrder(this.project);
+        this.selectedLayerId = adj.id;
+      });
+      this.hideOpenSheets();
+      this.openSheet('sheetStyle', 'fx', 'adjust');
+    });
 
     // Doodle Draw Modal bindings
     const drawCanvas = document.getElementById('drawPadCanvas');

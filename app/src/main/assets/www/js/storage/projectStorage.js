@@ -63,6 +63,7 @@ export function createEmptyProject(name = 'Untitled Project', options = {}) {
       }
     },
     mediaRefs: [],
+    markers: [],
     beatMarkers: [],
     layers: [],
     exportPrefs: {
@@ -75,7 +76,8 @@ export function createEmptyProject(name = 'Untitled Project', options = {}) {
       snapToTimeline: true,
       showGrid: false,
       rippleMode: true,
-      autoColorMatch: true
+      autoColorMatch: true,
+      mainTrackCompact: false
     },
     coverDataUrl: options.coverDataUrl || null,
     createdAt: Date.now(),
@@ -110,12 +112,32 @@ export function deserializeProject(jsonString) {
       ...base.settings,
       ...(raw.settings || {}),
       rippleMode: raw.settings?.rippleMode ?? true,
-      autoColorMatch: raw.settings?.autoColorMatch ?? true
+      autoColorMatch: raw.settings?.autoColorMatch ?? true,
+      mainTrackCompact: Boolean(raw.settings?.mainTrackCompact)
     },
     exportPrefs: { ...base.exportPrefs, ...(raw.exportPrefs || {}) },
     backgroundMode: raw.backgroundMode || base.backgroundMode,
     backgroundGradient: Array.isArray(raw.backgroundGradient) ? raw.backgroundGradient : base.backgroundGradient,
     backgroundBlurLevel: raw.backgroundBlurLevel ?? base.backgroundBlurLevel,
+    markers: Array.isArray(raw.markers)
+      ? raw.markers
+          .map((m, idx) => {
+            if (typeof m === 'number' && Number.isFinite(m)) {
+              return { id: `mkr_${idx}`, frame: Math.max(0, Math.round(m)), label: 'Marker', color: '#34d399' };
+            }
+            if (m && typeof m === 'object' && Number.isFinite(Number(m.frame))) {
+              return {
+                id: m.id || `mkr_${idx}`,
+                frame: Math.max(0, Math.round(Number(m.frame))),
+                label: String(m.label || 'Marker'),
+                color: String(m.color || '#34d399')
+              };
+            }
+            return null;
+          })
+          .filter(Boolean)
+          .sort((a, b) => a.frame - b.frame)
+      : [],
     beatMarkers: Array.isArray(raw.beatMarkers) ? raw.beatMarkers : [],
     mediaRefs: Array.isArray(raw.mediaRefs) ? raw.mediaRefs : [],
     layers: raw.layers,

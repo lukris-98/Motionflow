@@ -105,3 +105,34 @@ export function applyEasing(t, easing = 'linear', bezier = [0.42, 0, 0.58, 1]) {
 export function deepClone(obj) {
   return JSON.parse(JSON.stringify(obj));
 }
+
+export function normalizeHexColor(val, fallback = '#ffffff') {
+  if (typeof val !== 'string') return fallback;
+  let hex = val.trim();
+  if (!hex.startsWith('#')) hex = `#${hex}`;
+  if (/^#[0-9a-fA-F]{3}$/.test(hex)) {
+    hex = `#${hex[1]}${hex[1]}${hex[2]}${hex[2]}${hex[3]}${hex[3]}`;
+  }
+  if (/^#[0-9a-fA-F]{6}$/.test(hex)) {
+    return hex.toLowerCase();
+  }
+  return fallback;
+}
+
+export function hexToRgbBytes(hex) {
+  const norm = normalizeHexColor(hex, '#ffffff').slice(1);
+  return [
+    parseInt(norm.slice(0, 2), 16),
+    parseInt(norm.slice(2, 4), 16),
+    parseInt(norm.slice(4, 6), 16)
+  ];
+}
+
+export function lerpColorHex(hexA, hexB, t) {
+  const [r1, g1, b1] = hexToRgbBytes(hexA);
+  const [r2, g2, b2] = hexToRgbBytes(hexB);
+  const k = clamp(Number(t) || 0, 0, 1);
+  const toHex = (n) => clamp(Math.round(n), 0, 255).toString(16).padStart(2, '0');
+  return `#${toHex(lerp(r1, r2, k))}${toHex(lerp(g1, g2, k))}${toHex(lerp(b1, b2, k))}`;
+}
+

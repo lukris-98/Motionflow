@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { KeyframeEngine, EASING_TYPES } from '../src/main/assets/www/js/engine/keyframeEngine.js';
+import { KEYFRAME_LANE_GROUPS, KeyframeEngine, EASING_TYPES } from '../src/main/assets/www/js/engine/keyframeEngine.js';
+import { lerpColorHex, normalizeHexColor } from '../src/main/assets/www/js/utils/math.js';
 import {
   STABILIZE_PRESETS,
   StabilizerEngine,
@@ -294,7 +295,16 @@ test('TimelineEngine between-clip transitions, split transition reset & Apply to
   assert.ok(TRANSITION_PRESETS.every((t) => Boolean(t.animClass)));
 });
 
-import { computeRulerLodSpec, formatRulerLabel } from '../src/main/assets/www/js/ui/timelineView.js';
+import {
+  computeRulerLodSpec,
+  computeDynamicRulerTicks,
+  formatRulerLabel,
+  formatDurationShort,
+  formatSignedDurationDelta,
+  getClipStatusBadges,
+  isSnapActive,
+  computeEdgeAutoScrollDelta
+} from '../src/main/assets/www/js/ui/timelineView.js';
 
 test('ExportEngine effective trimmed duration & even dimensions', () => {
   const proj = createEmptyProject('ExpTest', { width: 1080, height: 1920, fps: 30, durationSec: 12 });
@@ -801,6 +811,304 @@ test('Timeline items extend beyond duration, trim/delete split Left & Right at p
   assert.equal(v2Right.startFrame, 45);
 });
 
+test('Clip anatomy badges, duration delta formatting (+00:02.3), and left/right corner duration extension', () => {
+  assert.equal(formatDurationShort(69, 30), '00:02.3');
+  assert.equal(formatSignedDurationDelta(69, 30), '+00:02.3');
+  assert.equal(formatSignedDurationDelta(-36, 30), '-00:01.2');
+
+  const proj = createEmptyProject('BadgeTest', { width: 1080, height: 1920, fps: 30, durationSec: 10 });
+  const clip = TimelineEngine.createMediaLayer(proj, { id: 'v1', name: 'Hero', type: 'video', width: 1080, height: 1920, durationMs: 3000 }, 30);
+  clip.speed = 2.0;
+  clip.vfx.type = 'glitch';
+  clip.reversed = true;
+  clip.audioProps.muted = true;
+  KeyframeEngine.setKeyframe(clip, 'x', 45, 120, 'linear');
+  TimelineEngine.addLayer(proj, clip);
+
+  const badges = getClipStatusBadges(clip);
+  const kinds = badges.map((b) => b.kind);
+  assert.ok(kinds.includes('speed'));
+  assert.equal(badges.find((b) => b.kind === 'speed').text, '×2');
+  assert.ok(kinds.includes('fx'));
+  assert.ok(kinds.includes('keyframe'));
+  assert.ok(kinds.includes('mute'));
+  assert.ok(kinds.includes('reverse'));
+
+  // Left-corner drag left extends overlay clip startFrame from 30 -> 10 (+20f duration)
+  TimelineEngine.trimMainOrClip(proj, clip.id, 'left', 10, false, 0);
+  assert.equal(clip.startFrame, 10);
+  assert.equal(clip.endFrame - clip.startFrame, 110);
+
+  // Right-corner drag right extends endFrame from 120 -> 189 (+69f = +00:02.3)
+  TimelineEngine.trimMainOrClip(proj, clip.id, 'right', 189, false, 0);
+  assert.equal(clip.endFrame, 189);
+  assert.equal(clip.endFrame - clip.startFrame, 179);
+
+  // Magnetic Main Track clip at frame 0 can also extend via left-corner drag left
+  const mainClip = TimelineEngine.createMediaLayer(proj, { id: 'v2', name: 'Main1', type: 'video', width: 1080, height: 1920, durationMs: 2000 }, 0);
+  TimelineEngine.addToMainTrack(proj, mainClip);
+  TimelineEngine.trimMainOrClip(proj, mainClip.id, 'left', -30, false, 0);
+  assert.equal(mainClip.startFrame, 0);
+  assert.equal(mainClip.endFrame, 90);
+});
+
+test('Adaptive dynamic ruler ticks keep clean label & minor tick spacing across zoom levels', () => {
+  for (const fps of [30, 60]) {
+    for (const px of [0.25, 1.15, 2.0, 5.0, 32.0]) {
+      const spec = computeDynamicRulerTicks(px, fps);
+      assert.ok(spec.labelFrames >= 1);
+      assert.ok(spec.minorFrames >= 1 && spec.minorFrames <= spec.labelFrames);
+      assert.ok(spec.majorFrames >= spec.labelFrames);
+      const minExpectedPx = spec.labelFrames < fps ? 42 : 48;
+      if (spec.labelFrames < fps * 600) {
+        assert.ok(spec.labelFrames * px >= minExpectedPx, `Expected label spacing >= ${minExpectedPx}px at px=${px}, fps=${fps}, got ${spec.labelFrames * px}`);
+      }
+      if (spec.minorFrames < spec.labelFrames) {
+        assert.ok(spec.minorFrames * px >= 8, `Expected minor tick spacing >= 8px, got ${spec.minorFrames * px}`);
+      }
+    }
+  }
+  const zoomedOut = computeDynamicRulerTicks(0.25, 30);
+  const zoomedIn = computeDynamicRulerTicks(32.0, 30);
+  assert.ok(zoomedOut.labelFrames > zoomedIn.labelFrames);
+  assert.equal(zoomedIn.showSubFrames, true);
+  assert.equal(zoomedOut.showSubFrames, false);
+});
+
+test('Per-track lock/hide/mute/compact state, Main Track compact persistence, and Adjustment Layer Z-order/FX rules', () => {
+  const proj = createEmptyProject('StackAdjustTest', { width: 1080, height: 1920, fps: 30, durationSec: 10 });
+  assert.equal(proj.settings.mainTrackCompact, false);
+
+  const m1 = TimelineEngine.createMediaLayer(proj, { id: 'm1', name: 'MainClip', type: 'video', width: 1080, height: 1920, durationMs: 3000 }, 0);
+  TimelineEngine.addToMainTrack(proj, m1);
+
+  const aud = TimelineEngine.createMediaLayer(proj, { id: 'a1', name: 'BGM', type: 'audio', durationMs: 4000 }, 0);
+  TimelineEngine.addLayer(proj, aud);
+
+  const pip = TimelineEngine.createMediaLayer(proj, { id: 'p1', name: 'PiP', type: 'image', width: 400, height: 400, durationMs: 2000 }, 15, { trackRole: 'overlay' });
+  TimelineEngine.addLayer(proj, pip);
+
+  const adj = TimelineEngine.createAdjustmentLayer(proj, 10);
+  adj.fx.filterPreset = 'vintage';
+  adj.fx.contrast = 1.35;
+  TimelineEngine.addLayer(proj, adj);
+
+  TimelineEngine.normalizeTrackZOrder(proj);
+
+  // Adjustment & overlay tracks sit above Main Track in project.layers, while audio sits below Main Track
+  const adjIdx = proj.layers.findIndex((l) => l.id === adj.id);
+  const pipIdx = proj.layers.findIndex((l) => l.id === pip.id);
+  const mainIdx = proj.layers.findIndex((l) => l.id === m1.id);
+  const audIdx = proj.layers.findIndex((l) => l.id === aud.id);
+  assert.ok(adjIdx < mainIdx, 'Adjustment layer should appear above main track');
+  assert.ok(pipIdx < mainIdx, 'Overlay PiP should appear above main track');
+  assert.ok(mainIdx < audIdx, 'Audio track should appear below main track');
+
+  // Toggle compact height, lock, visibility, and mute flags + serialize/deserialize roundtrip
+  adj.trackCompact = true;
+  pip.locked = true;
+  pip.visible = false;
+  aud.audioProps.muted = true;
+  proj.settings.mainTrackCompact = true;
+
+  const restored = deserializeProject(JSON.parse(JSON.stringify(proj)));
+  assert.equal(restored.settings.mainTrackCompact, true);
+  assert.equal(restored.layers.find((l) => l.id === adj.id).trackCompact, true);
+  assert.equal(restored.layers.find((l) => l.id === pip.id).locked, true);
+  assert.equal(restored.layers.find((l) => l.id === pip.id).visible, false);
+  assert.equal(restored.layers.find((l) => l.id === aud.id).audioProps.muted, true);
+
+  // Split & trim works cleanly on Adjustment Layer
+  const adjRight = TimelineEngine.splitClipAtFrame(restored, adj.id, 45);
+  assert.ok(adjRight);
+  assert.equal(adjRight.type, 'adjustment');
+  assert.equal(adjRight.startFrame, 45);
+  TimelineEngine.trimMainOrClip(restored, adjRight.id, 'right', 150, false, 0);
+  assert.equal(adjRight.endFrame, 150);
+
+  // Bulk applyFilterAndAdjustToAll updates visual clips but preserves adjustment layers' independent FX
+  const srcClip = restored.layers.find((l) => l.id === m1.id);
+  srcClip.fx.brightness = 0.25;
+  srcClip.fx.filterPreset = 'cool';
+  TimelineEngine.applyFilterAndAdjustToAll(restored, srcClip);
+  assert.equal(restored.layers.find((l) => l.id === pip.id).fx.brightness, 0.25);
+  assert.equal(restored.layers.find((l) => l.id === adj.id).fx.filterPreset, 'vintage');
+  assert.equal(restored.layers.find((l) => l.id === adj.id).fx.contrast, 1.35);
+});
+
+test('Timeline snapping (move & trim) attaches to clip edges, playhead, markers & beat markers, with magnet/modifier bypass and edge auto-scroll', () => {
+  const proj = createEmptyProject('SnapAutoScroll', { width: 1080, height: 1920, fps: 30, durationSec: 12 });
+  assert.equal(isSnapActive(proj, false), true);
+  assert.equal(isSnapActive(proj, true), false);
+
+  // Add reference clip [60..120], timeline marker @ 180, beat marker @ 240, moving overlay clip [0..30]
+  const refClip = TimelineEngine.createShapeLayer(proj, 'rectangle', 60);
+  refClip.startFrame = 60;
+  refClip.endFrame = 120;
+  TimelineEngine.addLayer(proj, refClip);
+
+  const movClip = TimelineEngine.createShapeLayer(proj, 'circle', 0);
+  movClip.startFrame = 0;
+  movClip.endFrame = 30;
+  TimelineEngine.addLayer(proj, movClip);
+
+  assert.equal(TimelineEngine.toggleTimelineMarker(proj, 180, 'Hook'), true);
+  assert.equal(TimelineEngine.toggleBeatMarker(proj, 240), true);
+  assert.equal(proj.markers.length, 1);
+  assert.equal(proj.markers[0].frame, 180);
+
+  // Serialization preserves markers cleanly
+  const rehydrated = deserializeProject(JSON.parse(JSON.stringify(proj)));
+  assert.equal(rehydrated.markers.length, 1);
+  assert.equal(rehydrated.markers[0].frame, 180);
+
+  // 1. Move clip start snaps to another clip's endEdge (120)
+  const snapClipEnd = TimelineEngine.moveClip(rehydrated, movClip.id, 118, true, 15, 4);
+  assert.equal(snapClipEnd.startFrame, 120);
+  assert.equal(snapClipEnd.snapInfo.kind, 'clip');
+
+  // 2. Move clip tail snaps to another clip's startEdge (60 -> movClip becomes [30..60])
+  const snapClipStartViaTail = TimelineEngine.moveClip(rehydrated, movClip.id, 32, true, 15, 4);
+  assert.equal(snapClipStartViaTail.startFrame, 30);
+  assert.equal(snapClipStartViaTail.endFrame, 60);
+  assert.equal(snapClipStartViaTail.snapInfo.kind, 'clip');
+
+  // 3. Move clip snaps to Playhead (F150)
+  const snapPlayhead = TimelineEngine.moveClip(rehydrated, movClip.id, 148, true, 150, 4);
+  assert.equal(snapPlayhead.startFrame, 150);
+  assert.equal(snapPlayhead.snapInfo.kind, 'playhead');
+
+  // 4. Move clip snaps to Timeline Marker (F180)
+  const snapMarker = TimelineEngine.moveClip(rehydrated, movClip.id, 183, true, 0, 4);
+  assert.equal(snapMarker.startFrame, 180);
+  assert.equal(snapMarker.snapInfo.kind, 'marker');
+
+  // 5. Move clip snaps to Beat Marker (F240)
+  const snapBeat = TimelineEngine.moveClip(rehydrated, movClip.id, 237, true, 0, 4);
+  assert.equal(snapBeat.startFrame, 240);
+  assert.equal(snapBeat.snapInfo.kind, 'beat');
+
+  // 6. Trimming right & left edges snap to clip edges, markers, beats, and playhead
+  const mov = rehydrated.layers.find((l) => l.id === movClip.id);
+  TimelineEngine.moveClip(rehydrated, mov.id, 130, false, 0, 4); // [130..160]
+  const trimRightToMarker = TimelineEngine.trimMainOrClip(rehydrated, mov.id, 'right', 178, true, 0, 4);
+  assert.equal(mov.endFrame, 180);
+  assert.equal(trimRightToMarker.snapInfo.kind, 'marker');
+
+  const trimRightToBeat = TimelineEngine.trimMainOrClip(rehydrated, mov.id, 'right', 243, true, 0, 4);
+  assert.equal(mov.endFrame, 240);
+  assert.equal(trimRightToBeat.snapInfo.kind, 'beat');
+
+  const trimLeftToClipEdge = TimelineEngine.trimMainOrClip(rehydrated, mov.id, 'left', 122, true, 0, 4);
+  assert.equal(mov.startFrame, 120);
+  assert.equal(trimLeftToClipEdge.snapInfo.kind, 'clip');
+
+  const trimLeftToPlayhead = TimelineEngine.trimMainOrClip(rehydrated, mov.id, 'left', 148, true, 150, 4);
+  assert.equal(mov.startFrame, 150);
+  assert.equal(trimLeftToPlayhead.snapInfo.kind, 'playhead');
+
+  // 7. Global toggle OFF or Modifier held disables snapping temporarily
+  rehydrated.settings.snapToTimeline = false;
+  assert.equal(isSnapActive(rehydrated, false), false);
+  TimelineEngine.moveClip(rehydrated, mov.id, 178, isSnapActive(rehydrated, false), 0, 4);
+  assert.equal(mov.startFrame, 178);
+
+  rehydrated.settings.snapToTimeline = true;
+  assert.equal(isSnapActive(rehydrated, true), false);
+  TimelineEngine.trimMainOrClip(rehydrated, mov.id, 'right', 238, isSnapActive(rehydrated, true), 0, 4);
+  assert.equal(mov.endFrame, 238);
+
+  // 8. Edge auto-scroll velocity calculation for left/right drag edges
+  assert.equal(computeEdgeAutoScrollDelta(250, 100, 460, 0), 0); // Safe center
+  assert.equal(computeEdgeAutoScrollDelta(105, 100, 460, 0), 0); // Left edge but scrollLeft is 0
+  assert.ok(computeEdgeAutoScrollDelta(105, 100, 460, 80) < 0); // Left edge scrolls backward
+  assert.equal(computeEdgeAutoScrollDelta(105, 100, 460, 3), -3); // Clamped to remaining scrollLeft
+  assert.ok(computeEdgeAutoScrollDelta(455, 100, 460, 40) > 0); // Right edge scrolls forward
+});
+
+test('Per-property keyframe lanes (position, scale, rotation, opacity, volume, color), individual move/delete/easing, and combinable In/Out presets', () => {
+  // 1. Hex normalization & RGB color interpolation
+  assert.equal(normalizeHexColor('#f0a'), '#ff00aa');
+  assert.equal(normalizeHexColor('invalid', '#123456'), '#123456');
+  assert.equal(lerpColorHex('#000000', '#ffffff', 0.5), '#808080');
+
+  // Verify all 6 requested property lane groups exist
+  assert.deepEqual(
+    KEYFRAME_LANE_GROUPS.map((g) => g.key),
+    ['position', 'scale', 'rotation', 'opacity', 'volume', 'color']
+  );
+
+  const proj = createEmptyProject('KfLanes', { width: 1080, height: 1920, fps: 30, durationSec: 10 });
+  const textLayer = TimelineEngine.createTextLayer(proj, 0); // [0..90]
+  textLayer.endFrame = 90;
+  const audioLayer = TimelineEngine.createMediaLayer(proj, { id: 'a1', name: 'Music', type: 'audio', durationMs: 3000 }, 0);
+  const adjLayer = TimelineEngine.createAdjustmentLayer(proj, 0);
+  const videoLayer = TimelineEngine.createMediaLayer(proj, { id: 'v1', name: 'Clip', type: 'video', width: 1080, height: 1920, durationMs: 3000 }, 0);
+
+  // 2. Visible keyframe lanes adapt by track type
+  assert.deepEqual(KeyframeEngine.getVisibleKeyframeLanes(audioLayer).map((g) => g.key), ['volume']);
+  assert.deepEqual(KeyframeEngine.getVisibleKeyframeLanes(adjLayer).map((g) => g.key), ['opacity', 'color']);
+  assert.deepEqual(
+    KeyframeEngine.getVisibleKeyframeLanes(videoLayer).map((g) => g.key),
+    ['position', 'scale', 'rotation', 'opacity', 'volume', 'color']
+  );
+
+  // 3. Color keyframing linear vs easeInOut interpolation
+  KeyframeEngine.setKeyframe(textLayer, 'color', 0, '#ff0000', 'linear');
+  KeyframeEngine.setKeyframe(textLayer, 'color', 30, '#0000ff', 'easeInOut');
+  assert.equal(KeyframeEngine.getColorAtFrame(textLayer, 15, '#ffffff'), '#800080');
+  assert.equal(KeyframeEngine.getValueAtFrame(textLayer, 'color', 30, '#ffffff'), '#0000ff');
+
+  // 4. Moving one property lane diamond ONLY shifts that property group, keeping sibling properties at same frame intact
+  KeyframeEngine.setKeyframe(videoLayer, 'x', 20, 100, 'linear');
+  KeyframeEngine.setKeyframe(videoLayer, 'y', 20, -40, 'linear');
+  KeyframeEngine.setKeyframe(videoLayer, 'opacity', 20, 0.5, 'easeOut');
+  KeyframeEngine.setKeyframe(videoLayer, 'opacity', 60, 1.0, 'linear');
+
+  const movedPos = KeyframeEngine.movePropGroupKeyframe(videoLayer, ['x', 'y', 'z'], 20, 45);
+  assert.equal(movedPos, true);
+  assert.equal(videoLayer.keyframes.x[0].frame, 45);
+  assert.equal(videoLayer.keyframes.y[0].frame, 45);
+  assert.equal(videoLayer.keyframes.opacity[0].frame, 20); // Opacity stayed at F20!
+
+  // 5. Easing switching & 1-by-1 deletion per property group
+  assert.equal(KeyframeEngine.setPropGroupEasing(videoLayer, ['opacity'], 20, 'linear'), true);
+  assert.equal(videoLayer.keyframes.opacity[0].easing, 'linear');
+  assert.equal(KeyframeEngine.removePropGroupKeyframe(videoLayer, ['opacity'], 20), true);
+  assert.equal(videoLayer.keyframes.opacity.length, 1);
+  assert.equal(videoLayer.keyframes.opacity[0].frame, 60);
+
+  // Toggle lane keyframe at playhead (adds then removes cleanly)
+  const togAdd = KeyframeEngine.togglePropLaneKeyframeAtFrame(audioLayer, 'volume', 35, 'easeInOut');
+  assert.equal(togAdd.added, true);
+  assert.equal(audioLayer.keyframes.volume.length, 1);
+  const togDel = KeyframeEngine.togglePropLaneKeyframeAtFrame(audioLayer, 'volume', 35, 'easeInOut');
+  assert.equal(togDel.added, false);
+  assert.equal(audioLayer.keyframes.volume.length, 0);
+
+  // 6. Presets = ready-to-use keyframes: In + Out presets combine cleanly and stay individually editable/deletable
+  KeyframeEngine.applyPreset(textLayer, 'fadeIn', proj.width, proj.height, 20);
+  KeyframeEngine.applyPreset(textLayer, 'slideOutRight', proj.width, proj.height, 20);
+  assert.equal(textLayer.presetInId, 'fadeIn');
+  assert.equal(textLayer.presetOutId, 'slideOutRight');
+  assert.equal(textLayer.keyframes.opacity.length, 2); // F0=0, F20=1
+  assert.equal(textLayer.keyframes.x.length, 2); // F70=base, F90=+width*0.65
+  assert.equal(textLayer.keyframes.opacity[0].presetTag, 'in');
+  assert.equal(textLayer.keyframes.x[0].presetTag, 'out');
+
+  // Preset keyframes can be moved/deleted individually on timeline lanes
+  assert.equal(KeyframeEngine.movePropGroupKeyframe(textLayer, ['x', 'y', 'z'], 70, 65), true);
+  assert.equal(textLayer.keyframes.x[0].frame, 65);
+  assert.equal(KeyframeEngine.removePropGroupKeyframe(textLayer, ['opacity'], 0), true);
+  assert.equal(textLayer.keyframes.opacity.length, 1);
+
+  // Clearing In preset removes only remaining 'in' keyframes, preserving Out preset ('slideOutRight')
+  KeyframeEngine.clearPresetCategory(textLayer, 'in');
+  assert.equal(textLayer.presetInId, null);
+  assert.equal(textLayer.keyframes.opacity.length, 0);
+  assert.equal(textLayer.presetOutId, 'slideOutRight');
+  assert.equal(textLayer.keyframes.x.length, 2);
+});
 
 
 

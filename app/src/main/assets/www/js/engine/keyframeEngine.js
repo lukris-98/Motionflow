@@ -1,4 +1,4 @@
-import { applyEasing, lerp, uid } from '../utils/math.js';
+import { applyEasing, lerp, lerpColorHex, normalizeHexColor, uid } from '../utils/math.js';
 
 export const ANIMATABLE_PROPS = [
   { key: 'x', label: 'Position X', step: 1 },
@@ -12,7 +12,66 @@ export const ANIMATABLE_PROPS = [
   { key: 'opacity', label: 'Opacity', step: 0.05 },
   { key: 'anchorX', label: 'Anchor X', step: 1 },
   { key: 'anchorY', label: 'Anchor Y', step: 1 },
-  { key: 'volume', label: 'Audio Volume', step: 0.05 }
+  { key: 'volume', label: 'Audio Volume', step: 0.05 },
+  { key: 'color', label: 'Color / Tint', isColor: true }
+];
+
+export const KEYFRAME_LANE_GROUPS = [
+  {
+    key: 'position',
+    label: 'Posisi',
+    icon: 'bi-arrows-move',
+    color: '#38bdf8',
+    props: ['x', 'y', 'z'],
+    defaultProps: ['x', 'y'],
+    primaryProp: 'x'
+  },
+  {
+    key: 'scale',
+    label: 'Scale',
+    icon: 'bi-arrows-angle-expand',
+    color: '#a78bfa',
+    props: ['scaleX', 'scaleY'],
+    defaultProps: ['scaleX', 'scaleY'],
+    primaryProp: 'scaleX'
+  },
+  {
+    key: 'rotation',
+    label: 'Rotasi',
+    icon: 'bi-arrow-clockwise',
+    color: '#f472b6',
+    props: ['rotation', 'rotX', 'rotY'],
+    defaultProps: ['rotation'],
+    primaryProp: 'rotation'
+  },
+  {
+    key: 'opacity',
+    label: 'Opacity',
+    icon: 'bi-brightness-half',
+    color: '#34d399',
+    props: ['opacity'],
+    defaultProps: ['opacity'],
+    primaryProp: 'opacity'
+  },
+  {
+    key: 'volume',
+    label: 'Volume',
+    icon: 'bi-volume-up-fill',
+    color: '#ffab40',
+    props: ['volume'],
+    defaultProps: ['volume'],
+    primaryProp: 'volume'
+  },
+  {
+    key: 'color',
+    label: 'Warna',
+    icon: 'bi-palette-fill',
+    color: '#fb7185',
+    props: ['color'],
+    defaultProps: ['color'],
+    primaryProp: 'color',
+    isColor: true
+  }
 ];
 
 export const EASING_TYPES = [
@@ -25,27 +84,27 @@ export const EASING_TYPES = [
 ];
 
 export const ANIMATION_PRESETS = [
-  { id: 'fadeIn', label: 'Fade In', icon: 'bi-brightness-high' },
-  { id: 'fadeOut', label: 'Fade Out', icon: 'bi-brightness-low' },
-  { id: 'slideInLeft', label: 'Slide In Left', icon: 'bi-box-arrow-in-right' },
-  { id: 'slideInRight', label: 'Slide In Right', icon: 'bi-box-arrow-in-left' },
-  { id: 'slideInUp', label: 'Slide Up', icon: 'bi-arrow-up-square' },
-  { id: 'slideInDown', label: 'Slide Down', icon: 'bi-arrow-down-square' },
-  { id: 'slideOutLeft', label: 'Slide Out Left', icon: 'bi-box-arrow-left' },
-  { id: 'slideOutRight', label: 'Slide Out Right', icon: 'bi-box-arrow-right' },
-  { id: 'slideOutDown', label: 'Drop Out', icon: 'bi-box-arrow-down' },
-  { id: 'zoomIn', label: 'Zoom In', icon: 'bi-zoom-in' },
-  { id: 'zoomOut', label: 'Zoom Out', icon: 'bi-zoom-out' },
-  { id: 'bounceIn', label: 'Bounce In', icon: 'bi-activity' },
-  { id: 'spinIn', label: 'Spin In', icon: 'bi-arrow-clockwise' },
-  { id: 'spinOut', label: 'Spin Out', icon: 'bi-arrow-counterclockwise' },
-  { id: 'popUp', label: 'Pop Up', icon: 'bi-stars' },
-  { id: 'rotate360', label: 'Rotate 360°', icon: 'bi-arrow-repeat' },
-  { id: 'bounce', label: 'Bounce Pop', icon: 'bi-activity' },
-  { id: 'shake', label: 'Shake', icon: 'bi-vibrate' },
-  { id: 'pulseLoop', label: 'Heartbeat', icon: 'bi-heart-pulse' },
-  { id: 'swing', label: 'Pendulum', icon: 'bi-stopwatch' },
-  { id: 'float3D', label: '3D Float', icon: 'bi-badge-3d' }
+  { id: 'fadeIn', cat: 'in', label: 'Fade In', icon: 'bi-brightness-high' },
+  { id: 'fadeOut', cat: 'out', label: 'Fade Out', icon: 'bi-brightness-low' },
+  { id: 'slideInLeft', cat: 'in', label: 'Slide In Left', icon: 'bi-box-arrow-in-right' },
+  { id: 'slideInRight', cat: 'in', label: 'Slide In Right', icon: 'bi-box-arrow-in-left' },
+  { id: 'slideInUp', cat: 'in', label: 'Slide Up', icon: 'bi-arrow-up-square' },
+  { id: 'slideInDown', cat: 'in', label: 'Slide Down', icon: 'bi-arrow-down-square' },
+  { id: 'slideOutLeft', cat: 'out', label: 'Slide Out Left', icon: 'bi-box-arrow-left' },
+  { id: 'slideOutRight', cat: 'out', label: 'Slide Out Right', icon: 'bi-box-arrow-right' },
+  { id: 'slideOutDown', cat: 'out', label: 'Drop Out', icon: 'bi-box-arrow-down' },
+  { id: 'zoomIn', cat: 'in', label: 'Zoom In', icon: 'bi-zoom-in' },
+  { id: 'zoomOut', cat: 'out', label: 'Zoom Out', icon: 'bi-zoom-out' },
+  { id: 'bounceIn', cat: 'in', label: 'Bounce In', icon: 'bi-activity' },
+  { id: 'spinIn', cat: 'in', label: 'Spin In', icon: 'bi-arrow-clockwise' },
+  { id: 'spinOut', cat: 'out', label: 'Spin Out', icon: 'bi-arrow-counterclockwise' },
+  { id: 'popUp', cat: 'in', label: 'Pop Up', icon: 'bi-stars' },
+  { id: 'rotate360', cat: 'combo', label: 'Rotate 360°', icon: 'bi-arrow-repeat' },
+  { id: 'bounce', cat: 'combo', label: 'Bounce Pop', icon: 'bi-activity' },
+  { id: 'shake', cat: 'combo', label: 'Shake', icon: 'bi-vibrate' },
+  { id: 'pulseLoop', cat: 'combo', label: 'Heartbeat', icon: 'bi-heart-pulse' },
+  { id: 'swing', cat: 'combo', label: 'Pendulum', icon: 'bi-stopwatch' },
+  { id: 'float3D', cat: 'combo', label: '3D Float', icon: 'bi-badge-3d' }
 ];
 
 export const KeyframeEngine = {
@@ -55,23 +114,60 @@ export const KeyframeEngine = {
     return target.keyframes[prop];
   },
 
-  setKeyframe(target, prop, frame, value, easing = 'easeInOut', bezier = [0.42, 0, 0.58, 1]) {
+  getDefaultPropValue(layer, prop) {
+    if (!layer) return prop === 'color' ? '#ffffff' : 0;
+    if (prop === 'color') {
+      if (layer.type === 'text' && layer.textProps?.color) {
+        return normalizeHexColor(layer.textProps.color, '#ffffff');
+      }
+      if (layer.type === 'shape' && layer.shapeProps?.fillColor) {
+        return normalizeHexColor(layer.shapeProps.fillColor, '#7c4dff');
+      }
+      return normalizeHexColor(layer.fx?.tintColor || '#ffffff', '#ffffff');
+    }
+    if (prop === 'volume') return layer.audioProps?.volume ?? 1;
+    const base = layer.transform || {};
+    if (prop === 'scaleX' || prop === 'scaleY' || prop === 'opacity') return base[prop] ?? 1;
+    return base[prop] ?? 0;
+  },
+
+  getVisibleKeyframeLanes(layer) {
+    if (!layer) return [];
+    const hasProps = (props) => props.some((p) => (layer.keyframes?.[p]?.length || 0) > 0);
+    return KEYFRAME_LANE_GROUPS.filter((g) => {
+      if (hasProps(g.props)) return true;
+      if (layer.type === 'audio') return g.key === 'volume';
+      if (layer.type === 'adjustment') return g.key === 'opacity' || g.key === 'color';
+      if (g.key === 'volume') return layer.type === 'video' || Boolean(layer.audioProps);
+      return true;
+    });
+  },
+
+  setKeyframe(target, prop, frame, value, easing = 'easeInOut', bezier = [0.42, 0, 0.58, 1], opts = null) {
     const f = Math.round(frame);
     const list = this.ensurePropTrack(target, prop);
+    const storedVal = prop === 'color'
+      ? normalizeHexColor(String(value || '#ffffff'), '#ffffff')
+      : Number(value);
     const existing = list.find((k) => k.frame === f);
     if (existing) {
-      existing.value = Number(value);
+      existing.value = storedVal;
       existing.easing = easing;
       existing.bezier = [...bezier];
+      if (opts && Object.prototype.hasOwnProperty.call(opts, 'presetTag')) {
+        if (opts.presetTag) existing.presetTag = opts.presetTag;
+        else delete existing.presetTag;
+      }
       return existing;
     }
     const kf = {
       id: uid('kf'),
       frame: f,
-      value: Number(value),
+      value: storedVal,
       easing,
       bezier: [...bezier]
     };
+    if (opts?.presetTag) kf.presetTag = opts.presetTag;
     list.push(kf);
     list.sort((a, b) => a.frame - b.frame);
     return kf;
@@ -123,7 +219,116 @@ export const KeyframeEngine = {
     return Array.from(set).sort((a, b) => a - b);
   },
 
+  getLaneKeyframes(layer, propKeys) {
+    if (!layer?.keyframes || !Array.isArray(propKeys)) return [];
+    const byFrame = new Map();
+    for (const p of propKeys) {
+      const arr = layer.keyframes[p];
+      if (!Array.isArray(arr)) continue;
+      for (const k of arr) {
+        let entry = byFrame.get(k.frame);
+        if (!entry) {
+          entry = {
+            frame: k.frame,
+            easing: k.easing || 'linear',
+            bezier: k.bezier ? [...k.bezier] : [0.42, 0, 0.58, 1],
+            colorVal: p === 'color' ? normalizeHexColor(String(k.value), '#ffffff') : null,
+            presetTag: k.presetTag || null,
+            props: [p],
+            summary: `${p}:${p === 'color' ? k.value : Number(Number(k.value).toFixed(2))}`
+          };
+          byFrame.set(k.frame, entry);
+        } else {
+          entry.props.push(p);
+          entry.summary += ` ${p}:${p === 'color' ? k.value : Number(Number(k.value).toFixed(2))}`;
+          if (!entry.presetTag && k.presetTag) entry.presetTag = k.presetTag;
+        }
+      }
+    }
+    return Array.from(byFrame.values()).sort((a, b) => a.frame - b.frame);
+  },
+
+  movePropGroupKeyframe(layer, propKeys, oldFrame, newFrame) {
+    const fOld = Math.round(oldFrame);
+    const fNew = Math.max(0, Math.round(newFrame));
+    if (fOld === fNew || !layer?.keyframes || !Array.isArray(propKeys)) return false;
+    let moved = false;
+    for (const prop of propKeys) {
+      const list = layer.keyframes[prop];
+      if (!Array.isArray(list)) continue;
+      const kf = list.find((k) => k.frame === fOld);
+      if (kf) {
+        if (this.moveKeyframe(layer, prop, kf.id, fNew)) {
+          moved = true;
+        }
+      }
+    }
+    return moved;
+  },
+
+  removePropGroupKeyframe(layer, propKeys, frame) {
+    const f = Math.round(frame);
+    if (!layer?.keyframes || !Array.isArray(propKeys)) return false;
+    let removed = false;
+    for (const prop of propKeys) {
+      const list = layer.keyframes[prop];
+      if (!Array.isArray(list)) continue;
+      const idx = list.findIndex((k) => k.frame === f);
+      if (idx >= 0) {
+        list.splice(idx, 1);
+        removed = true;
+      }
+    }
+    return removed;
+  },
+
+  setPropGroupEasing(layer, propKeys, frame, easing, bezier = null) {
+    const f = Math.round(frame);
+    if (!layer?.keyframes || !Array.isArray(propKeys)) return false;
+    let updated = false;
+    for (const prop of propKeys) {
+      const list = layer.keyframes[prop];
+      if (!Array.isArray(list)) continue;
+      const kf = list.find((k) => k.frame === f);
+      if (kf) {
+        kf.easing = easing;
+        if (Array.isArray(bezier) && bezier.length === 4) {
+          kf.bezier = [...bezier];
+        }
+        updated = true;
+      }
+    }
+    return updated;
+  },
+
+  togglePropLaneKeyframeAtFrame(layer, laneKey, frame, easing = 'easeInOut') {
+    const group = KEYFRAME_LANE_GROUPS.find((g) => g.key === laneKey);
+    if (!layer || !group) return { added: false, laneKey };
+    const f = Math.max(layer.startFrame || 0, Math.min(layer.endFrame ?? frame, Math.round(frame)));
+    const exists = group.props.some((p) => Boolean(this.getKeyframeAtFrame(layer, p, f)));
+    if (exists) {
+      this.removePropGroupKeyframe(layer, group.props, f);
+      return { added: false, laneKey, frame: f };
+    }
+    const tf = this.getTransformAtFrame(layer, f);
+    for (const p of group.defaultProps) {
+      let val;
+      if (p === 'color') {
+        val = this.getColorAtFrame(layer, f, this.getDefaultPropValue(layer, 'color'));
+      } else if (p === 'volume') {
+        val = this.getValueAtFrame(layer, 'volume', f, this.getDefaultPropValue(layer, 'volume'));
+      } else {
+        val = tf[p] ?? this.getDefaultPropValue(layer, p);
+      }
+      this.setKeyframe(layer, p, f, val, easing);
+    }
+    return { added: true, laneKey, frame: f };
+  },
+
   getValueAtFrame(target, prop, frame, fallbackValue = 0) {
+    if (prop === 'color') {
+      return this.getColorAtFrame(target, frame, typeof fallbackValue === 'string' ? fallbackValue : '#ffffff');
+    }
     const list = target?.keyframes?.[prop];
     if (!list || list.length === 0) {
       return fallbackValue;
@@ -173,6 +378,32 @@ export const KeyframeEngine = {
     return fallbackValue;
   },
 
+  getColorAtFrame(target, frame, fallbackHex = '#ffffff') {
+    const safeFallback = normalizeHexColor(fallbackHex, '#ffffff');
+    const list = target?.keyframes?.color;
+    if (!list || list.length === 0) return safeFallback;
+    if (list.length === 1 || frame <= list[0].frame) {
+      return normalizeHexColor(String(list[0].value), safeFallback);
+    }
+    const last = list[list.length - 1];
+    if (frame >= last.frame) {
+      return normalizeHexColor(String(last.value), safeFallback);
+    }
+    for (let i = 0; i < list.length - 1; i++) {
+      const a = list[i];
+      const b = list[i + 1];
+      if (frame >= a.frame && frame <= b.frame) {
+        const span = b.frame - a.frame;
+        if (span <= 0) return normalizeHexColor(String(b.value), safeFallback);
+        const rawT = (frame - a.frame) / span;
+        const mode = a.easing === 'smooth' ? 'easeInOut' : (a.easing || 'linear');
+        const easedT = applyEasing(rawT, mode, a.bezier || [0.42, 0, 0.58, 1]);
+        return lerpColorHex(String(a.value), String(b.value), easedT);
+      }
+    }
+    return safeFallback;
+  },
+
   moveAllKeyframesAtFrame(layer, oldFrame, newFrame) {
     const fOld = Math.round(oldFrame);
     const fNew = Math.max(0, Math.round(newFrame));
@@ -216,7 +447,37 @@ export const KeyframeEngine = {
     };
   },
 
+  getPresetCategory(presetId) {
+    const spec = ANIMATION_PRESETS.find((p) => p.id === presetId);
+    return spec?.cat || 'combo';
+  },
+
+  clearPresetCategory(layer, category) {
+    if (!layer) return 0;
+    let removed = 0;
+    if (layer.keyframes) {
+      for (const prop of Object.keys(layer.keyframes)) {
+        const arr = layer.keyframes[prop];
+        if (!Array.isArray(arr)) continue;
+        const next = arr.filter((k) => k.presetTag !== category);
+        removed += arr.length - next.length;
+        layer.keyframes[prop] = next;
+      }
+    }
+    if (category === 'in') layer.presetInId = null;
+    else if (category === 'out') layer.presetOutId = null;
+    else if (category === 'combo') layer.presetComboId = null;
+    return removed;
+  },
+
   applyPreset(layer, presetId, projectWidth, projectHeight, durationFrames = 24) {
+    const cat = this.getPresetCategory(presetId);
+    this.clearPresetCategory(layer, cat);
+
+    if (cat === 'in') layer.presetInId = presetId;
+    else if (cat === 'out') layer.presetOutId = presetId;
+    else layer.presetComboId = presetId;
+
     const start = layer.startFrame;
     const dur = Math.max(6, Math.round(durationFrames));
     const end = Math.min(layer.endFrame, start + dur);
@@ -224,109 +485,112 @@ export const KeyframeEngine = {
     const outEnd = layer.endFrame;
     const base = layer.transform;
     const fullEnd = layer.endFrame;
+    const tagOpts = { presetTag: cat };
+    const sk = (prop, f, val, easing = 'easeInOut') =>
+      this.setKeyframe(layer, prop, f, val, easing, [0.42, 0, 0.58, 1], tagOpts);
 
     switch (presetId) {
       case 'fadeIn':
-        this.setKeyframe(layer, 'opacity', start, 0, 'easeOut');
-        this.setKeyframe(layer, 'opacity', end, base.opacity ?? 1, 'linear');
+        sk('opacity', start, 0, 'easeOut');
+        sk('opacity', end, base.opacity ?? 1, 'linear');
         break;
       case 'fadeOut':
-        this.setKeyframe(layer, 'opacity', outStart, base.opacity ?? 1, 'easeIn');
-        this.setKeyframe(layer, 'opacity', outEnd, 0, 'linear');
+        sk('opacity', outStart, base.opacity ?? 1, 'easeIn');
+        sk('opacity', outEnd, 0, 'linear');
         break;
       case 'slideInLeft':
-        this.setKeyframe(layer, 'x', start, -projectWidth * 0.65, 'easeOut');
-        this.setKeyframe(layer, 'x', end, base.x, 'linear');
-        this.setKeyframe(layer, 'opacity', start, 0, 'easeOut');
-        this.setKeyframe(layer, 'opacity', Math.min(end, start + 8), base.opacity ?? 1, 'linear');
+        sk('x', start, -projectWidth * 0.65, 'easeOut');
+        sk('x', end, base.x, 'linear');
+        sk('opacity', start, 0, 'easeOut');
+        sk('opacity', Math.min(end, start + 8), base.opacity ?? 1, 'linear');
         break;
       case 'slideInRight':
-        this.setKeyframe(layer, 'x', start, projectWidth * 0.65, 'easeOut');
-        this.setKeyframe(layer, 'x', end, base.x, 'linear');
+        sk('x', start, projectWidth * 0.65, 'easeOut');
+        sk('x', end, base.x, 'linear');
         break;
       case 'slideInUp':
-        this.setKeyframe(layer, 'y', start, projectHeight * 0.55, 'easeOut');
-        this.setKeyframe(layer, 'y', end, base.y, 'linear');
-        this.setKeyframe(layer, 'opacity', start, 0, 'easeOut');
-        this.setKeyframe(layer, 'opacity', Math.min(end, start + 8), base.opacity ?? 1, 'linear');
+        sk('y', start, projectHeight * 0.55, 'easeOut');
+        sk('y', end, base.y, 'linear');
+        sk('opacity', start, 0, 'easeOut');
+        sk('opacity', Math.min(end, start + 8), base.opacity ?? 1, 'linear');
         break;
       case 'slideInDown':
-        this.setKeyframe(layer, 'y', start, -projectHeight * 0.55, 'easeOut');
-        this.setKeyframe(layer, 'y', end, base.y, 'linear');
-        this.setKeyframe(layer, 'opacity', start, 0, 'easeOut');
-        this.setKeyframe(layer, 'opacity', Math.min(end, start + 8), base.opacity ?? 1, 'linear');
+        sk('y', start, -projectHeight * 0.55, 'easeOut');
+        sk('y', end, base.y, 'linear');
+        sk('opacity', start, 0, 'easeOut');
+        sk('opacity', Math.min(end, start + 8), base.opacity ?? 1, 'linear');
         break;
       case 'slideOutLeft':
-        this.setKeyframe(layer, 'x', outStart, base.x, 'easeIn');
-        this.setKeyframe(layer, 'x', outEnd, -projectWidth * 0.65, 'linear');
+        sk('x', outStart, base.x, 'easeIn');
+        sk('x', outEnd, -projectWidth * 0.65, 'linear');
         break;
       case 'slideOutRight':
-        this.setKeyframe(layer, 'x', outStart, base.x, 'easeIn');
-        this.setKeyframe(layer, 'x', outEnd, projectWidth * 0.65, 'linear');
+        sk('x', outStart, base.x, 'easeIn');
+        sk('x', outEnd, projectWidth * 0.65, 'linear');
         break;
       case 'slideOutDown':
-        this.setKeyframe(layer, 'y', outStart, base.y, 'easeIn');
-        this.setKeyframe(layer, 'y', outEnd, projectHeight * 0.6, 'linear');
-        this.setKeyframe(layer, 'opacity', outStart, base.opacity ?? 1, 'easeIn');
-        this.setKeyframe(layer, 'opacity', outEnd, 0, 'linear');
+        sk('y', outStart, base.y, 'easeIn');
+        sk('y', outEnd, projectHeight * 0.6, 'linear');
+        sk('opacity', outStart, base.opacity ?? 1, 'easeIn');
+        sk('opacity', outEnd, 0, 'linear');
         break;
       case 'zoomIn':
-        this.setKeyframe(layer, 'scaleX', start, 0.1, 'easeOut');
-        this.setKeyframe(layer, 'scaleY', start, 0.1, 'easeOut');
-        this.setKeyframe(layer, 'scaleX', end, base.scaleX, 'linear');
-        this.setKeyframe(layer, 'scaleY', end, base.scaleY, 'linear');
+        sk('scaleX', start, 0.1, 'easeOut');
+        sk('scaleY', start, 0.1, 'easeOut');
+        sk('scaleX', end, base.scaleX, 'linear');
+        sk('scaleY', end, base.scaleY, 'linear');
         break;
       case 'zoomOut':
-        this.setKeyframe(layer, 'scaleX', outStart, base.scaleX, 'easeIn');
-        this.setKeyframe(layer, 'scaleY', outStart, base.scaleY, 'easeIn');
-        this.setKeyframe(layer, 'scaleX', outEnd, 0.05, 'linear');
-        this.setKeyframe(layer, 'scaleY', outEnd, 0.05, 'linear');
+        sk('scaleX', outStart, base.scaleX, 'easeIn');
+        sk('scaleY', outStart, base.scaleY, 'easeIn');
+        sk('scaleX', outEnd, 0.05, 'linear');
+        sk('scaleY', outEnd, 0.05, 'linear');
         break;
       case 'spinIn':
-        this.setKeyframe(layer, 'rotation', start, base.rotation - 180, 'easeOut');
-        this.setKeyframe(layer, 'rotation', end, base.rotation, 'linear');
-        this.setKeyframe(layer, 'scaleX', start, 0.2, 'easeOut');
-        this.setKeyframe(layer, 'scaleY', start, 0.2, 'easeOut');
-        this.setKeyframe(layer, 'scaleX', end, base.scaleX, 'linear');
-        this.setKeyframe(layer, 'scaleY', end, base.scaleY, 'linear');
+        sk('rotation', start, base.rotation - 180, 'easeOut');
+        sk('rotation', end, base.rotation, 'linear');
+        sk('scaleX', start, 0.2, 'easeOut');
+        sk('scaleY', start, 0.2, 'easeOut');
+        sk('scaleX', end, base.scaleX, 'linear');
+        sk('scaleY', end, base.scaleY, 'linear');
         break;
       case 'spinOut':
-        this.setKeyframe(layer, 'rotation', outStart, base.rotation, 'easeIn');
-        this.setKeyframe(layer, 'rotation', outEnd, base.rotation + 180, 'linear');
-        this.setKeyframe(layer, 'scaleX', outStart, base.scaleX, 'easeIn');
-        this.setKeyframe(layer, 'scaleY', outStart, base.scaleY, 'easeIn');
-        this.setKeyframe(layer, 'scaleX', outEnd, 0.05, 'linear');
-        this.setKeyframe(layer, 'scaleY', outEnd, 0.05, 'linear');
+        sk('rotation', outStart, base.rotation, 'easeIn');
+        sk('rotation', outEnd, base.rotation + 180, 'linear');
+        sk('scaleX', outStart, base.scaleX, 'easeIn');
+        sk('scaleY', outStart, base.scaleY, 'easeIn');
+        sk('scaleX', outEnd, 0.05, 'linear');
+        sk('scaleY', outEnd, 0.05, 'linear');
         break;
       case 'popUp':
       case 'bounceIn': {
         const mid1 = start + Math.round((end - start) * 0.55);
         const mid2 = start + Math.round((end - start) * 0.8);
-        this.setKeyframe(layer, 'scaleX', start, 0.15, 'easeOut');
-        this.setKeyframe(layer, 'scaleY', start, 0.15, 'easeOut');
-        this.setKeyframe(layer, 'scaleX', mid1, base.scaleX * 1.18, 'easeInOut');
-        this.setKeyframe(layer, 'scaleY', mid1, base.scaleY * 1.18, 'easeInOut');
-        this.setKeyframe(layer, 'scaleX', mid2, base.scaleX * 0.94, 'easeInOut');
-        this.setKeyframe(layer, 'scaleY', mid2, base.scaleY * 0.94, 'easeInOut');
-        this.setKeyframe(layer, 'scaleX', end, base.scaleX, 'linear');
-        this.setKeyframe(layer, 'scaleY', end, base.scaleY, 'linear');
+        sk('scaleX', start, 0.15, 'easeOut');
+        sk('scaleY', start, 0.15, 'easeOut');
+        sk('scaleX', mid1, base.scaleX * 1.18, 'easeInOut');
+        sk('scaleY', mid1, base.scaleY * 1.18, 'easeInOut');
+        sk('scaleX', mid2, base.scaleX * 0.94, 'easeInOut');
+        sk('scaleY', mid2, base.scaleY * 0.94, 'easeInOut');
+        sk('scaleX', end, base.scaleX, 'linear');
+        sk('scaleY', end, base.scaleY, 'linear');
         break;
       }
       case 'rotate360':
-        this.setKeyframe(layer, 'rotation', start, base.rotation, 'easeInOut');
-        this.setKeyframe(layer, 'rotation', end, base.rotation + 360, 'linear');
+        sk('rotation', start, base.rotation, 'easeInOut');
+        sk('rotation', end, base.rotation + 360, 'linear');
         break;
       case 'bounce': {
         const mid1 = start + Math.round((end - start) * 0.45);
         const mid2 = start + Math.round((end - start) * 0.72);
-        this.setKeyframe(layer, 'scaleX', start, 0.2, 'easeOut');
-        this.setKeyframe(layer, 'scaleY', start, 0.2, 'easeOut');
-        this.setKeyframe(layer, 'scaleX', mid1, base.scaleX * 1.18, 'easeInOut');
-        this.setKeyframe(layer, 'scaleY', mid1, base.scaleY * 1.18, 'easeInOut');
-        this.setKeyframe(layer, 'scaleX', mid2, base.scaleX * 0.94, 'easeInOut');
-        this.setKeyframe(layer, 'scaleY', mid2, base.scaleY * 0.94, 'easeInOut');
-        this.setKeyframe(layer, 'scaleX', end, base.scaleX, 'linear');
-        this.setKeyframe(layer, 'scaleY', end, base.scaleY, 'linear');
+        sk('scaleX', start, 0.2, 'easeOut');
+        sk('scaleY', start, 0.2, 'easeOut');
+        sk('scaleX', mid1, base.scaleX * 1.18, 'easeInOut');
+        sk('scaleY', mid1, base.scaleY * 1.18, 'easeInOut');
+        sk('scaleX', mid2, base.scaleX * 0.94, 'easeInOut');
+        sk('scaleY', mid2, base.scaleY * 0.94, 'easeInOut');
+        sk('scaleX', end, base.scaleX, 'linear');
+        sk('scaleY', end, base.scaleY, 'linear');
         break;
       }
       case 'shake': {
@@ -334,42 +598,42 @@ export const KeyframeEngine = {
         const offsets = [0, -18, 18, -12, 12, -5, 0];
         offsets.forEach((dx, i) => {
           const f = Math.min(layer.endFrame, start + i * step);
-          this.setKeyframe(layer, 'x', f, base.x + dx, 'linear');
+          sk('x', f, base.x + dx, 'linear');
         });
         break;
       }
       case 'pulseLoop': {
         const half = Math.max(4, Math.round((fullEnd - start) / 2));
         const q1 = start + Math.round(half / 2);
-        this.setKeyframe(layer, 'scaleX', start, base.scaleX, 'easeInOut');
-        this.setKeyframe(layer, 'scaleY', start, base.scaleY, 'easeInOut');
-        this.setKeyframe(layer, 'scaleX', q1, base.scaleX * 1.12, 'easeInOut');
-        this.setKeyframe(layer, 'scaleY', q1, base.scaleY * 1.12, 'easeInOut');
-        this.setKeyframe(layer, 'scaleX', start + half, base.scaleX, 'easeInOut');
-        this.setKeyframe(layer, 'scaleY', start + half, base.scaleY, 'easeInOut');
-        this.setKeyframe(layer, 'scaleX', fullEnd, base.scaleX, 'linear');
-        this.setKeyframe(layer, 'scaleY', fullEnd, base.scaleY, 'linear');
+        sk('scaleX', start, base.scaleX, 'easeInOut');
+        sk('scaleY', start, base.scaleY, 'easeInOut');
+        sk('scaleX', q1, base.scaleX * 1.12, 'easeInOut');
+        sk('scaleY', q1, base.scaleY * 1.12, 'easeInOut');
+        sk('scaleX', start + half, base.scaleX, 'easeInOut');
+        sk('scaleY', start + half, base.scaleY, 'easeInOut');
+        sk('scaleX', fullEnd, base.scaleX, 'linear');
+        sk('scaleY', fullEnd, base.scaleY, 'linear');
         break;
       }
       case 'swing': {
         const t1 = start + Math.round((fullEnd - start) * 0.25);
         const t2 = start + Math.round((fullEnd - start) * 0.5);
         const t3 = start + Math.round((fullEnd - start) * 0.75);
-        this.setKeyframe(layer, 'rotation', start, base.rotation - 10, 'easeInOut');
-        this.setKeyframe(layer, 'rotation', t1, base.rotation + 10, 'easeInOut');
-        this.setKeyframe(layer, 'rotation', t2, base.rotation - 8, 'easeInOut');
-        this.setKeyframe(layer, 'rotation', t3, base.rotation + 8, 'easeInOut');
-        this.setKeyframe(layer, 'rotation', fullEnd, base.rotation, 'linear');
+        sk('rotation', start, base.rotation - 10, 'easeInOut');
+        sk('rotation', t1, base.rotation + 10, 'easeInOut');
+        sk('rotation', t2, base.rotation - 8, 'easeInOut');
+        sk('rotation', t3, base.rotation + 8, 'easeInOut');
+        sk('rotation', fullEnd, base.rotation, 'linear');
         break;
       }
       case 'float3D': {
         const mid = start + Math.round((fullEnd - start) * 0.5);
-        this.setKeyframe(layer, 'rotY', start, -12, 'easeInOut');
-        this.setKeyframe(layer, 'rotY', mid, 12, 'easeInOut');
-        this.setKeyframe(layer, 'rotY', fullEnd, -12, 'linear');
-        this.setKeyframe(layer, 'y', start, base.y - 12, 'easeInOut');
-        this.setKeyframe(layer, 'y', mid, base.y + 12, 'easeInOut');
-        this.setKeyframe(layer, 'y', fullEnd, base.y - 12, 'linear');
+        sk('rotY', start, -12, 'easeInOut');
+        sk('rotY', mid, 12, 'easeInOut');
+        sk('rotY', fullEnd, -12, 'linear');
+        sk('y', start, base.y - 12, 'easeInOut');
+        sk('y', mid, base.y + 12, 'easeInOut');
+        sk('y', fullEnd, base.y - 12, 'linear');
         break;
       }
     }

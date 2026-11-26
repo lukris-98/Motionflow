@@ -18,7 +18,7 @@ import { SPEED_CURVE_PRESETS, TimelineEngine } from '../engine/timelineEngine.js
 import { STABILIZE_PRESETS } from '../engine/stabilizerEngine.js';
 import { TrackerEngine } from '../engine/trackerEngine.js';
 import { setLayerColorMatchIntensity, toggleLayerColorMatch } from '../engine/colorMatchEngine.js';
-import { formatBytes, formatDurationMs } from '../utils/math.js';
+import { formatBytes, formatDurationMs, normalizeHexColor } from '../utils/math.js';
 
 const SAMPLE_PREVIEW_SVG = 'data:image/svg+xml;utf8,' + encodeURIComponent(
   '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 90">' +
@@ -399,16 +399,29 @@ export class PanelsUI {
 
     const frame = this.app.currentFrame;
     const prop = this.selectedKfProp;
+    const propMeta = ANIMATABLE_PROPS.find((p) => p.key === prop);
+    const isColorProp = prop === 'color' || Boolean(propMeta?.isColor);
     const tf = KeyframeEngine.getTransformAtFrame(layer, frame);
-    const curVal = tf[prop] ?? 0;
+    const curVal = isColorProp
+      ? KeyframeEngine.getColorAtFrame(layer, frame, KeyframeEngine.getDefaultPropValue(layer, 'color'))
+      : prop === 'volume'
+        ? KeyframeEngine.getValueAtFrame(layer, 'volume', frame, KeyframeEngine.getDefaultPropValue(layer, 'volume'))
+        : (tf[prop] ?? KeyframeEngine.getDefaultPropValue(layer, prop));
     const kfAtCur = KeyframeEngine.getKeyframeAtFrame(layer, prop, frame);
     const list = KeyframeEngine.ensurePropTrack(layer, prop);
     const activeEasing = kfAtCur?.easing || 'easeInOut';
     const bez = [...(kfAtCur?.bezier || [0.42, 0, 0.58, 1])];
     const animItems = ANIMATION_CATALOG.filter((a) => a.cat === this.activeAnimTab);
+    const isPresetActive = (id) =>
+      layer.presetInId === id || layer.presetOutId === id || layer.presetComboId === id || layer.activePresetId === id;
+    const activePresetChips = [
+      layer.presetInId ? { cat: 'in', label: `In: ${ANIMATION_CATALOG.find((x) => x.id === layer.presetInId)?.label || layer.presetInId}` } : null,
+      layer.presetOutId ? { cat: 'out', label: `Out: ${ANIMATION_CATALOG.find((x) => x.id === layer.presetOutId)?.label || layer.presetOutId}` } : null,
+      layer.presetComboId ? { cat: 'combo', label: `Combo: ${ANIMATION_CATALOG.find((x) => x.id === layer.presetComboId)?.label || layer.presetComboId}` } : null
+    ].filter(Boolean);
 
     body.innerHTML = `
-      <div class="d-flex align-items-center justify-content-between gap-2 mb-2">
+      <div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mb-2">
         <div class="btn-group btn-group-sm" role="group">
           <button type="button" class="btn ${this.activeAnimTab === 'in' ? 'btn-info text-dark fw-semibold' : 'btn-dark border-secondary-subtle'}" data-anim-tab="in">In</button>
           <button type="button" class="btn ${this.activeAnimTab === 'out' ? 'btn-info text-dark fw-semibold' : 'btn-dark border-secondary-subtle'}" data-anim-tab="out">Out</button>
@@ -420,15 +433,33 @@ export class PanelsUI {
         </div>
       </div>
 
-      <div class="mf-tile-grid mb-3">
+      <div class="mf-tile-grid mb-2">
         ${animItems.map((a) => `
-          <button type="button" class="mf-preview-tile ${layer.activePresetId === a.id ? 'active' : ''}" data-preset="${a.id}">
+          <div role="button" tabindex="0" class="mf-preview-tile has-add-btn ${isPresetActive(a.id) ? 'active' : ''}" data-anim-preview="${a.id}" aria-label="Preview ${a.label}">
             <div class="mf-tile-stage">
               <div class="mf-anim-chip ${a.animClass}" style="background:linear-gradient(135deg, ${a.color}, #7c4dff);">Aa</div>
             </div>
             <div class="mf-tile-label">${a.label}</div>
-          </button>
+            <button type="button" class="mf-tile-add-btn" data-preset="${a.id}" title="Apply ${a.label}" aria-label="Apply ${a.label}">
+              <i class="bi bi-plus-lg"></i>
+            </button>
+          </div>
         `).join('')}
+      </div>
+
+      <div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mb-2 px-2 py-1 rounded-2 bg-dark border border-secondary-subtle">
+        <div class="d-flex flex-wrap align-items-center gap-1">
+          <span class="small text-secondary" style="font-size:0.68rem;"><i class="bi bi-diamond-fill text-info me-1"></i>Preset = Keyframe siap pakai</span>
+          ${activePresetChips.map((c) => `
+            <span class="badge text-bg-dark border border-info-subtle d-inline-flex align-items-center gap-1">
+              <span>${c.label}</span>
+              <button type="button" class="btn-close btn-close-white" style="font-size:0.45rem;" data-clear-preset-cat="${c.cat}" aria-label="Hapus preset ${c.cat}"></button>
+            </span>
+          `).join('')}
+        </div>
+        <button type="button" id="btnRevealKfLanes" class="btn btn-sm btn-outline-info py-0 px-2" style="font-size:0.7rem;">
+          <i class="bi bi-sliders2 me-1"></i>Lane Timeline
+        </button>
       </div>
 
       <hr class="border-secondary-subtle my-2" />
@@ -442,7 +473,10 @@ export class PanelsUI {
         </div>
         <div class="col-4">
           <label class="form-label small text-secondary mb-0">Val @ F${frame}</label>
-          <input id="kfValInp" type="number" step="0.1" class="form-control form-control-sm" value="${Number(curVal.toFixed(2))}" />
+          ${isColorProp
+            ? `<input id="kfValInp" type="color" class="form-control form-control-color form-control-sm w-100" value="${normalizeHexColor(String(curVal), '#ffffff')}" />`
+            : `<input id="kfValInp" type="number" step="${propMeta?.step ?? 0.1}" class="form-control form-control-sm" value="${Number(Number(curVal).toFixed(2))}" />`
+          }
         </div>
         <div class="col-3 d-flex gap-1">
           <button id="btnAddSetKf" class="btn btn-sm mf-btn-accent flex-grow-1" title="Set Keyframe"><i class="bi bi-diamond-fill"></i></button>
@@ -473,13 +507,18 @@ export class PanelsUI {
       </div>
 
       <div class="d-flex flex-wrap gap-1">
-        ${list.length === 0 ? '<span class="small text-secondary">Tap a kotak animation preset above or set manual keyframes.</span>' : ''}
-        ${list.map((k) => `
-          <div class="badge ${k.frame === frame ? 'text-bg-info' : 'text-bg-dark border border-secondary-subtle'} d-inline-flex align-items-center gap-1 py-1 px-2">
-            <span class="cursor-pointer" data-kf-jump="${k.frame}">F${k.frame}: ${Number(k.value.toFixed(2))} (${k.easing})</span>
-            <button class="btn-close btn-close-white ms-1" style="font-size:0.5rem;" data-kf-del="${k.id}" aria-label="Delete Keyframe"></button>
-          </div>
-        `).join('')}
+        ${list.length === 0 ? '<span class="small text-secondary">Tap preset di atas atau tambah keyframe manual per properti.</span>' : ''}
+        ${list.map((k) => {
+          const valLabel = isColorProp
+            ? `<span class="rounded-1 border border-light-subtle" style="display:inline-block;width:9px;height:9px;background:${normalizeHexColor(String(k.value), '#ffffff')};"></span> ${normalizeHexColor(String(k.value), '#ffffff')}`
+            : Number(Number(k.value).toFixed(2));
+          return `
+            <div class="badge ${k.frame === frame ? 'text-bg-info' : 'text-bg-dark border border-secondary-subtle'} d-inline-flex align-items-center gap-1 py-1 px-2">
+              <span class="cursor-pointer d-inline-flex align-items-center gap-1" data-kf-jump="${k.frame}">F${k.frame}: ${valLabel} (${k.easing})</span>
+              <button class="btn-close btn-close-white ms-1" style="font-size:0.5rem;" data-kf-del="${k.id}" aria-label="Delete Keyframe"></button>
+            </div>
+          `;
+        }).join('')}
       </div>
     `;
 
@@ -492,13 +531,34 @@ export class PanelsUI {
       };
     });
 
+    const revealBtn = body.querySelector('#btnRevealKfLanes');
+    if (revealBtn) {
+      revealBtn.onclick = () => {
+        layer.kfExpanded = true;
+        this.app.scheduleAutosave();
+        this.app.refreshTimelineOnly();
+        this.app.hideOpenSheets();
+      };
+    }
+
+    body.querySelectorAll('[data-clear-preset-cat]').forEach((btn) => {
+      btn.onclick = () => {
+        const cat = btn.dataset.clearPresetCat;
+        this.app.mutateProject(() => {
+          KeyframeEngine.clearPresetCategory(layer, cat);
+        });
+        this.app.showToast(`Preset ${cat.toUpperCase()} dihapus`);
+      };
+    });
+
     body.querySelector('#kfPropSel').onchange = (e) => {
       this.selectedKfProp = e.target.value;
       this.renderKeyframesPanel();
     };
 
     body.querySelector('#btnAddSetKf').onclick = () => {
-      const val = Number(body.querySelector('#kfValInp').value);
+      const rawVal = body.querySelector('#kfValInp').value;
+      const val = isColorProp ? normalizeHexColor(String(rawVal), '#ffffff') : Number(rawVal);
       const easing = body.querySelector('#kfEasingSel').value;
       const bezVal = [
         Number(body.querySelector('#bzX1').value) || 0.42,
@@ -533,7 +593,12 @@ export class PanelsUI {
 
     body.querySelector('#btnCopyKf').onclick = () => {
       if (kfAtCur) {
-        this.copiedKeyframe = { value: kfAtCur.value, easing: kfAtCur.easing, bezier: [...(kfAtCur.bezier || [0.42, 0, 0.58, 1])] };
+        this.copiedKeyframe = {
+          prop,
+          value: kfAtCur.value,
+          easing: kfAtCur.easing,
+          bezier: [...(kfAtCur.bezier || [0.42, 0, 0.58, 1])]
+        };
         this.app.showToast('Keyframe copied');
         this.renderKeyframesPanel();
       }
@@ -541,8 +606,15 @@ export class PanelsUI {
 
     body.querySelector('#btnPasteKf').onclick = () => {
       if (this.copiedKeyframe) {
+        const pasteColor = isColorProp
+          ? normalizeHexColor(String(this.copiedKeyframe.value), '#ffffff')
+          : Number(this.copiedKeyframe.value);
+        if (!isColorProp && !Number.isFinite(pasteColor)) {
+          this.app.showToast('Tipe keyframe berbeda');
+          return;
+        }
         this.app.mutateProject(() => {
-          KeyframeEngine.setKeyframe(layer, prop, frame, this.copiedKeyframe.value, this.copiedKeyframe.easing, this.copiedKeyframe.bezier);
+          KeyframeEngine.setKeyframe(layer, prop, frame, isColorProp ? pasteColor : Number(this.copiedKeyframe.value), this.copiedKeyframe.easing, this.copiedKeyframe.bezier);
         });
       }
     };
@@ -557,15 +629,20 @@ export class PanelsUI {
       };
     });
 
+    this.bindTemplatePreviewTiles(body, '[data-anim-preview]');
+
     body.querySelectorAll('[data-preset]').forEach((btn) => {
-      btn.onclick = () => {
+      btn.onclick = (e) => {
+        e.stopPropagation();
         const durF = Number(body.querySelector('#presetDurFrames').value) || 24;
         const pid = btn.dataset.preset;
+        const tileLabel = btn.closest('.mf-preview-tile')?.querySelector('.mf-tile-label')?.textContent || pid;
         this.app.mutateProject(() => {
           layer.activePresetId = pid;
+          layer.kfExpanded = true;
           KeyframeEngine.applyPreset(layer, pid, this.app.project.width, this.app.project.height, durF);
         });
-        this.app.showToast(`Applied "${btn.querySelector('.mf-tile-label')?.textContent || pid}" animation`);
+        this.app.showToast(`Preset "${tileLabel}" diterapkan sebagai keyframe`);
       };
     });
   }
@@ -708,6 +785,32 @@ export class PanelsUI {
     });
   }
 
+  bindTemplatePreviewTiles(rootEl, tileSelector) {
+    if (!rootEl) return;
+    const tiles = [...rootEl.querySelectorAll(tileSelector)];
+    const togglePreview = (tile) => {
+      const wasPreviewing = tile.classList.contains('is-previewing');
+      tiles.forEach((other) => other.classList.remove('is-previewing'));
+      if (!wasPreviewing) {
+        void tile.offsetWidth;
+        tile.classList.add('is-previewing');
+      }
+    };
+    tiles.forEach((tile) => {
+      tile.addEventListener('click', (e) => {
+        if (e.target.closest('.mf-tile-add-btn')) return;
+        togglePreview(tile);
+      });
+      tile.addEventListener('keydown', (e) => {
+        if (e.target.closest('.mf-tile-add-btn')) return;
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          togglePreview(tile);
+        }
+      });
+    });
+  }
+
   renderStylePanel() {
     const body = document.getElementById('styleBody');
     const layer = this.app.getSelectedLayer();
@@ -789,14 +892,14 @@ export class PanelsUI {
       const tp = layer.textProps;
       const customFonts = this.app.customFonts || [];
       innerHtml = `
-        <div class="d-flex justify-content-between align-items-center mb-2 gap-1">
-          <div class="btn-group btn-group-sm">
+        <div class="d-flex flex-wrap justify-content-between align-items-center mb-2 gap-1">
+          <div class="btn-group btn-group-sm flex-wrap">
             <button type="button" class="btn ${this.activeTextSubTab === 'edit' ? 'btn-info text-dark fw-semibold' : 'btn-dark border-secondary-subtle'}" data-txt-sub="edit">Font &amp; Style</button>
             <button type="button" class="btn ${this.activeTextSubTab === 'templates' ? 'btn-info text-dark fw-semibold' : 'btn-dark border-secondary-subtle'}" data-txt-sub="templates">Templates</button>
             <button type="button" class="btn ${this.activeTextSubTab === 'bubble' ? 'btn-info text-dark fw-semibold' : 'btn-dark border-secondary-subtle'}" data-txt-sub="bubble">Bubble</button>
             <button type="button" class="btn ${this.activeTextSubTab === 'voice' ? 'btn-info text-dark fw-semibold' : 'btn-dark border-secondary-subtle'}" data-txt-sub="voice">TTS/Caps</button>
           </div>
-          <button id="btnTextOpenDraw" type="button" class="btn btn-xs btn-outline-warning py-1 px-2"><i class="bi bi-brush me-1"></i>Draw</button>
+          <button id="btnTextOpenDraw" type="button" class="btn btn-xs btn-outline-warning py-1 px-2 flex-shrink-0"><i class="bi bi-brush me-1"></i>Draw</button>
         </div>
 
         ${this.activeTextSubTab === 'templates' ? `
@@ -1490,21 +1593,29 @@ export class PanelsUI {
     const visibleFilters = this.activeFilterCat === 'all'
       ? FILTER_PRESETS
       : FILTER_PRESETS.filter((f) => f.id === 'normal' || f.cat === this.activeFilterCat);
+    const isAdjustment = layer.type === 'adjustment';
+    const activeSub = isAdjustment && this.activeFxSubTab === 'chroma' ? 'adjust' : this.activeFxSubTab;
     const curHsl = fx.hsl?.[this.selectedHslIdx] || [0, 0, 0];
     const activeCh = HSL_CHANNELS[this.selectedHslIdx] || HSL_CHANNELS[0];
 
     return `
-      <div class="d-flex justify-content-between align-items-center mb-2 gap-1">
-        <div class="btn-group btn-group-sm flex-grow-1">
-          <button type="button" class="btn ${this.activeFxSubTab === 'effects' ? 'btn-info text-dark fw-semibold' : 'btn-dark border-secondary-subtle'}" data-fx-sub="effects">Effects</button>
-          <button type="button" class="btn ${this.activeFxSubTab === 'filters' ? 'btn-info text-dark fw-semibold' : 'btn-dark border-secondary-subtle'}" data-fx-sub="filters">Filters</button>
-          <button type="button" class="btn ${this.activeFxSubTab === 'adjust' ? 'btn-info text-dark fw-semibold' : 'btn-dark border-secondary-subtle'}" data-fx-sub="adjust">Adjust/HSL</button>
-          <button type="button" class="btn ${this.activeFxSubTab === 'chroma' ? 'btn-success text-dark fw-semibold' : 'btn-dark border-secondary-subtle'}" data-fx-sub="chroma">Cutout</button>
+      ${isAdjustment ? `
+        <div class="alert alert-warning bg-dark border-warning-subtle py-1 px-2 mb-2 small d-flex align-items-center gap-2">
+          <i class="bi bi-sliders2-vertical text-warning"></i>
+          <span><strong>Adjustment Layer</strong> — Effects, Filters &amp; Adjust apply to all tracks visually below it.</span>
         </div>
-        <button id="btnFxReset" class="btn btn-xs btn-outline-secondary py-1 px-2">Reset</button>
+      ` : ''}
+      <div class="d-flex flex-wrap justify-content-between align-items-center mb-2 gap-1">
+        <div class="btn-group btn-group-sm flex-grow-1 flex-wrap">
+          <button type="button" class="btn ${activeSub === 'effects' ? 'btn-info text-dark fw-semibold' : 'btn-dark border-secondary-subtle'}" data-fx-sub="effects">Effects</button>
+          <button type="button" class="btn ${activeSub === 'filters' ? 'btn-info text-dark fw-semibold' : 'btn-dark border-secondary-subtle'}" data-fx-sub="filters">Filters</button>
+          <button type="button" class="btn ${activeSub === 'adjust' ? 'btn-info text-dark fw-semibold' : 'btn-dark border-secondary-subtle'}" data-fx-sub="adjust">Adjust/HSL</button>
+          ${!isAdjustment ? `<button type="button" class="btn ${activeSub === 'chroma' ? 'btn-success text-dark fw-semibold' : 'btn-dark border-secondary-subtle'}" data-fx-sub="chroma">Cutout</button>` : ''}
+        </div>
+        <button id="btnFxReset" class="btn btn-xs btn-outline-secondary py-1 px-2 flex-shrink-0">Reset</button>
       </div>
 
-      ${this.activeFxSubTab === 'effects' ? `
+      ${activeSub === 'effects' ? `
         <div class="mf-cat-scroll mb-1">
           ${effectCats.map((c) => `
             <button type="button" class="btn btn-xs ${this.activeEffectCat === c.id ? 'btn-info text-dark fw-semibold' : 'btn-dark border-secondary-subtle'} py-0 px-2 text-nowrap" data-ef-cat="${c.id}">${c.label}</button>
@@ -1534,7 +1645,7 @@ export class PanelsUI {
             <button id="btnFxApplyAll" type="button" class="btn btn-xs btn-outline-info w-100 py-1">Apply to All</button>
           </div>
         </div>
-      ` : this.activeFxSubTab === 'filters' ? `
+      ` : activeSub === 'filters' ? `
         <div class="mf-cat-scroll mb-1">
           ${filterCats.map((c) => `
             <button type="button" class="btn btn-xs ${this.activeFilterCat === c.id ? 'btn-info text-dark fw-semibold' : 'btn-dark border-secondary-subtle'} py-0 px-2 text-nowrap" data-flt-cat="${c.id}">${c.label}</button>
@@ -1559,7 +1670,7 @@ export class PanelsUI {
             <button id="btnFilterApplyAll" type="button" class="btn btn-xs btn-outline-info w-100 py-1">Apply to All</button>
           </div>
         </div>
-      ` : this.activeFxSubTab === 'chroma' ? `
+      ` : activeSub === 'chroma' ? `
         <div class="p-2 rounded bg-dark border border-secondary-subtle mb-2">
           <div class="d-flex justify-content-between align-items-center mb-2">
             <div class="form-check form-switch mb-0">
@@ -1952,12 +2063,12 @@ export class PanelsUI {
 
     return `
       <div class="p-2 rounded bg-dark border border-secondary-subtle mb-2">
-        <div class="d-flex justify-content-between align-items-center mb-2">
+        <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-2">
           <div class="btn-group btn-group-sm">
             <button type="button" class="btn ${this.activeTransSide === 'in' ? 'btn-info text-dark fw-semibold' : 'btn-dark border-secondary-subtle'}" data-tr-side="in">In</button>
             <button type="button" class="btn ${this.activeTransSide === 'out' ? 'btn-info text-dark fw-semibold' : 'btn-dark border-secondary-subtle'}" data-tr-side="out">Out</button>
           </div>
-          <div class="d-flex align-items-center gap-1">
+          <div class="d-flex align-items-center gap-1 flex-shrink-0">
             <button id="btnOpenFullTransitions" type="button" class="btn btn-xs btn-outline-info py-1 px-2"><i class="bi bi-intersect me-1"></i>Between Clips</button>
             <span class="small text-secondary">F</span>
             <input id="trCurFrames" type="number" min="2" max="120" class="form-control form-control-sm" style="width:56px;" value="${curTrFrames}" />
@@ -1965,7 +2076,7 @@ export class PanelsUI {
         </div>
         <div class="mf-tile-grid">
           ${TRANSITION_PRESETS.map((tp) => `
-            <button type="button" class="mf-preview-tile ${(curTrId || 'none') === tp.id ? 'active' : ''}" data-tr-pick="${tp.id}">
+            <div role="button" tabindex="0" class="mf-preview-tile has-add-btn ${(curTrId || 'none') === tp.id ? 'active' : ''}" data-tr-preview="${tp.id}" aria-label="Preview ${tp.label}">
               <div class="mf-tile-stage">
                 <div class="mf-tr-stage ${tp.animClass || 'mf-tr-none'}">
                   <div class="mf-tr-clip-a">A</div>
@@ -1974,7 +2085,10 @@ export class PanelsUI {
                 </div>
               </div>
               <div class="mf-tile-label">${tp.label}</div>
-            </button>
+              <button type="button" class="mf-tile-add-btn" data-tr-pick="${tp.id}" title="Apply ${tp.label}" aria-label="Apply ${tp.label}">
+                <i class="bi bi-plus-lg"></i>
+              </button>
+            </div>
           `).join('')}
         </div>
       </div>
@@ -2073,8 +2187,11 @@ export class PanelsUI {
         this.renderStylePanel();
       };
     });
+    this.bindTemplatePreviewTiles(body, '[data-tr-preview]');
+
     body.querySelectorAll('[data-tr-pick]').forEach((btn) => {
-      btn.onclick = () => {
+      btn.onclick = (e) => {
+        e.stopPropagation();
         const val = btn.dataset.trPick;
         this.app.mutateProject(() => {
           if (this.activeTransSide === 'in') tr.inType = val;
@@ -2125,12 +2242,12 @@ export class PanelsUI {
     const body = document.getElementById('stickersBody');
     if (!body) return;
     body.innerHTML = `
-      <div class="d-flex justify-content-between align-items-center mb-2">
+      <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-2">
         <div class="btn-group btn-group-sm">
           <button type="button" class="btn ${this.activeStickerSubTab === 'stickers' ? 'btn-info text-dark fw-semibold' : 'btn-dark border-secondary-subtle'}" data-stk-tab="stickers">Stickers</button>
           <button type="button" class="btn ${this.activeStickerSubTab === 'templates' ? 'btn-info text-dark fw-semibold' : 'btn-dark border-secondary-subtle'}" data-stk-tab="templates">Text Templates</button>
         </div>
-        <button id="btnStkOpenDraw" type="button" class="btn btn-sm btn-outline-warning"><i class="bi bi-brush me-1"></i>Draw Doodle</button>
+        <button id="btnStkOpenDraw" type="button" class="btn btn-sm btn-outline-warning flex-shrink-0"><i class="bi bi-brush me-1"></i>Draw Doodle</button>
       </div>
 
       ${this.activeStickerSubTab === 'stickers' ? `
@@ -2414,7 +2531,7 @@ export class PanelsUI {
         </div>
 
         ${tgt.mode === 'junction' && activeJunction ? `
-          <select id="selTransJunction" class="form-select form-select-sm flex-grow-1" style="max-width:230px;">
+          <select id="selTransJunction" class="form-select form-select-sm flex-grow-1 min-w-0" style="max-width:100%;">
             ${junctions.map((j) => `
               <option value="${j.id}" ${j.id === activeJunction.id ? 'selected' : ''}>
                 ${this.esc(j.left.name)} ⇄ ${this.esc(j.right.name)} (@F${j.seamFrame})
@@ -2440,7 +2557,7 @@ export class PanelsUI {
 
       <div class="mf-tile-grid mb-2">
         ${visiblePresets.map((tp) => `
-          <button type="button" class="mf-preview-tile ${currentType === tp.id ? 'active' : ''}" data-tr-apply="${tp.id}">
+          <div role="button" tabindex="0" class="mf-preview-tile has-add-btn ${currentType === tp.id ? 'active' : ''}" data-tr-sheet-preview="${tp.id}" aria-label="Preview ${tp.label}">
             <div class="mf-tile-stage">
               <div class="mf-tr-stage ${tp.animClass}">
                 <div class="mf-tr-clip-a">A</div>
@@ -2450,7 +2567,10 @@ export class PanelsUI {
               ${tp.badge ? `<span class="mf-tile-badge">${tp.badge}</span>` : ''}
             </div>
             <div class="mf-tile-label">${tp.label}</div>
-          </button>
+            <button type="button" class="mf-tile-add-btn" data-tr-apply="${tp.id}" title="Apply ${tp.label}" aria-label="Apply ${tp.label}">
+              <i class="bi bi-plus-lg"></i>
+            </button>
+          </div>
         `).join('')}
       </div>
 
@@ -2495,8 +2615,11 @@ export class PanelsUI {
       return Math.max(4, Math.round(secVal * fps));
     };
 
+    this.bindTemplatePreviewTiles(body, '[data-tr-sheet-preview]');
+
     body.querySelectorAll('[data-tr-apply]').forEach((btn) => {
-      btn.onclick = () => {
+      btn.onclick = (e) => {
+        e.stopPropagation();
         const typeId = btn.dataset.trApply;
         const durF = getChosenFrames();
         this.app.applyTransitionFromSheet(typeId, durF, this.transitionTarget);
@@ -2536,7 +2659,7 @@ export class PanelsUI {
     const srcLayer = visualSources.find((l) => l.id === tr.sourceLayerId) || visualSources[0] || null;
     const trackData = srcLayer?.trackData || null;
     const pinnableLayers = this.app.project.layers.filter(
-      (l) => l.id !== srcLayer?.id && l.type !== 'audio'
+      (l) => l.id !== srcLayer?.id && l.type !== 'audio' && l.type !== 'adjustment'
     );
 
     if (!srcLayer) {

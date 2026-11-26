@@ -106,6 +106,7 @@ export class RendererEngine {
       uniform vec3 uVfx;
       uniform vec2 uWipe;
       uniform vec3 uHsl[8];
+      uniform vec4 uColorTint;
 
       float hash12(vec2 p) {
         vec3 p3 = fract(vec3(p.xyx) * 0.1031);
@@ -439,6 +440,9 @@ export class RendererEngine {
           float vig = smoothstep(0.35, 1.05, vd);
           c.rgb *= (1.0 - vig * uVignette * 0.85);
         }
+        if (uColorTint.a > 0.005) {
+          c.rgb = mix(c.rgb, clamp(c.rgb * uColorTint.rgb * 1.15 + uColorTint.rgb * 0.25, 0.0, 1.0), uColorTint.a);
+        }
         c.rgb = clamp(c.rgb, 0.0, 1.0);
 
         // Crop bounds (left, top, right, bottom)
@@ -536,6 +540,16 @@ export class RendererEngine {
        0.5,  0.5,  1, 0
     ]), gl.STATIC_DRAW);
 
+    const fboPosBuf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, fboPosBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+      -0.5, -0.5,  0, 0,
+       0.5, -0.5,  1, 0,
+      -0.5,  0.5,  0, 1,
+       0.5,  0.5,  1, 1
+    ]), gl.STATIC_DRAW);
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
     const aPos = gl.getAttribLocation(prog, 'aPos');
     const aUv = gl.getAttribLocation(prog, 'aUv');
     gl.enableVertexAttribArray(aPos);
@@ -552,6 +566,11 @@ export class RendererEngine {
     return {
       gl,
       prog,
+      posBuf,
+      fboPosBuf,
+      aPos,
+      aUv,
+      adjTex: null,
       uMvp: gl.getUniformLocation(prog, 'uMvp'),
       uAlpha: gl.getUniformLocation(prog, 'uAlpha'),
       uPremul: gl.getUniformLocation(prog, 'uPremul'),
@@ -586,9 +605,33 @@ export class RendererEngine {
       uVfx: gl.getUniformLocation(prog, 'uVfx'),
       uWipe: gl.getUniformLocation(prog, 'uWipe'),
       uHsl: gl.getUniformLocation(prog, 'uHsl[0]'),
+      uColorTint: gl.getUniformLocation(prog, 'uColorTint'),
       zeroHsl: new Float32Array(24),
       textures: new Map()
     };
+  }
+
+  bindCompositorQuadBuffer(compositor, buf) {
+    const { gl, aPos, aUv } = compositor;
+    gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+    gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 16, 0);
+    gl.vertexAttribPointer(aUv, 2, gl.FLOAT, false, 16, 8);
+  }
+
+  copyFramebufferToAdjustmentTex(compositor, w, h) {
+    const { gl } = compositor;
+    if (!compositor.adjTex) {
+      compositor.adjTex = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, compositor.adjTex);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    } else {
+      gl.bindTexture(gl.TEXTURE_2D, compositor.adjTex);
+    }
+    gl.copyTexImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 0, 0, Math.max(1, w), Math.max(1, h), 0);
+    return compositor.adjTex;
   }
 
   getOrCreateTexture(compositor, key, sourceEl) {
@@ -744,13 +787,19 @@ export class RendererEngine {
     ctx.textAlign = prevAlign;
   }
 
-  getOrRasterizeVectorLayer(layer) {
+  getOrRasterizeVectorLayer(layer, frame = 0) {
     let w = Math.max(2, Math.ceil(layer.width || 300));
     let h = Math.max(2, Math.ceil(layer.height || 200));
+    const animColor = layer.type === 'text' && layer.textProps
+      ? KeyframeEngine.getColorAtFrame(layer, frame, layer.textProps.color || '#FFFFFF')
+      : layer.type === 'shape' && layer.shapeProps
+        ? KeyframeEngine.getColorAtFrame(layer, frame, layer.shapeProps.fillColor || '#7C4DFF')
+        : null;
     const key = JSON.stringify({
       type: layer.type,
       w,
       h,
+      animColor,
       textProps: layer.textProps,
       shapeProps: layer.shapeProps
     });
@@ -815,10 +864,11 @@ export class RendererEngine {
         ctx.shadowOffsetY = tp.shadowOffsetY || 3;
       }
 
-      let fillPaint = tp.color || '#FFFFFF';
+      const resolvedTextColor = animColor || tp.color || '#FFFFFF';
+      let fillPaint = resolvedTextColor;
       if (tp.gradientEnabled) {
         const grad = ctx.createLinearGradient(-w * 0.4, -h * 0.3, w * 0.4, h * 0.3);
-        grad.addColorStop(0, tp.color || '#FFEB3B');
+        grad.addColorStop(0, resolvedTextColor);
         grad.addColorStop(1, tp.gradientColor2 || '#00E5FF');
         fillPaint = grad;
       }
@@ -871,7 +921,7 @@ export class RendererEngine {
           if (tp.underline && lineW > 2) {
             const uLeft = tp.align === 'left' ? xOffset : tp.align === 'right' ? xOffset - lineW : xOffset - lineW / 2;
             ctx.save();
-            ctx.strokeStyle = tp.color || '#FFFFFF';
+            ctx.strokeStyle = animColor || tp.color || '#FFFFFF';
             ctx.lineWidth = Math.max(2, Math.round(fontSize * 0.065));
             ctx.beginPath();
             ctx.moveTo(uLeft, ly + fontSize * 0.44);
@@ -883,7 +933,8 @@ export class RendererEngine {
       }
     } else if (layer.type === 'shape' && layer.shapeProps) {
       const sp = layer.shapeProps;
-      ctx.fillStyle = sp.fillColor || '#7C4DFF';
+      const resolvedShapeFill = animColor || sp.fillColor || '#7C4DFF';
+      ctx.fillStyle = resolvedShapeFill;
       ctx.strokeStyle = sp.strokeColor || '#00E5FF';
       ctx.lineWidth = sp.strokeWidth || 0;
       if (sp.shapeType === 'circle') {
@@ -903,7 +954,7 @@ export class RendererEngine {
         ctx.lineTo(w / 2, 0);
         ctx.lineCap = 'round';
         ctx.lineWidth = Math.max(2, sp.strokeWidth || 8);
-        ctx.strokeStyle = sp.strokeColor || sp.fillColor || '#00E5FF';
+        ctx.strokeStyle = layer.keyframes?.color?.length ? resolvedShapeFill : (sp.strokeColor || resolvedShapeFill || '#00E5FF');
         ctx.stroke();
       } else {
         const rad = Math.min(sp.cornerRadius || 0, w / 2, h / 2);
@@ -955,7 +1006,7 @@ export class RendererEngine {
       return null;
     }
     if (layer.type === 'text' || layer.type === 'shape') {
-      const c = this.getOrRasterizeVectorLayer(layer);
+      const c = this.getOrRasterizeVectorLayer(layer, frame);
       return { el: c, w: c.width, h: c.height };
     }
     return null;
@@ -1159,6 +1210,7 @@ export class RendererEngine {
     gl.uniform3f(uVfx, 0, 0, 0);
     gl.uniform2f(uWipe, 0, 1);
     if (uHsl) gl.uniform3fv(uHsl, zeroHsl);
+    if (compositor.uColorTint) gl.uniform4f(compositor.uColorTint, 1, 1, 1, 0);
   }
 
   renderWebGL(compositor, project, frame, mediaMap, outW, outH) {
@@ -1169,9 +1221,10 @@ export class RendererEngine {
       uBlur, uVignette, uGrain, uTexel,
       uChromaOn, uChromaKey, uChromaSim, uChromaSmooth, uChromaSpill,
       uOutlineW, uOutlineCol,
-      uMaskType, uMaskRect, uMaskRot, uMaskFeather, uMaskInvert, uCropRect, uStab, uVfx, uWipe, uHsl, zeroHsl
+      uMaskType, uMaskRect, uMaskRot, uMaskFeather, uMaskInvert, uCropRect, uStab, uVfx, uWipe, uHsl, uColorTint, zeroHsl
     } = compositor;
     gl.useProgram(prog);
+    this.bindCompositorQuadBuffer(compositor, compositor.posBuf);
     gl.viewport(0, 0, outW, outH);
 
     const [bgR, bgG, bgB] = this.hexToRgb01(project.backgroundColor);
@@ -1249,36 +1302,52 @@ export class RendererEngine {
           }
         }
 
-        const drawable = this.resolveLayerDrawable(layer, subFrame, fps, mediaMap);
-        if (!drawable) continue;
+        const isAdjustment = layer.type === 'adjustment';
+        if (isAdjustment && s > 0) continue;
+
+        const drawable = isAdjustment ? null : this.resolveLayerDrawable(layer, subFrame, fps, mediaMap);
+        if (!isAdjustment && !drawable) continue;
 
         const tf = KeyframeEngine.getTransformAtFrame(layer, subFrame);
         const trState = this.computeTransitionState(layer, subFrame, project.width, project.height);
-        let alpha = masterAlpha * Math.max(0, Math.min(1, tf.opacity)) * trState.alphaMul;
+        let alpha = (isAdjustment ? 1.0 : masterAlpha) * Math.max(0, Math.min(1, tf.opacity)) * trState.alphaMul;
         if (parentTf) alpha *= Math.max(0, Math.min(1, parentTf.opacity));
         if (alpha <= 0.002) continue;
 
-        let model = Mat4.identity();
-        if (parentTf) {
-          model = Mat4.translate(model, parentTf.x, -parentTf.y, parentTf.z || 0);
-          model = Mat4.rotateZ(model, (-parentTf.rotation * Math.PI) / 180);
-          model = Mat4.rotateX(model, ((parentTf.rotX || 0) * Math.PI) / 180);
-          model = Mat4.rotateY(model, ((parentTf.rotY || 0) * Math.PI) / 180);
-          model = Mat4.scale(model, parentTf.scaleX, parentTf.scaleY, 1);
+        let mvp;
+        let texelW;
+        let texelH;
+        if (isAdjustment) {
+          this.copyFramebufferToAdjustmentTex(compositor, outW, outH);
+          this.bindCompositorQuadBuffer(compositor, compositor.fboPosBuf);
+          mvp = Mat4.scale(Mat4.identity(), 2, 2, 1);
+          texelW = Math.max(1, outW);
+          texelH = Math.max(1, outH);
+        } else {
+          let model = Mat4.identity();
+          if (parentTf) {
+            model = Mat4.translate(model, parentTf.x, -parentTf.y, parentTf.z || 0);
+            model = Mat4.rotateZ(model, (-parentTf.rotation * Math.PI) / 180);
+            model = Mat4.rotateX(model, ((parentTf.rotX || 0) * Math.PI) / 180);
+            model = Mat4.rotateY(model, ((parentTf.rotY || 0) * Math.PI) / 180);
+            model = Mat4.scale(model, parentTf.scaleX, parentTf.scaleY, 1);
+          }
+
+          const flipSX = layer.flipX ? -1 : 1;
+          const flipSY = layer.flipY ? -1 : 1;
+          model = Mat4.translate(model, tf.x + trState.dx, -(tf.y + trState.dy), tf.z || 0);
+          model = Mat4.rotateZ(model, (-(tf.rotation + (trState.rotDelta || 0)) * Math.PI) / 180);
+          model = Mat4.rotateX(model, ((tf.rotX || 0) * Math.PI) / 180);
+          model = Mat4.rotateY(model, ((tf.rotY || 0) * Math.PI) / 180);
+          model = Mat4.scale(model, tf.scaleX * trState.scaleMul * flipSX, tf.scaleY * trState.scaleMul * flipSY, 1);
+          model = Mat4.translate(model, -tf.anchorX, tf.anchorY, 0);
+          model = Mat4.scale(model, drawable.w, drawable.h, 1);
+
+          mvp = Mat4.multiply(projMat, Mat4.multiply(viewMat, model));
+          this.getOrCreateTexture(compositor, layer.mediaId || layer.id, drawable.el);
+          texelW = Math.max(1, drawable.w);
+          texelH = Math.max(1, drawable.h);
         }
-
-        const flipSX = layer.flipX ? -1 : 1;
-        const flipSY = layer.flipY ? -1 : 1;
-        model = Mat4.translate(model, tf.x + trState.dx, -(tf.y + trState.dy), tf.z || 0);
-        model = Mat4.rotateZ(model, (-(tf.rotation + (trState.rotDelta || 0)) * Math.PI) / 180);
-        model = Mat4.rotateX(model, ((tf.rotX || 0) * Math.PI) / 180);
-        model = Mat4.rotateY(model, ((tf.rotY || 0) * Math.PI) / 180);
-        model = Mat4.scale(model, tf.scaleX * trState.scaleMul * flipSX, tf.scaleY * trState.scaleMul * flipSY, 1);
-        model = Mat4.translate(model, -tf.anchorX, tf.anchorY, 0);
-        model = Mat4.scale(model, drawable.w, drawable.h, 1);
-
-        const mvp = Mat4.multiply(projMat, Mat4.multiply(viewMat, model));
-        this.getOrCreateTexture(compositor, layer.mediaId || layer.id, drawable.el);
 
         const blend = layer.blendMode || 'normal';
         let premul = 0;
@@ -1322,13 +1391,13 @@ export class RendererEngine {
         gl.uniform1f(uBlur, (Number(fx.blur) || 0) + (trState.blurDelta || 0));
         gl.uniform1f(uVignette, Number(fx.vignette) || 0);
         gl.uniform1f(uGrain, Number(fx.grain) || 0);
-        gl.uniform2f(uTexel, 1 / Math.max(1, drawable.w), 1 / Math.max(1, drawable.h));
-        gl.uniform1f(uChromaOn, fx.chromaEnabled ? 1 : 0);
+        gl.uniform2f(uTexel, 1 / texelW, 1 / texelH);
+        gl.uniform1f(uChromaOn, isAdjustment ? 0 : (fx.chromaEnabled ? 1 : 0));
         gl.uniform3f(uChromaKey, keyRgb[0], keyRgb[1], keyRgb[2]);
         gl.uniform1f(uChromaSim, fx.chromaSimilarity ?? 0.35);
         gl.uniform1f(uChromaSmooth, fx.chromaSmoothness ?? 0.12);
         gl.uniform1f(uChromaSpill, fx.chromaSpill ?? 0.5);
-        gl.uniform1f(uOutlineW, Number(fx.outlineWidth) || 0);
+        gl.uniform1f(uOutlineW, isAdjustment ? 0 : (Number(fx.outlineWidth) || 0));
         gl.uniform3f(uOutlineCol, outRgb[0], outRgb[1], outRgb[2]);
         gl.uniform1f(uMaskType, maskShaderType);
         gl.uniform4f(
@@ -1349,14 +1418,18 @@ export class RendererEngine {
           Number(crop.bottom) || 0
         );
         if (uStab) {
-          const stab = getStabilizerAtFrame(layer, subFrame, fps);
-          gl.uniform4f(
-            uStab,
-            stab.dx / Math.max(1, drawable.w),
-            stab.dy / Math.max(1, drawable.h),
-            stab.rot,
-            stab.cropScale
-          );
+          if (isAdjustment) {
+            gl.uniform4f(uStab, 0, 0, 0, 1);
+          } else {
+            const stab = getStabilizerAtFrame(layer, subFrame, fps);
+            gl.uniform4f(
+              uStab,
+              stab.dx / texelW,
+              stab.dy / texelH,
+              stab.rot,
+              stab.cropScale
+            );
+          }
         }
         gl.uniform3f(uVfx, vfxShaderId, vfx.intensity ?? 0.65, vfxTime);
         gl.uniform2f(uWipe, trState.wipeType, trState.wipeProgress);
@@ -1374,8 +1447,20 @@ export class RendererEngine {
             gl.uniform3fv(uHsl, zeroHsl);
           }
         }
+        if (uColorTint) {
+          if (layer.type !== 'text' && layer.type !== 'shape' && layer.keyframes?.color?.length > 0) {
+            const tintHex = KeyframeEngine.getColorAtFrame(layer, subFrame, fx.tintColor || '#FFFFFF');
+            const [tr, tg, tb] = this.hexToRgb01(tintHex);
+            gl.uniform4f(uColorTint, tr, tg, tb, 0.45);
+          } else {
+            gl.uniform4f(uColorTint, 1, 1, 1, 0);
+          }
+        }
 
         gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+        if (isAdjustment) {
+          this.bindCompositorQuadBuffer(compositor, compositor.posBuf);
+        }
       }
     }
     gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
@@ -1407,6 +1492,40 @@ export class RendererEngine {
           if (!parent.visible || frame < parent.startFrame || frame > parent.endFrame) continue;
           parentTf = KeyframeEngine.getTransformAtFrame(parent, frame);
         }
+      }
+
+      if (layer.type === 'adjustment') {
+        const tf = KeyframeEngine.getTransformAtFrame(layer, frame);
+        const trState = this.computeTransitionState(layer, frame, project.width, project.height);
+        let alpha = Math.max(0, Math.min(1, tf.opacity)) * trState.alphaMul;
+        if (parentTf) alpha *= Math.max(0, Math.min(1, parentTf.opacity));
+        if (alpha <= 0.002) continue;
+
+        if (!this._adj2dCanvas) this._adj2dCanvas = document.createElement('canvas');
+        if (this._adj2dCanvas.width !== w || this._adj2dCanvas.height !== h) {
+          this._adj2dCanvas.width = w;
+          this._adj2dCanvas.height = h;
+        }
+        const actx = this._adj2dCanvas.getContext('2d');
+        actx.clearRect(0, 0, w, h);
+        actx.drawImage(ctx.canvas, 0, 0, w, h);
+
+        const fx = layer.fx || {};
+        const bright = Math.max(0.1, 1 + (Number(fx.brightness) || 0) + (Number(fx.exposure) || 0) * 0.45 + (trState.brightDelta || 0));
+        const contrast = Math.max(0.1, fx.contrast ?? 1);
+        const sat = Math.max(0, fx.saturation ?? 1);
+        const blurPx = Math.max(0, ((Number(fx.blur) || 0) + (trState.blurDelta || 0)) * (w / Math.max(1, project.width)));
+        const tempHue = (Number(fx.temperature) || 0) * -22 + (Number(fx.tint) || 0) * 20;
+
+        ctx.save();
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        const blendMap = { add: 'lighter', screen: 'screen', multiply: 'multiply' };
+        ctx.globalCompositeOperation = blendMap[layer.blendMode] || 'source-over';
+        ctx.globalAlpha = alpha;
+        ctx.filter = `brightness(${bright.toFixed(2)}) contrast(${contrast.toFixed(2)}) saturate(${sat.toFixed(2)}) hue-rotate(${tempHue.toFixed(1)}deg) blur(${blurPx.toFixed(1)}px)`;
+        ctx.drawImage(this._adj2dCanvas, 0, 0, w, h);
+        ctx.restore();
+        continue;
       }
 
       const drawable = this.resolveLayerDrawable(layer, frame, project.fps || 30, mediaMap);
@@ -1465,7 +1584,30 @@ export class RendererEngine {
         ctx.rotate(stab.rot);
         ctx.translate(stab.dx, stab.dy);
       }
-      ctx.drawImage(drawable.el, -drawable.w / 2, -drawable.h / 2, drawable.w, drawable.h);
+      if (layer.type !== 'text' && layer.type !== 'shape' && layer.keyframes?.color?.length > 0) {
+        const tintHex = KeyframeEngine.getColorAtFrame(layer, frame, layer.fx?.tintColor || '#FFFFFF');
+        const tw = Math.max(2, Math.min(1024, Math.round(drawable.w)));
+        const th = Math.max(2, Math.min(1024, Math.round(drawable.h)));
+        if (!this._tint2dCanvas) this._tint2dCanvas = document.createElement('canvas');
+        if (this._tint2dCanvas.width !== tw || this._tint2dCanvas.height !== th) {
+          this._tint2dCanvas.width = tw;
+          this._tint2dCanvas.height = th;
+        }
+        const tctx = this._tint2dCanvas.getContext('2d');
+        tctx.clearRect(0, 0, tw, th);
+        tctx.globalCompositeOperation = 'source-over';
+        tctx.globalAlpha = 1;
+        tctx.drawImage(drawable.el, 0, 0, tw, th);
+        tctx.globalCompositeOperation = 'source-atop';
+        tctx.globalAlpha = 0.42;
+        tctx.fillStyle = tintHex;
+        tctx.fillRect(0, 0, tw, th);
+        tctx.globalCompositeOperation = 'source-over';
+        tctx.globalAlpha = 1;
+        ctx.drawImage(this._tint2dCanvas, -drawable.w / 2, -drawable.h / 2, drawable.w, drawable.h);
+      } else {
+        ctx.drawImage(drawable.el, -drawable.w / 2, -drawable.h / 2, drawable.w, drawable.h);
+      }
       ctx.restore();
     }
     ctx.restore();
@@ -1633,7 +1775,7 @@ export class RendererEngine {
     // Collect projected hit-test quads for all visible visual layers (front-to-back)
     for (let i = 0; i < project.layers.length; i++) {
       const l = project.layers[i];
-      if (!l.visible || l.type === 'audio' || l.type === 'group') continue;
+      if (!l.visible || l.type === 'audio' || l.type === 'group' || l.type === 'adjustment') continue;
       if (frame < l.startFrame || frame > l.endFrame) continue;
 
       let parentTf = null;

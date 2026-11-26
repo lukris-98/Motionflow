@@ -11,15 +11,15 @@
 <body class="mf-body d-flex flex-column overflow-hidden">
 
   <!-- TOP TOOLBAR -->
-  <header class="mf-toolbar d-flex align-items-center justify-content-between px-2 py-1 border-bottom border-secondary-subtle">
-    <div class="d-flex align-items-center gap-1 min-w-0">
-      <button id="btnProjects" class="btn btn-sm btn-dark mf-icon-btn" title="Projects" aria-label="Projects">
+  <header class="mf-toolbar d-flex align-items-center justify-content-between gap-1 px-2 py-1 border-bottom border-secondary-subtle">
+    <div class="d-flex align-items-center gap-1 flex-grow-1 min-w-0 overflow-hidden">
+      <button id="btnProjects" class="btn btn-sm btn-dark mf-icon-btn flex-shrink-0" title="Projects" aria-label="Projects">
         <i class="bi bi-folder2-open"></i>
       </button>
-      <button id="btnRenameQuick" class="btn btn-sm btn-dark text-truncate mf-project-pill" title="Project Name">
+      <button id="btnRenameQuick" class="btn btn-sm btn-dark text-truncate mf-project-pill min-w-0" title="Project Name">
         <span id="lblProjectName">Untitled Project</span>
       </button>
-      <span id="badgeSaveState" class="badge rounded-pill text-bg-dark border border-secondary-subtle mf-save-badge">Saved</span>
+      <span id="badgeSaveState" class="mf-save-dot is-saved flex-shrink-0" role="status" title="Saved" aria-label="Saved"></span>
     </div>
 
     <div class="d-flex align-items-center gap-1 flex-shrink-0">
@@ -33,7 +33,7 @@
         <i class="bi bi-sliders"></i>
       </button>
       <button id="btnQuickExportSpec" class="btn btn-sm btn-dark mf-res-pill" title="Export Resolution &amp; FPS">1080p·30</button>
-      <button id="btnOpenExport" class="btn btn-sm mf-btn-accent fw-semibold px-2">
+      <button id="btnOpenExport" class="btn btn-sm mf-btn-accent fw-semibold px-2 mf-export-btn">
         <i class="bi bi-film me-1"></i>Export
       </button>
     </div>
@@ -47,9 +47,9 @@
     </div>
 
     <!-- Floating Preview HUD -->
-    <div class="mf-preview-hud-top position-absolute top-0 start-0 end-0 d-flex justify-content-between px-2 pt-1 pointer-none">
-      <span id="hudResFps" class="badge mf-hud-pill">1280×720 · 30 FPS</span>
-      <div class="d-flex gap-1 pointer-auto">
+    <div class="mf-preview-hud-top position-absolute top-0 start-0 end-0 d-flex align-items-center justify-content-between gap-1 px-2 pt-1 pointer-none">
+      <span id="hudResFps" class="badge mf-hud-pill min-w-0 text-truncate">1280×720 · 30 FPS</span>
+      <div class="d-flex gap-1 flex-shrink-0 pointer-auto">
         <button id="btnOpenTrackerQuick" class="btn btn-xs mf-hud-btn" title="Motion &amp; Camera Track" aria-label="Motion Tracker">
           <i class="bi bi-crosshair me-1 text-warning"></i>Track
         </button>
@@ -63,8 +63,8 @@
     </div>
 
     <!-- Blender-Style 3D Viewport Mini-HUD -->
-    <div id="hud3DViewport" class="mf-3d-hud position-absolute bottom-0 start-0 end-0 d-none justify-content-between align-items-center px-2 pb-1 pointer-none">
-      <div class="mf-3d-pill-bar d-flex align-items-center gap-1 pointer-auto">
+    <div id="hud3DViewport" class="mf-3d-hud position-absolute bottom-0 start-0 end-0 d-none justify-content-between align-items-center gap-1 px-2 pb-1 pointer-none">
+      <div class="mf-3d-pill-bar d-flex align-items-center gap-1 flex-shrink-0 pointer-auto">
         <button id="btn3DToolMove" class="btn btn-xs mf-hud-btn active" title="Move Gizmo (X/Y/Z)" aria-label="3D Move Tool">
           <i class="bi bi-arrows-move"></i>
         </button>
@@ -78,8 +78,8 @@
           <i class="bi bi-camera-video"></i>
         </button>
       </div>
-      <span id="lbl3DHudReadout" class="badge mf-hud-pill text-info text-truncate mx-1">3D · 1F Orbit · 2F Zoom/Pan</span>
-      <div class="mf-3d-pill-bar d-flex align-items-center gap-1 pointer-auto">
+      <span id="lbl3DHudReadout" class="badge mf-hud-pill text-info text-truncate min-w-0 mx-1">3D · 1F Orbit · 2F Zoom/Pan</span>
+      <div class="mf-3d-pill-bar d-flex align-items-center gap-1 flex-shrink-0 pointer-auto">
         <button id="btn3DCamAutoRec" class="btn btn-xs mf-hud-btn active text-danger" title="Auto-Record Smooth 3D Camera Keyframes" aria-label="Auto-Record 3D Camera">
           <i class="bi bi-record-circle-fill"></i>
         </button>
@@ -100,8 +100,8 @@
   </section>
 
   <!-- TRANSPORT & TIMELINE TOOLS BAR -->
-  <section class="mf-transport-bar d-flex align-items-center justify-content-between px-2 py-1 border-top border-bottom border-secondary-subtle">
-    <div class="d-flex align-items-center gap-1">
+  <section class="mf-transport-bar d-flex align-items-center justify-content-between gap-1 px-2 py-1 border-top border-bottom border-secondary-subtle">
+    <div class="d-flex align-items-center gap-1 flex-shrink-0 mf-transport-group">
       <button id="btnJumpStart" class="btn btn-sm btn-dark mf-icon-btn" title="Jump to Start" aria-label="Jump to Start">
         <i class="bi bi-skip-start-fill"></i>
       </button>
@@ -116,12 +116,12 @@
       </button>
     </div>
 
-    <div class="text-center mf-timecode-wrap">
+    <div class="text-center mf-timecode-wrap flex-shrink-0">
       <div id="lblTimecode" class="mf-timecode">00:00:00:00</div>
       <div id="lblFrameCounter" class="mf-frame-counter">F 0 / 300</div>
     </div>
 
-    <div class="d-flex align-items-center gap-1">
+    <div class="d-flex align-items-center gap-1 flex-shrink-0 mf-transport-group">
       <button id="btnQuickKeyframe" class="btn btn-sm btn-dark mf-icon-btn" title="Toggle Keyframe" aria-label="Toggle Keyframe">
         <i class="bi bi-diamond"></i>
       </button>
@@ -146,19 +146,23 @@
   <!-- MULTI-LAYER TIMELINE -->
   <main class="mf-timeline-wrapper flex-grow-1 d-flex flex-column overflow-hidden position-relative">
     <div id="timelineDragTooltip" class="mf-timeline-tooltip d-none"></div>
+    <div id="timelineKfBar" class="mf-kf-floating-bar d-none" role="toolbar" aria-label="Keyframe Controls"></div>
     <div id="timelineBody" class="mf-timeline-body d-flex flex-grow-1 overflow-hidden">
       <!-- Left Track Headers -->
       <div class="mf-track-headers d-flex flex-column flex-shrink-0 border-end border-secondary-subtle">
-        <div class="mf-ruler-corner d-flex align-items-center justify-content-between px-2 border-bottom border-secondary-subtle">
-          <span class="small text-secondary fw-semibold">LAYERS</span>
-          <div class="d-flex align-items-center gap-1">
-            <button id="btnGroupChecked" class="btn btn-xs btn-outline-info py-0 px-1 d-none" title="Group Selected Layers" style="font-size:0.62rem;">
+        <div class="mf-ruler-corner d-flex align-items-center justify-content-between gap-1 px-1 border-bottom border-secondary-subtle overflow-hidden">
+          <span class="mf-layers-title text-secondary fw-semibold text-truncate min-w-0">LAYERS</span>
+          <div class="d-flex align-items-center gap-1 flex-shrink-0">
+            <button id="btnGroupChecked" class="btn btn-xs btn-outline-info mf-corner-btn d-none" title="Group Selected Layers">
               <i class="bi bi-collection"></i>
             </button>
-            <button id="btnTimelineQuickAdd" class="btn btn-xs mf-btn-accent py-0 px-1" title="Import &amp; Add Clip to Timeline" aria-label="Quick Add Media" style="font-size:0.65rem;">
+            <button id="btnCompactAllTracks" class="btn btn-xs btn-dark border-secondary-subtle mf-corner-btn" title="Padatkan / Perluas Semua Track" aria-label="Toggle Compact Tracks">
+              <i class="bi bi-arrows-collapse"></i>
+            </button>
+            <button id="btnTimelineQuickAdd" class="btn btn-xs mf-btn-accent mf-corner-btn" title="Import &amp; Add Clip to Timeline" aria-label="Quick Add Media">
               <i class="bi bi-plus-lg"></i>
             </button>
-            <span id="lblLayerCount" class="badge bg-secondary-subtle text-light">0</span>
+            <span id="lblLayerCount" class="badge bg-secondary-subtle text-light mf-corner-count">0</span>
           </div>
         </div>
         <div id="trackHeadersList" class="mf-track-headers-list flex-grow-1 overflow-y-auto overflow-x-hidden"></div>
@@ -169,6 +173,9 @@
         <div id="timelineContent" class="mf-timeline-content position-relative">
           <canvas id="rulerCanvas" class="mf-ruler-canvas d-block border-bottom border-secondary-subtle"></canvas>
           <div id="trackLanesList" class="mf-track-lanes-list position-relative"></div>
+          <div id="timelineSnapGuide" class="mf-snap-guide d-none">
+            <span class="mf-snap-guide-tag"></span>
+          </div>
           <div id="playheadLine" class="mf-playhead-line">
             <div class="mf-playhead-head"></div>
           </div>
@@ -186,15 +193,15 @@
 
   <!-- 1. PROJECTS SHEET -->
   <div class="offcanvas offcanvas-bottom mf-sheet" tabindex="-1" id="sheetProjects">
-    <div class="offcanvas-header py-2 border-bottom border-secondary-subtle">
+    <div class="offcanvas-header flex-wrap gap-2 py-2 border-bottom border-secondary-subtle">
       <h6 class="offcanvas-title mb-0"><i class="bi bi-folder2-open me-2 text-info"></i>Projects</h6>
-      <div class="d-flex gap-1 ms-auto me-2">
-        <button id="btnCaptureCover" class="btn btn-sm btn-outline-warning"><i class="bi bi-image me-1"></i>Cover</button>
-        <button id="btnNewProject" class="btn btn-sm mf-btn-accent"><i class="bi bi-file-earmark-plus me-1"></i>New</button>
-        <button id="btnImportProjectJson" class="btn btn-sm btn-outline-light"><i class="bi bi-upload me-1"></i>Import</button>
-        <button id="btnExportProjectJson" class="btn btn-sm btn-outline-info"><i class="bi bi-download me-1"></i>Save</button>
+      <div class="d-flex flex-wrap gap-1 ms-auto me-1">
+        <button id="btnCaptureCover" class="btn btn-xs btn-outline-warning px-2 py-1"><i class="bi bi-image me-1"></i>Cover</button>
+        <button id="btnNewProject" class="btn btn-xs mf-btn-accent px-2 py-1"><i class="bi bi-file-earmark-plus me-1"></i>New</button>
+        <button id="btnImportProjectJson" class="btn btn-xs btn-outline-light px-2 py-1"><i class="bi bi-upload me-1"></i>Import</button>
+        <button id="btnExportProjectJson" class="btn btn-xs btn-outline-info px-2 py-1"><i class="bi bi-download me-1"></i>Save</button>
       </div>
-      <button type="button" class="btn-close" data-bs-dismiss="offcanvas" aria-label="Close"></button>
+      <button type="button" class="btn-close flex-shrink-0" data-bs-dismiss="offcanvas" aria-label="Close"></button>
     </div>
     <div class="offcanvas-body py-2">
       <div id="projectsList" class="row g-2"></div>
@@ -203,13 +210,13 @@
 
   <!-- 2. MEDIA LIBRARY SHEET -->
   <div class="offcanvas offcanvas-bottom mf-sheet" tabindex="-1" id="sheetMedia">
-    <div class="offcanvas-header py-2 border-bottom border-secondary-subtle">
+    <div class="offcanvas-header flex-wrap gap-2 py-2 border-bottom border-secondary-subtle">
       <h6 class="offcanvas-title mb-0"><i class="bi bi-collection-play me-2 text-info"></i>Media Library</h6>
-      <div class="d-flex gap-1 ms-auto me-2">
-        <button id="btnImportVisual" class="btn btn-sm mf-btn-accent"><i class="bi bi-film me-1"></i>Video / Image / GIF</button>
-        <button id="btnImportAudio" class="btn btn-sm btn-outline-warning"><i class="bi bi-music-note-beamed me-1"></i>Audio</button>
+      <div class="d-flex flex-wrap gap-1 ms-auto me-1">
+        <button id="btnImportVisual" class="btn btn-xs mf-btn-accent px-2 py-1"><i class="bi bi-film me-1"></i>Video / Image / GIF</button>
+        <button id="btnImportAudio" class="btn btn-xs btn-outline-warning px-2 py-1"><i class="bi bi-music-note-beamed me-1"></i>Audio</button>
       </div>
-      <button type="button" class="btn-close" data-bs-dismiss="offcanvas" aria-label="Close"></button>
+      <button type="button" class="btn-close flex-shrink-0" data-bs-dismiss="offcanvas" aria-label="Close"></button>
     </div>
     <div class="offcanvas-body py-2">
       <input id="fallbackFileInput" type="file" multiple accept="video/*,image/*,audio/*" class="d-none" />
@@ -257,6 +264,11 @@
         <div class="col-4 col-sm-2">
           <button id="btnAddGroupLayer" class="btn btn-dark border border-secondary-subtle w-100 py-3 d-flex flex-column align-items-center gap-1">
             <i class="bi bi-collection fs-4 text-primary"></i><span class="small">Group</span>
+          </button>
+        </div>
+        <div class="col-4 col-sm-2">
+          <button id="btnAddAdjustmentLayer" class="btn btn-dark border border-secondary-subtle w-100 py-3 d-flex flex-column align-items-center gap-1">
+            <i class="bi bi-sliders2-vertical fs-4 text-warning"></i><span class="small">Adjustment FX</span>
           </button>
         </div>
       </div>
