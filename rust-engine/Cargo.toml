@@ -1,0 +1,22 @@
+[package]
+name = "motionflow_rust"
+version = "0.1.0"
+edition = "2021"
+description = "Lightweight Rust core engine (Keyframe, Cubic Bezier, 3D Mat4, PCM Audio Mixer) for MotionFlow Studio (WASM & Android JNI)"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+android-jni = ["dep:jni"]
+
+[dependencies]
+jni = { version = "0.21", optional = true }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -1,0 +1,10 @@
+{
+  "appId": "com.aistudio.motionflow.kxmpzq",
+  "appName": "MotionFlow Studio",
+  "webDir": "app/src/main/assets/www",
+  "bundledWebRuntime": false,
+  "android": {
+    "allowMixedContent": false,
+    "backgroundColor": "#0B0E14"
+  }
+}

@@ -1,0 +1,2057 @@
+import { KeyframeEngine } from './keyframeEngine.js';
+import { TimelineEngine } from './timelineEngine.js';
+import { getStabilizerAtFrame } from './stabilizerEngine.js';
+import { MASK_PRESETS, VIDEO_EFFECT_PRESETS } from './capcutCatalog.js';
+import { decodeAnimatedGif } from '../utils/gifDecoder.js';
+import { Mat4 } from '../utils/mat4.js';
+
+export class RendererEngine {
+  constructor(previewCanvas, overlayCanvas) {
+    this.canvas = previewCanvas;
+    this.overlay = overlayCanvas;
+    this.octx = overlayCanvas.getContext('2d');
+
+    this.imageCache = new Map();       // mediaId -> HTMLImageElement
+    this.gifCache = new Map();         // mediaId -> { frames, totalMs } | 'loading'
+    this.videoCache = new Map();       // mediaId -> HTMLVideoElement
+    this.rasterCache = new Map();      // layerId -> { key, canvas }
+    this.bgGradientCache = { key: '', canvas: null };
+
+    this.glPreview = this.createWebGLCompositor(this.canvas);
+    this.ctx2dFallback = this.glPreview ? null : this.canvas.getContext('2d', { alpha: false });
+    this.exportCompositors = new WeakMap();
+    this.lastOverlayBox = null;
+    this.lastTrackerBox = null;
+    this.lastGizmoHandles = null;
+    this.renderedLayerQuads = [];
+    this.trackerOverlay = null;
+    this.viewport3D = { enabled: false, tool: 'move' }; // 'move' | 'rotate' | 'scale' | 'camera'
+  }
+
+  setTrackerOverlay(state) {
+    this.trackerOverlay = state;
+  }
+
+  setViewport3DState(state) {
+    this.viewport3D = state || { enabled: false, tool: 'move' };
+  }
+
+  purgeMediaCache(mediaId) {
+    if (!mediaId) return;
+    this.imageCache.delete(mediaId);
+    this.gifCache.delete(mediaId);
+    const vid = this.videoCache.get(mediaId);
+    if (vid) {
+      try {
+        vid.pause();
+        vid.removeAttribute('src');
+        vid.load();
+      } catch {}
+      this.videoCache.delete(mediaId);
+    }
+    if (this.glPreview?.textures?.has(mediaId)) {
+      this.glPreview.gl.deleteTexture(this.glPreview.textures.get(mediaId));
+      this.glPreview.textures.delete(mediaId);
+    }
+  }
+
+  createWebGLCompositor(canvas) {
+    const gl = canvas.getContext('webgl', { alpha: false, preserveDrawingBuffer: true, antialias: true });
+    if (!gl) return null;
+
+    const vsSrc = `
+      attribute vec2 aPos;
+      attribute vec2 aUv;
+      uniform mat4 uMvp;
+      varying vec2 vUv;
+      void main() {
+        gl_Position = uMvp * vec4(aPos, 0.0, 1.0);
+        vUv = aUv;
+      }
+    `;
+    const fsSrc = `
+      precision mediump float;
+      varying vec2 vUv;
+      uniform sampler2D uTex;
+      uniform float uAlpha;
+      uniform float uPremul;
+      uniform float uBright;
+      uniform float uContrast;
+      uniform float uSat;
+      uniform float uTemp;
+      uniform float uTint;
+      uniform float uExposure;
+      uniform float uHighlights;
+      uniform float uShadows;
+      uniform float uFade;
+      uniform float uSharpen;
+      uniform float uBlur;
+      uniform float uVignette;
+      uniform float uGrain;
+      uniform vec2 uTexel;
+      uniform float uChromaOn;
+      uniform vec3 uChromaKey;
+      uniform float uChromaSim;
+      uniform float uChromaSmooth;
+      uniform float uChromaSpill;
+      uniform float uOutlineW;
+      uniform vec3 uOutlineCol;
+      uniform float uMaskType;
+      uniform vec4 uMaskRect;
+      uniform float uMaskRot;
+      uniform float uMaskFeather;
+      uniform float uMaskInvert;
+      uniform vec4 uCropRect;
+      uniform vec4 uStab;
+      uniform vec3 uVfx;
+      uniform vec2 uWipe;
+      uniform vec3 uHsl[8];
+
+      float hash12(vec2 p) {
+        vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+        p3 += dot(p3, p3.yzx + 33.33);
+        return fract((p3.x + p3.y) * p3.z);
+      }
+
+      vec3 rgb2hsl(vec3 c) {
+        float cmax = max(c.r, max(c.g, c.b));
+        float cmin = min(c.r, min(c.g, c.b));
+        float delta = cmax - cmin;
+        float l = 0.5 * (cmax + cmin);
+        float s = 0.0;
+        if (delta > 0.0001) {
+          s = delta / (1.0 - abs(2.0 * l - 1.0) + 0.0001);
+        }
+        float h = 0.0;
+        if (delta > 0.0001) {
+          if (cmax == c.r) h = mod((c.g - c.b) / delta, 6.0);
+          else if (cmax == c.g) h = (c.b - c.r) / delta + 2.0;
+          else h = (c.r - c.g) / delta + 4.0;
+          h /= 6.0;
+          if (h < 0.0) h += 1.0;
+        }
+        return vec3(h, clamp(s, 0.0, 1.0), clamp(l, 0.0, 1.0));
+      }
+
+      float hue2rgb(float p, float q, float t) {
+        if (t < 0.0) t += 1.0;
+        if (t > 1.0) t -= 1.0;
+        if (t < 1.0 / 6.0) return p + (q - p) * 6.0 * t;
+        if (t < 0.5) return q;
+        if (t < 2.0 / 3.0) return p + (q - p) * (2.0 / 3.0 - t) * 6.0;
+        return p;
+      }
+
+      vec3 hsl2rgb(vec3 hsl) {
+        if (hsl.y <= 0.0001) return vec3(hsl.z);
+        float q = hsl.z < 0.5 ? hsl.z * (1.0 + hsl.y) : hsl.z + hsl.y - hsl.z * hsl.y;
+        float p = 2.0 * hsl.z - q;
+        return vec3(
+          hue2rgb(p, q, hsl.x + 1.0 / 3.0),
+          hue2rgb(p, q, hsl.x),
+          hue2rgb(p, q, hsl.x - 1.0 / 3.0)
+        );
+      }
+
+      float hueDist(float h, float center) {
+        float d = abs(h - center);
+        return min(d, 1.0 - d);
+      }
+
+      float evalChromaAlpha(vec4 col) {
+        if (uChromaOn < 0.5) return col.a;
+        float y = 0.299 * col.r + 0.587 * col.g + 0.114 * col.b;
+        float cb = -0.168736 * col.r - 0.331264 * col.g + 0.5 * col.b;
+        float cr = 0.5 * col.r - 0.418688 * col.g - 0.081312 * col.b;
+        float ky = 0.299 * uChromaKey.r + 0.587 * uChromaKey.g + 0.114 * uChromaKey.b;
+        float kcb = -0.168736 * uChromaKey.r - 0.331264 * uChromaKey.g + 0.5 * uChromaKey.b;
+        float kcr = 0.5 * uChromaKey.r - 0.418688 * uChromaKey.g - 0.081312 * uChromaKey.b;
+        float dist = length(vec2(cb - kcb, cr - kcr)) + 0.15 * abs(y - ky);
+        return col.a * smoothstep(uChromaSim, uChromaSim + max(0.005, uChromaSmooth), dist);
+      }
+
+      void main() {
+        vec2 uv = vUv;
+        if (uStab.w > 1.0005 || abs(uStab.x) > 0.0001 || abs(uStab.y) > 0.0001 || abs(uStab.z) > 0.0001) {
+          float stabAsp = uTexel.y / max(1e-6, uTexel.x);
+          float cs = cos(uStab.z);
+          float sn = sin(uStab.z);
+          vec2 p = (uv - 0.5) / max(1.0, uStab.w);
+          p.x *= stabAsp;
+          vec2 rp = vec2(p.x * cs + p.y * sn, -p.x * sn + p.y * cs);
+          rp.x /= max(0.1, stabAsp);
+          uv = clamp(rp - uStab.xy + 0.5, 0.0, 1.0);
+        }
+        float vfxType = uVfx.x;
+        float vfxInt = uVfx.y;
+        float vfxTime = uVfx.z;
+
+        // Shake Cam UV jitter (4)
+        if (vfxType > 3.5 && vfxType < 4.5 && vfxInt > 0.01) {
+          float zoomComp = 1.0 - 0.06 * vfxInt;
+          vec2 shakeOff = vec2(
+            sin(vfxTime * 29.0) * 0.022,
+            cos(vfxTime * 37.0) * 0.022
+          ) * vfxInt;
+          uv = (uv - 0.5) * zoomComp + 0.5 + shakeOff;
+        }
+
+        // Glitch horizontal block shift (1)
+        if (vfxType > 0.5 && vfxType < 1.5 && vfxInt > 0.01) {
+          float band = floor(uv.y * 20.0);
+          float trigger = step(0.68, hash12(vec2(band, floor(vfxTime * 14.0))));
+          float shift = (hash12(vec2(band + 7.0, floor(vfxTime * 18.0))) - 0.5) * 0.14 * vfxInt * trigger;
+          uv.x = clamp(uv.x + shift, 0.0, 1.0);
+        }
+
+        // VHS horizontal tape wobble (3)
+        if (vfxType > 2.5 && vfxType < 3.5 && vfxInt > 0.01) {
+          float wob = sin(uv.y * 18.0 + vfxTime * 9.0) * 0.008 * vfxInt;
+          uv.x = clamp(uv.x + wob, 0.0, 1.0);
+        }
+
+        // Pixelate / Mosaic (9)
+        if (vfxType > 8.5 && vfxType < 9.5 && vfxInt > 0.01) {
+          float cells = mix(140.0, 18.0, vfxInt);
+          uv = (floor(uv * cells) + 0.5) / cells;
+        }
+
+        // 2x2 Mirror Grid Clone (10)
+        if (vfxType > 9.5 && vfxType < 10.5 && vfxInt > 0.01) {
+          vec2 scaled = uv * 2.0;
+          vec2 tile = floor(scaled);
+          vec2 fuv = fract(scaled);
+          if (mod(tile.x, 2.0) > 0.5) fuv.x = 1.0 - fuv.x;
+          if (mod(tile.y, 2.0) > 0.5) fuv.y = 1.0 - fuv.y;
+          uv = mix(uv, fuv, clamp(vfxInt * 1.4, 0.0, 1.0));
+        }
+
+        // Fisheye 180 (12)
+        if (vfxType > 11.5 && vfxType < 12.5 && vfxInt > 0.01) {
+          vec2 d = uv - 0.5;
+          float r = length(d);
+          float bind = 0.707;
+          float power = mix(0.0, 1.6, vfxInt);
+          if (r > 0.001) {
+            uv = 0.5 + normalize(d) * tan(r * power) * bind / max(0.01, tan(bind * power));
+          }
+        }
+
+        // CRT Barrel Curve (14)
+        if (vfxType > 13.5 && vfxType < 14.5 && vfxInt > 0.01) {
+          vec2 dc = uv - 0.5;
+          float d2 = dot(dc, dc);
+          uv = uv + dc * (d2 * 0.35 * vfxInt);
+        }
+
+        vec4 c = texture2D(uTex, clamp(uv, 0.0, 1.0));
+
+        // Zoom Blur (13)
+        if (vfxType > 12.5 && vfxType < 13.5 && vfxInt > 0.01) {
+          vec2 dir = (0.5 - uv) * 0.035 * vfxInt;
+          vec4 zb = c * 0.28;
+          zb += texture2D(uTex, clamp(uv + dir * 0.5, 0.0, 1.0)) * 0.22;
+          zb += texture2D(uTex, clamp(uv + dir * 1.0, 0.0, 1.0)) * 0.20;
+          zb += texture2D(uTex, clamp(uv + dir * 1.6, 0.0, 1.0)) * 0.16;
+          zb += texture2D(uTex, clamp(uv + dir * 2.2, 0.0, 1.0)) * 0.14;
+          c = zb;
+        }
+
+        // RGB Split / Glitch Chromatic Shift (1, 2)
+        if ((vfxType > 0.5 && vfxType < 2.5) && vfxInt > 0.01) {
+          float rgbOff = (vfxType < 1.5 ? 0.014 : 0.022) * vfxInt;
+          float rCh = texture2D(uTex, clamp(uv + vec2(rgbOff, 0.0), 0.0, 1.0)).r;
+          float bCh = texture2D(uTex, clamp(uv - vec2(rgbOff, 0.0), 0.0, 1.0)).b;
+          c.r = rCh;
+          c.b = bCh;
+        }
+
+        if (uBlur > 0.01) {
+          vec2 off = uTexel * uBlur;
+          vec4 acc = c * 0.25;
+          acc += texture2D(uTex, clamp(uv + vec2(off.x, 0.0), 0.0, 1.0)) * 0.125;
+          acc += texture2D(uTex, clamp(uv - vec2(off.x, 0.0), 0.0, 1.0)) * 0.125;
+          acc += texture2D(uTex, clamp(uv + vec2(0.0, off.y), 0.0, 1.0)) * 0.125;
+          acc += texture2D(uTex, clamp(uv - vec2(0.0, off.y), 0.0, 1.0)) * 0.125;
+          acc += texture2D(uTex, clamp(uv + vec2(off.x, off.y), 0.0, 1.0)) * 0.0625;
+          acc += texture2D(uTex, clamp(uv + vec2(-off.x, off.y), 0.0, 1.0)) * 0.0625;
+          acc += texture2D(uTex, clamp(uv + vec2(off.x, -off.y), 0.0, 1.0)) * 0.0625;
+          acc += texture2D(uTex, clamp(uv + vec2(-off.x, -off.y), 0.0, 1.0)) * 0.0625;
+          c = acc;
+        }
+
+        // Sharpen
+        if (uSharpen > 0.01) {
+          vec3 n0 = texture2D(uTex, clamp(uv + vec2(uTexel.x, 0.0), 0.0, 1.0)).rgb;
+          vec3 n1 = texture2D(uTex, clamp(uv - vec2(uTexel.x, 0.0), 0.0, 1.0)).rgb;
+          vec3 n2 = texture2D(uTex, clamp(uv + vec2(0.0, uTexel.y), 0.0, 1.0)).rgb;
+          vec3 n3 = texture2D(uTex, clamp(uv - vec2(0.0, uTexel.y), 0.0, 1.0)).rgb;
+          vec3 sharpRgb = c.rgb * (1.0 + 2.4 * uSharpen) - (n0 + n1 + n2 + n3) * (0.6 * uSharpen);
+          c.rgb = clamp(sharpRgb, 0.0, 1.0);
+        }
+
+        // Dream Glow bloom (8)
+        if (vfxType > 7.5 && vfxType < 8.5 && vfxInt > 0.01) {
+          vec2 boff = uTexel * (4.0 + 6.0 * vfxInt);
+          vec3 bloom = (
+            texture2D(uTex, clamp(uv + vec2(boff.x, 0.0), 0.0, 1.0)).rgb +
+            texture2D(uTex, clamp(uv - vec2(boff.x, 0.0), 0.0, 1.0)).rgb +
+            texture2D(uTex, clamp(uv + vec2(0.0, boff.y), 0.0, 1.0)).rgb +
+            texture2D(uTex, clamp(uv - vec2(0.0, boff.y), 0.0, 1.0)).rgb
+          ) * 0.25;
+          c.rgb = mix(c.rgb, max(c.rgb, bloom * 1.18), 0.55 * vfxInt);
+        }
+
+        // Neon Edge Glow (11)
+        if (vfxType > 10.5 && vfxType < 11.5 && vfxInt > 0.01) {
+          vec2 eo = uTexel * 2.0;
+          float lL = dot(texture2D(uTex, clamp(uv - vec2(eo.x, 0.0), 0.0, 1.0)).rgb, vec3(0.299, 0.587, 0.114));
+          float lR = dot(texture2D(uTex, clamp(uv + vec2(eo.x, 0.0), 0.0, 1.0)).rgb, vec3(0.299, 0.587, 0.114));
+          float lU = dot(texture2D(uTex, clamp(uv - vec2(0.0, eo.y), 0.0, 1.0)).rgb, vec3(0.299, 0.587, 0.114));
+          float lD = dot(texture2D(uTex, clamp(uv + vec2(0.0, eo.y), 0.0, 1.0)).rgb, vec3(0.299, 0.587, 0.114));
+          float edge = clamp(length(vec2(lR - lL, lD - lU)) * 3.8, 0.0, 1.0);
+          vec3 neon = mix(vec3(0.0, 0.9, 1.0), vec3(1.0, 0.25, 0.55), sin(vfxTime * 3.0 + uv.x * 4.0) * 0.5 + 0.5) * edge;
+          c.rgb = mix(c.rgb, max(c.rgb * 0.35, neon), vfxInt);
+        }
+
+        if (uChromaOn > 0.5) {
+          c.a = evalChromaAlpha(c);
+          if (uChromaSpill > 0.005) {
+            if (uChromaKey.g >= uChromaKey.r && uChromaKey.g >= uChromaKey.b) {
+              float sp = max(0.0, c.g - (c.r + c.b) * 0.5);
+              c.g -= sp * uChromaSpill;
+            } else if (uChromaKey.b >= uChromaKey.r && uChromaKey.b > uChromaKey.g) {
+              float sp = max(0.0, c.b - (c.r + c.g) * 0.5);
+              c.b -= sp * uChromaSpill;
+            } else {
+              float sp = max(0.0, c.r - (c.g + c.b) * 0.5);
+              c.r -= sp * uChromaSpill;
+            }
+          }
+        }
+
+        // Subject / Cutout Outline Stroke
+        if (uOutlineW > 0.005) {
+          vec2 oo = uTexel * (uOutlineW * 12.0);
+          float maxA = 0.0;
+          maxA = max(maxA, evalChromaAlpha(texture2D(uTex, clamp(uv + vec2(oo.x, 0.0), 0.0, 1.0))));
+          maxA = max(maxA, evalChromaAlpha(texture2D(uTex, clamp(uv - vec2(oo.x, 0.0), 0.0, 1.0))));
+          maxA = max(maxA, evalChromaAlpha(texture2D(uTex, clamp(uv + vec2(0.0, oo.y), 0.0, 1.0))));
+          maxA = max(maxA, evalChromaAlpha(texture2D(uTex, clamp(uv - vec2(0.0, oo.y), 0.0, 1.0))));
+          maxA = max(maxA, evalChromaAlpha(texture2D(uTex, clamp(uv + vec2(oo.x, oo.y) * 0.7, 0.0, 1.0))));
+          maxA = max(maxA, evalChromaAlpha(texture2D(uTex, clamp(uv + vec2(-oo.x, oo.y) * 0.7, 0.0, 1.0))));
+          maxA = max(maxA, evalChromaAlpha(texture2D(uTex, clamp(uv + vec2(oo.x, -oo.y) * 0.7, 0.0, 1.0))));
+          maxA = max(maxA, evalChromaAlpha(texture2D(uTex, clamp(uv + vec2(-oo.x, -oo.y) * 0.7, 0.0, 1.0))));
+          float ring = smoothstep(0.15, 0.75, maxA) * (1.0 - smoothstep(0.2, 0.75, c.a));
+          c.rgb = mix(c.rgb, uOutlineCol, ring);
+          c.a = max(c.a, ring * maxA);
+        }
+
+        // Color Adjust
+        c.rgb *= exp2(uExposure * 1.4);
+        c.r += uTemp * 0.14 + uTint * 0.06;
+        c.g += uTemp * 0.02 - uTint * 0.10;
+        c.b -= uTemp * 0.14 - uTint * 0.06;
+        c.rgb += uBright * 0.45;
+        float lumAdj = dot(c.rgb, vec3(0.299, 0.587, 0.114));
+        float shadowW = pow(clamp(1.0 - lumAdj, 0.0, 1.0), 1.6);
+        float highW = pow(clamp(lumAdj, 0.0, 1.0), 1.6);
+        c.rgb += uShadows * 0.35 * shadowW + uHighlights * 0.35 * highW;
+        c.rgb = (c.rgb - 0.5) * uContrast + 0.5;
+        float lum = dot(c.rgb, vec3(0.299, 0.587, 0.114));
+        c.rgb = mix(vec3(lum), c.rgb, uSat);
+
+        // 8-Channel Selective HSL (Red, Orange, Yellow, Green, Cyan, Blue, Purple, Magenta)
+        vec3 hsl = rgb2hsl(clamp(c.rgb, 0.0, 1.0));
+        if (hsl.y > 0.04) {
+          float w0 = max(0.0, 1.0 - hueDist(hsl.x, 0.0) / 0.09);
+          float w1 = max(0.0, 1.0 - hueDist(hsl.x, 0.083) / 0.08);
+          float w2 = max(0.0, 1.0 - hueDist(hsl.x, 0.166) / 0.08);
+          float w3 = max(0.0, 1.0 - hueDist(hsl.x, 0.333) / 0.12);
+          float w4 = max(0.0, 1.0 - hueDist(hsl.x, 0.500) / 0.10);
+          float w5 = max(0.0, 1.0 - hueDist(hsl.x, 0.666) / 0.11);
+          float w6 = max(0.0, 1.0 - hueDist(hsl.x, 0.777) / 0.09);
+          float w7 = max(0.0, 1.0 - hueDist(hsl.x, 0.900) / 0.09);
+          vec3 adj = w0 * uHsl[0] + w1 * uHsl[1] + w2 * uHsl[2] + w3 * uHsl[3] + w4 * uHsl[4] + w5 * uHsl[5] + w6 * uHsl[6] + w7 * uHsl[7];
+          if (abs(adj.x) + abs(adj.y) + abs(adj.z) > 0.001) {
+            hsl.x = fract(hsl.x + adj.x * 0.18 + 1.0);
+            hsl.y = clamp(hsl.y + adj.y * 0.85, 0.0, 1.0);
+            hsl.z = clamp(hsl.z + adj.z * 0.35, 0.0, 1.0);
+            c.rgb = hsl2rgb(hsl);
+          }
+        }
+
+        if (uFade > 0.005) {
+          c.rgb = mix(c.rgb, max(c.rgb, vec3(0.16)), uFade);
+        }
+
+        // Independent Film Grain
+        if (uGrain > 0.005) {
+          float gVal = (hash12(uv * 540.0 + fract(vfxTime * 19.0 + 0.37) * 77.0) - 0.5) * 0.28 * uGrain;
+          c.rgb += vec3(gVal);
+        }
+
+        // VHS Retro tint + scanlines (3)
+        if (vfxType > 2.5 && vfxType < 3.5 && vfxInt > 0.01) {
+          float scan = 0.88 + 0.12 * sin(uv.y * 420.0);
+          float gr = (hash12(uv * 320.0 + fract(vfxTime) * 53.0) - 0.5) * 0.14 * vfxInt;
+          c.rgb = c.rgb * scan + vec3(gr);
+          c.r += 0.04 * vfxInt;
+        }
+        // Flash Pulse (5)
+        if (vfxType > 4.5 && vfxType < 5.5 && vfxInt > 0.01) {
+          float pulse = pow(max(0.0, sin(vfxTime * 8.0)), 4.0);
+          c.rgb += vec3(pulse * 0.55 * vfxInt);
+        }
+        // Film Grain VFX (6)
+        if (vfxType > 5.5 && vfxType < 6.5 && vfxInt > 0.01) {
+          float gr = (hash12(uv * 512.0 + fract(vfxTime * 24.0) * 91.0) - 0.5) * 0.24 * vfxInt;
+          c.rgb += vec3(gr);
+        }
+        // Night Vision (7)
+        if (vfxType > 6.5 && vfxType < 7.5 && vfxInt > 0.01) {
+          float nl = dot(c.rgb, vec3(0.299, 0.587, 0.114));
+          float scan = 0.84 + 0.16 * sin(uv.y * 360.0);
+          vec3 nvg = vec3(nl * 0.25, nl * 1.35 + 0.08, nl * 0.35) * scan;
+          c.rgb = mix(c.rgb, nvg, vfxInt);
+        }
+        // CRT Scanline Phosphor (14)
+        if (vfxType > 13.5 && vfxType < 14.5 && vfxInt > 0.01) {
+          float sc = 0.78 + 0.22 * sin(uv.y * 380.0);
+          float ph = 0.90 + 0.10 * cos(uv.x * 460.0);
+          c.rgb *= mix(1.0, sc * ph, vfxInt);
+        }
+        // Comic Halftone Dots (15)
+        if (vfxType > 14.5 && vfxType < 15.5 && vfxInt > 0.01) {
+          vec2 cell = fract(uv * 72.0) - 0.5;
+          float htLum = dot(c.rgb, vec3(0.299, 0.587, 0.114));
+          float dotMask = smoothstep(htLum * 0.55 + 0.06, htLum * 0.55 - 0.06, length(cell));
+          c.rgb = mix(c.rgb, c.rgb * (0.55 + 0.75 * dotMask), vfxInt);
+        }
+        // Black Strobe Beat (16)
+        if (vfxType > 15.5 && vfxType < 16.5 && vfxInt > 0.01) {
+          float blk = step(0.45, sin(vfxTime * 18.0));
+          c.rgb *= mix(1.0, 1.0 - blk * 0.88, vfxInt);
+        }
+
+        if (uVignette > 0.005) {
+          float vd = distance(vUv, vec2(0.5)) * 1.414;
+          float vig = smoothstep(0.35, 1.05, vd);
+          c.rgb *= (1.0 - vig * uVignette * 0.85);
+        }
+        c.rgb = clamp(c.rgb, 0.0, 1.0);
+
+        // Crop bounds (left, top, right, bottom)
+        if (vUv.x < uCropRect.x || vUv.x > (1.0 - uCropRect.z) || vUv.y < uCropRect.y || vUv.y > (1.0 - uCropRect.w)) {
+          c.a = 0.0;
+        }
+
+        // 7 Mask Shapes + Mask Rotation
+        if (uMaskType > 0.5) {
+          vec2 centered = vUv - vec2(0.5 + uMaskRect.x, 0.5 + uMaskRect.y);
+          float cs = cos(-uMaskRot);
+          float sn = sin(-uMaskRot);
+          vec2 rCent = vec2(centered.x * cs - centered.y * sn, centered.x * sn + centered.y * cs);
+          vec2 mp = rCent / max(vec2(0.02), uMaskRect.zw * 0.5);
+          float sd = 0.0;
+          if (uMaskType < 1.5) {
+            // 1: Rectangle
+            vec2 mq = abs(mp) - vec2(1.0);
+            sd = max(mq.x, mq.y);
+          } else if (uMaskType < 2.5) {
+            // 2: Circle / Ellipse
+            sd = length(mp) - 1.0;
+          } else if (uMaskType < 3.5) {
+            // 3: Split linear half-plane
+            sd = mp.y;
+          } else if (uMaskType < 4.5) {
+            // 4: Filmstrip horizontal mirror band
+            sd = abs(mp.y) - 1.0;
+          } else if (uMaskType < 5.5) {
+            // 5: Heart SDF
+            vec2 hp = vec2(abs(mp.x), -mp.y) * 0.85 + vec2(0.0, 0.5);
+            if (hp.y + hp.x > 1.0) sd = length(hp - vec2(0.25, 0.75)) - 0.3535;
+            else sd = min(length(hp - vec2(0.0, 1.0)), length(hp - vec2(0.5 * max(hp.x + hp.y, 0.0)))) * sign(hp.x - hp.y);
+            sd *= 1.4;
+          } else {
+            // 6: 5-Point Star polar SDF (top point upward)
+            float ang = atan(mp.y, mp.x);
+            float rStar = 0.68 + 0.30 * cos(5.0 * ang + 1.5708);
+            sd = length(mp) - rStar;
+          }
+          float fth = max(0.004, uMaskFeather * 2.0);
+          float mAlpha = 1.0 - smoothstep(-fth, fth, sd);
+          if (uMaskInvert > 0.5) mAlpha = 1.0 - mAlpha;
+          c.a *= mAlpha;
+        }
+
+        if (uWipe.x > 0.5) {
+          float p = clamp(uWipe.y, 0.0, 1.0);
+          float soft = 0.03;
+          if (uWipe.x < 1.5) {
+            float e = mix(-soft, 1.0 + soft, p);
+            c.a *= 1.0 - smoothstep(e - soft, e + soft, vUv.x);
+          } else if (uWipe.x < 2.5) {
+            float e = mix(1.0 + soft, -soft, p);
+            c.a *= smoothstep(e - soft, e + soft, vUv.x);
+          } else if (uWipe.x < 3.5) {
+            float e = mix(1.0 + soft, -soft, p);
+            c.a *= smoothstep(e - soft, e + soft, vUv.y);
+          } else if (uWipe.x < 4.5) {
+            float e = mix(-soft, 1.0 + soft, p);
+            c.a *= 1.0 - smoothstep(e - soft, e + soft, vUv.y);
+          } else {
+            float e = mix(-soft, 0.72 + soft, p);
+            c.a *= 1.0 - smoothstep(e - soft, e + soft, distance(vUv, vec2(0.5)));
+          }
+        }
+
+        float outAlpha = c.a * uAlpha;
+        if (uPremul > 0.5) {
+          c.rgb *= outAlpha;
+        }
+        gl_FragColor = vec4(c.rgb, outAlpha);
+      }
+    `;
+
+    const compile = (type, src) => {
+      const s = gl.createShader(type);
+      gl.shaderSource(s, src);
+      gl.compileShader(s);
+      return s;
+    };
+
+    const prog = gl.createProgram();
+    gl.attachShader(prog, compile(gl.VERTEX_SHADER, vsSrc));
+    gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, fsSrc));
+    gl.linkProgram(prog);
+    gl.useProgram(prog);
+
+    const posBuf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+      -0.5, -0.5,  0, 1,
+       0.5, -0.5,  1, 1,
+      -0.5,  0.5,  0, 0,
+       0.5,  0.5,  1, 0
+    ]), gl.STATIC_DRAW);
+
+    const aPos = gl.getAttribLocation(prog, 'aPos');
+    const aUv = gl.getAttribLocation(prog, 'aUv');
+    gl.enableVertexAttribArray(aPos);
+    gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 16, 0);
+    gl.enableVertexAttribArray(aUv);
+    gl.vertexAttribPointer(aUv, 2, gl.FLOAT, false, 16, 8);
+
+    const uTex = gl.getUniformLocation(prog, 'uTex');
+    gl.uniform1i(uTex, 0);
+
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+    return {
+      gl,
+      prog,
+      uMvp: gl.getUniformLocation(prog, 'uMvp'),
+      uAlpha: gl.getUniformLocation(prog, 'uAlpha'),
+      uPremul: gl.getUniformLocation(prog, 'uPremul'),
+      uBright: gl.getUniformLocation(prog, 'uBright'),
+      uContrast: gl.getUniformLocation(prog, 'uContrast'),
+      uSat: gl.getUniformLocation(prog, 'uSat'),
+      uTemp: gl.getUniformLocation(prog, 'uTemp'),
+      uTint: gl.getUniformLocation(prog, 'uTint'),
+      uExposure: gl.getUniformLocation(prog, 'uExposure'),
+      uHighlights: gl.getUniformLocation(prog, 'uHighlights'),
+      uShadows: gl.getUniformLocation(prog, 'uShadows'),
+      uFade: gl.getUniformLocation(prog, 'uFade'),
+      uSharpen: gl.getUniformLocation(prog, 'uSharpen'),
+      uBlur: gl.getUniformLocation(prog, 'uBlur'),
+      uVignette: gl.getUniformLocation(prog, 'uVignette'),
+      uGrain: gl.getUniformLocation(prog, 'uGrain'),
+      uTexel: gl.getUniformLocation(prog, 'uTexel'),
+      uChromaOn: gl.getUniformLocation(prog, 'uChromaOn'),
+      uChromaKey: gl.getUniformLocation(prog, 'uChromaKey'),
+      uChromaSim: gl.getUniformLocation(prog, 'uChromaSim'),
+      uChromaSmooth: gl.getUniformLocation(prog, 'uChromaSmooth'),
+      uChromaSpill: gl.getUniformLocation(prog, 'uChromaSpill'),
+      uOutlineW: gl.getUniformLocation(prog, 'uOutlineW'),
+      uOutlineCol: gl.getUniformLocation(prog, 'uOutlineCol'),
+      uMaskType: gl.getUniformLocation(prog, 'uMaskType'),
+      uMaskRect: gl.getUniformLocation(prog, 'uMaskRect'),
+      uMaskRot: gl.getUniformLocation(prog, 'uMaskRot'),
+      uMaskFeather: gl.getUniformLocation(prog, 'uMaskFeather'),
+      uMaskInvert: gl.getUniformLocation(prog, 'uMaskInvert'),
+      uCropRect: gl.getUniformLocation(prog, 'uCropRect'),
+      uStab: gl.getUniformLocation(prog, 'uStab'),
+      uVfx: gl.getUniformLocation(prog, 'uVfx'),
+      uWipe: gl.getUniformLocation(prog, 'uWipe'),
+      uHsl: gl.getUniformLocation(prog, 'uHsl[0]'),
+      zeroHsl: new Float32Array(24),
+      textures: new Map()
+    };
+  }
+
+  getOrCreateTexture(compositor, key, sourceEl) {
+    const { gl, textures } = compositor;
+    let tex = textures.get(key);
+    if (!tex) {
+      tex = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      textures.set(key, tex);
+    } else {
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+    }
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, sourceEl);
+    return tex;
+  }
+
+  syncCanvasDimensions(project) {
+    if (this.canvas.width !== project.width || this.canvas.height !== project.height) {
+      this.canvas.width = project.width;
+      this.canvas.height = project.height;
+    }
+    this.canvas.style.aspectRatio = `${project.width} / ${project.height}`;
+    const rect = this.canvas.getBoundingClientRect();
+    const w = Math.max(100, Math.round(rect.width || 360));
+    const h = Math.max(100, Math.round(rect.height || 202));
+    if (this.overlay.width !== w || this.overlay.height !== h) {
+      this.overlay.width = w;
+      this.overlay.height = h;
+      this.overlay.style.width = `${w}px`;
+      this.overlay.style.height = `${h}px`;
+    }
+  }
+
+  getImageElement(mediaItem) {
+    if (!mediaItem) return null;
+    if (mediaItem.isGif && !this.gifCache.has(mediaItem.id)) {
+      this.gifCache.set(mediaItem.id, 'loading');
+      decodeAnimatedGif(mediaItem.url)
+        .then((decoded) => this.gifCache.set(mediaItem.id, decoded))
+        .catch(() => this.gifCache.delete(mediaItem.id));
+    }
+    if (this.imageCache.has(mediaItem.id)) return this.imageCache.get(mediaItem.id);
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.src = mediaItem.url;
+    this.imageCache.set(mediaItem.id, img);
+    return img;
+  }
+
+  getGifFrameCanvas(mediaItem, layer, frame, fps) {
+    const entry = this.gifCache.get(mediaItem.id);
+    if (!entry || entry === 'loading' || !entry.frames?.length) return null;
+    const speed = layer.speed || 1;
+    const elapsedMs = Math.max(0, ((frame - layer.startFrame) * speed * 1000) / Math.max(1, fps));
+    const loopMs = elapsedMs % entry.totalMs;
+    const found = entry.frames.find((f) => loopMs >= f.startMs && loopMs < f.endMs);
+    return (found || entry.frames[entry.frames.length - 1]).canvas;
+  }
+
+  getVideoElement(mediaItem) {
+    if (!mediaItem) return null;
+    if (this.videoCache.has(mediaItem.id)) return this.videoCache.get(mediaItem.id);
+    const vid = document.createElement('video');
+    vid.crossOrigin = 'anonymous';
+    vid.muted = true;
+    vid.playsInline = true;
+    vid.preload = 'auto';
+    vid.src = mediaItem.url;
+    this.videoCache.set(mediaItem.id, vid);
+    return vid;
+  }
+
+  async seekVideosForFrame(project, frame, mediaMap, awaitSeek = false) {
+    const fps = project.fps || 30;
+    const promises = [];
+
+    for (const layer of project.layers) {
+      if (layer.type !== 'video' || !layer.visible || !layer.mediaId) continue;
+      if (frame < layer.startFrame || frame > layer.endFrame) continue;
+      const mediaItem = mediaMap.get(layer.mediaId);
+      if (!mediaItem) continue;
+      const vid = this.getVideoElement(mediaItem);
+      if (!vid) continue;
+
+      const baseSec = (layer.mediaOffsetFrames || 0) / fps;
+      const elapsedSec = TimelineEngine.integrateSpeedCurveSourceFrames(layer, frame - layer.startFrame) / fps;
+      const spanSec = TimelineEngine.integrateSpeedCurveSourceFrames(layer, Math.max(1, layer.endFrame - layer.startFrame)) / fps;
+      let targetTime;
+      if (layer.reversed) {
+        const endWindow = vid.duration && isFinite(vid.duration)
+          ? Math.min(vid.duration - 0.01, baseSec + spanSec)
+          : baseSec + spanSec;
+        targetTime = Math.max(0, endWindow - elapsedSec);
+      } else {
+        targetTime = Math.max(0, baseSec + elapsedSec);
+      }
+      const clampedTime = vid.duration && isFinite(vid.duration) ? Math.max(0, Math.min(vid.duration - 0.01, targetTime)) : Math.max(0, targetTime);
+      if (!isFinite(clampedTime) || clampedTime < 0) continue;
+
+      const seekThreshold = awaitSeek ? 0.004 : 0.014;
+      if (Math.abs(vid.currentTime - clampedTime) > seekThreshold) {
+        if (awaitSeek) {
+          promises.push(
+            new Promise((resolve) => {
+              const done = () => {
+                vid.removeEventListener('seeked', done);
+                resolve();
+              };
+              vid.addEventListener('seeked', done, { once: true });
+              vid.currentTime = clampedTime;
+              setTimeout(done, 180);
+            })
+          );
+        } else {
+          try { vid.currentTime = clampedTime; } catch {}
+        }
+      }
+    }
+    if (awaitSeek && promises.length > 0) await Promise.all(promises);
+  }
+
+  _formatRichTextLines(tp) {
+    let raw = String(tp.text || '');
+    if (tp.textCase === 'upper') raw = raw.toUpperCase();
+    else if (tp.textCase === 'lower') raw = raw.toLowerCase();
+    return raw.split('\n');
+  }
+
+  _measureLineWithSpacing(ctx, line, letterSpacing) {
+    if (!letterSpacing) return ctx.measureText(line).width;
+    let total = 0;
+    for (let i = 0; i < line.length; i++) {
+      total += ctx.measureText(line[i]).width + (i < line.length - 1 ? letterSpacing : 0);
+    }
+    return total;
+  }
+
+  _drawLineWithSpacing(ctx, line, xOffset, y, align, letterSpacing, isStroke) {
+    const totalW = this._measureLineWithSpacing(ctx, line, letterSpacing);
+    let cursorX = align === 'center' ? xOffset - totalW / 2 : align === 'right' ? xOffset - totalW : xOffset;
+    const prevAlign = ctx.textAlign;
+    ctx.textAlign = 'left';
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (isStroke) ctx.strokeText(ch, cursorX, y);
+      else ctx.fillText(ch, cursorX, y);
+      cursorX += ctx.measureText(ch).width + letterSpacing;
+    }
+    ctx.textAlign = prevAlign;
+  }
+
+  getOrRasterizeVectorLayer(layer) {
+    let w = Math.max(2, Math.ceil(layer.width || 300));
+    let h = Math.max(2, Math.ceil(layer.height || 200));
+    const key = JSON.stringify({
+      type: layer.type,
+      w,
+      h,
+      textProps: layer.textProps,
+      shapeProps: layer.shapeProps
+    });
+    const cached = this.rasterCache.get(layer.id);
+    if (cached && cached.key === key) return cached.canvas;
+
+    const pad = 56; // extra margin for drop shadow / stroke / curve
+    const c = cached?.canvas || document.createElement('canvas');
+    const ctx = c.getContext('2d');
+
+    let lines = [];
+    let fontSize = 64;
+    let lineHeight = 72;
+    let bgPad = 0;
+    let letterSpacing = 0;
+    let curveDeg = 0;
+    if (layer.type === 'text' && layer.textProps) {
+      const tp = layer.textProps;
+      fontSize = tp.fontSize || 64;
+      const fontStyle = tp.italic ? 'italic ' : '';
+      ctx.font = `${fontStyle}${tp.fontWeight || '700'} ${fontSize}px "${tp.fontFamily || 'sans-serif'}", sans-serif`;
+      lines = this._formatRichTextLines(tp);
+      lineHeight = fontSize * (Number(tp.lineHeight) || 1.18);
+      letterSpacing = Number(tp.letterSpacing) || 0;
+      curveDeg = Number(tp.curve) || 0;
+      const strokeExtra = (tp.strokeWidth || 0) * 2;
+      bgPad = tp.bgEnabled ? Math.max(8, Number(tp.bgPadding ?? 20)) : 0;
+      const maxLineW = lines.reduce((acc, ln) => Math.max(acc, this._measureLineWithSpacing(ctx, ln, letterSpacing)), 20);
+      const curvePadH = Math.abs(curveDeg) > 1 ? Math.round(maxLineW * Math.min(0.45, Math.abs(curveDeg) / 220)) : 0;
+      w = Math.max(w, Math.ceil(maxLineW + strokeExtra + bgPad * 2 + 12));
+      h = Math.max(h, Math.ceil(lines.length * lineHeight + strokeExtra + bgPad * 1.4 + curvePadH));
+    }
+
+    const cw = w + pad * 2;
+    const ch = h + pad * 2;
+    if (c.width !== cw || c.height !== ch) {
+      c.width = cw;
+      c.height = ch;
+    }
+    ctx.clearRect(0, 0, cw, ch);
+    ctx.save();
+    ctx.translate(cw / 2, ch / 2);
+
+    if (layer.type === 'text' && layer.textProps) {
+      const tp = layer.textProps;
+      if (tp.bgEnabled) {
+        ctx.save();
+        ctx.globalAlpha = tp.bgOpacity ?? 0.78;
+        ctx.fillStyle = tp.bgColor || '#0B0E14';
+        const rad = Math.min(Number(tp.bgRadius ?? 16), w / 2, h / 2);
+        this.roundRectPath(ctx, -w / 2, -h / 2, w, h, Math.max(0, rad));
+        ctx.fill();
+        ctx.restore();
+      }
+      const fontStyle = tp.italic ? 'italic ' : '';
+      ctx.font = `${fontStyle}${tp.fontWeight || '700'} ${fontSize}px "${tp.fontFamily || 'sans-serif'}", sans-serif`;
+      ctx.textAlign = tp.align || 'center';
+      ctx.textBaseline = 'middle';
+      if ((tp.shadowBlur || 0) > 0) {
+        ctx.shadowColor = tp.shadowColor || 'rgba(0,0,0,0.6)';
+        ctx.shadowBlur = tp.shadowBlur;
+        ctx.shadowOffsetY = tp.shadowOffsetY || 3;
+      }
+
+      let fillPaint = tp.color || '#FFFFFF';
+      if (tp.gradientEnabled) {
+        const grad = ctx.createLinearGradient(-w * 0.4, -h * 0.3, w * 0.4, h * 0.3);
+        grad.addColorStop(0, tp.color || '#FFEB3B');
+        grad.addColorStop(1, tp.gradientColor2 || '#00E5FF');
+        fillPaint = grad;
+      }
+
+      const startY = -((lines.length - 1) * lineHeight) / 2;
+      const xOffset = tp.align === 'left' ? (-w / 2 + bgPad) : tp.align === 'right' ? (w / 2 - bgPad) : 0;
+
+      if (Math.abs(curveDeg) > 1) {
+        const absArc = (Math.min(170, Math.abs(curveDeg)) * Math.PI) / 180;
+        const sign = curveDeg >= 0 ? 1 : -1;
+        lines.forEach((line, idx) => {
+          const ly = startY + idx * lineHeight;
+          const lineW = Math.max(20, this._measureLineWithSpacing(ctx, line, letterSpacing));
+          const radius = Math.max(60, lineW / Math.max(0.08, absArc));
+          let adv = -lineW / 2;
+          for (let i = 0; i < line.length; i++) {
+            const chStr = line[i];
+            const chW = ctx.measureText(chStr).width;
+            const midS = adv + chW * 0.5;
+            const theta = (midS / radius) * sign;
+            ctx.save();
+            ctx.translate(Math.sin(theta) * radius, ly + (radius - Math.cos(theta) * radius) * sign);
+            ctx.rotate(theta);
+            ctx.textAlign = 'center';
+            if ((tp.strokeWidth || 0) > 0) {
+              ctx.lineWidth = tp.strokeWidth;
+              ctx.strokeStyle = tp.strokeColor || '#00E5FF';
+              ctx.strokeText(chStr, 0, 0);
+            }
+            ctx.fillStyle = fillPaint;
+            ctx.fillText(chStr, 0, 0);
+            ctx.restore();
+            adv += chW + letterSpacing;
+          }
+        });
+      } else {
+        lines.forEach((line, idx) => {
+          const ly = startY + idx * lineHeight;
+          const lineW = this._measureLineWithSpacing(ctx, line, letterSpacing);
+          if ((tp.strokeWidth || 0) > 0) {
+            ctx.lineWidth = tp.strokeWidth;
+            ctx.strokeStyle = tp.strokeColor || '#00E5FF';
+            if (letterSpacing) this._drawLineWithSpacing(ctx, line, xOffset, ly, tp.align || 'center', letterSpacing, true);
+            else ctx.strokeText(line, xOffset, ly);
+          }
+          ctx.fillStyle = fillPaint;
+          if (letterSpacing) this._drawLineWithSpacing(ctx, line, xOffset, ly, tp.align || 'center', letterSpacing, false);
+          else ctx.fillText(line, xOffset, ly);
+
+          if (tp.underline && lineW > 2) {
+            const uLeft = tp.align === 'left' ? xOffset : tp.align === 'right' ? xOffset - lineW : xOffset - lineW / 2;
+            ctx.save();
+            ctx.strokeStyle = tp.color || '#FFFFFF';
+            ctx.lineWidth = Math.max(2, Math.round(fontSize * 0.065));
+            ctx.beginPath();
+            ctx.moveTo(uLeft, ly + fontSize * 0.44);
+            ctx.lineTo(uLeft + lineW, ly + fontSize * 0.44);
+            ctx.stroke();
+            ctx.restore();
+          }
+        });
+      }
+    } else if (layer.type === 'shape' && layer.shapeProps) {
+      const sp = layer.shapeProps;
+      ctx.fillStyle = sp.fillColor || '#7C4DFF';
+      ctx.strokeStyle = sp.strokeColor || '#00E5FF';
+      ctx.lineWidth = sp.strokeWidth || 0;
+      if (sp.shapeType === 'circle') {
+        const r = Math.min(w, h) / 2;
+        ctx.beginPath();
+        ctx.arc(0, 0, r, 0, Math.PI * 2);
+        ctx.fill();
+        if (sp.strokeWidth > 0) ctx.stroke();
+      } else if (sp.shapeType === 'ellipse') {
+        ctx.beginPath();
+        ctx.ellipse(0, 0, w / 2, h / 2, 0, 0, Math.PI * 2);
+        ctx.fill();
+        if (sp.strokeWidth > 0) ctx.stroke();
+      } else if (sp.shapeType === 'line') {
+        ctx.beginPath();
+        ctx.moveTo(-w / 2, 0);
+        ctx.lineTo(w / 2, 0);
+        ctx.lineCap = 'round';
+        ctx.lineWidth = Math.max(2, sp.strokeWidth || 8);
+        ctx.strokeStyle = sp.strokeColor || sp.fillColor || '#00E5FF';
+        ctx.stroke();
+      } else {
+        const rad = Math.min(sp.cornerRadius || 0, w / 2, h / 2);
+        this.roundRectPath(ctx, -w / 2, -h / 2, w, h, rad);
+        ctx.fill();
+        if (sp.strokeWidth > 0) ctx.stroke();
+      }
+    }
+
+    ctx.restore();
+    this.rasterCache.set(layer.id, { key, canvas: c, drawW: cw, drawH: ch, contentW: w, contentH: h });
+    return c;
+  }
+
+  roundRectPath(ctx, x, y, w, h, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.lineTo(x + w - r, y);
+    ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+    ctx.lineTo(x + w, y + h - r);
+    ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+    ctx.lineTo(x + r, y + h);
+    ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+    ctx.lineTo(x, y + r);
+    ctx.quadraticCurveTo(x, y, x + r, y);
+    ctx.closePath();
+  }
+
+  resolveLayerDrawable(layer, frame, projectFps, mediaMap) {
+    if (layer.type === 'image') {
+      const item = mediaMap.get(layer.mediaId);
+      if (!item) return null;
+      if (item.isGif) {
+        const gifCanvas = this.getGifFrameCanvas(item, layer, frame, projectFps);
+        if (gifCanvas) return { el: gifCanvas, w: layer.width || gifCanvas.width, h: layer.height || gifCanvas.height };
+      }
+      const img = this.getImageElement(item);
+      if (img && img.complete && img.naturalWidth > 0) {
+        return { el: img, w: layer.width || img.naturalWidth, h: layer.height || img.naturalHeight };
+      }
+      return null;
+    }
+    if (layer.type === 'video') {
+      const item = mediaMap.get(layer.mediaId);
+      const vid = this.getVideoElement(item);
+      if (vid && vid.readyState >= 2) {
+        return { el: vid, w: layer.width || vid.videoWidth, h: layer.height || vid.videoHeight };
+      }
+      return null;
+    }
+    if (layer.type === 'text' || layer.type === 'shape') {
+      const c = this.getOrRasterizeVectorLayer(layer);
+      return { el: c, w: c.width, h: c.height };
+    }
+    return null;
+  }
+
+  hexToRgb01(hex) {
+    const clean = (hex || '#05070B').replace('#', '');
+    if (clean.length !== 6) return [0.02, 0.03, 0.04];
+    return [
+      parseInt(clean.slice(0, 2), 16) / 255,
+      parseInt(clean.slice(2, 4), 16) / 255,
+      parseInt(clean.slice(4, 6), 16) / 255
+    ];
+  }
+
+  renderFrame(project, frame, mediaMap, selectedLayerId = null, targetCanvas = null, targetW = null, targetH = null) {
+    if (!targetCanvas) {
+      this.syncCanvasDimensions(project);
+    }
+
+    let compositor = this.glPreview;
+    if (targetCanvas) {
+      compositor = this.exportCompositors.get(targetCanvas);
+      if (!compositor) {
+        compositor = this.createWebGLCompositor(targetCanvas);
+        if (compositor) this.exportCompositors.set(targetCanvas, compositor);
+      }
+    }
+
+    const w = targetW || project.width;
+    const h = targetH || project.height;
+
+    if (compositor) {
+      this.renderWebGL(compositor, project, frame, mediaMap, w, h);
+    } else {
+      const ctx = targetCanvas ? targetCanvas.getContext('2d', { alpha: false }) : this.ctx2dFallback;
+      this.renderCanvas2DFallback(ctx, project, frame, mediaMap, w, h);
+    }
+
+    if (!targetCanvas) {
+      this.drawOverlay(project, frame, selectedLayerId);
+    }
+  }
+
+  computeTransitionState(layer, frame, projectWidth, projectHeight) {
+    const out = {
+      alphaMul: 1,
+      dx: 0,
+      dy: 0,
+      scaleMul: 1,
+      rotDelta: 0,
+      brightDelta: 0,
+      blurDelta: 0,
+      wipeType: 0,
+      wipeProgress: 1
+    };
+    const tr = layer.transitions;
+    if (!tr) return out;
+    const len = Math.max(1, layer.endFrame - layer.startFrame);
+    const apply = (type, eased, raw, isOut) => {
+      switch (type) {
+        case 'crossfade':
+          out.alphaMul *= eased;
+          break;
+        case 'fadeBlack':
+          out.alphaMul *= Math.min(1, eased * 1.15);
+          out.brightDelta -= (1 - eased) * 1.1;
+          break;
+        case 'mixBlur':
+          out.alphaMul *= eased;
+          out.blurDelta += (1 - eased) * 5.0;
+          break;
+        case 'flashWhite':
+          out.alphaMul *= Math.min(1, 0.25 + eased * 0.75);
+          out.brightDelta += (1 - eased) * 1.85;
+          break;
+        case 'glitchCut':
+          out.dx += Math.sin(raw * 34) * (1 - eased) * projectWidth * 0.08;
+          out.dy += Math.cos(raw * 27) * (1 - eased) * projectHeight * 0.04;
+          out.alphaMul *= Math.min(1, 0.35 + eased * 0.65);
+          break;
+        case 'wipeRight':
+          out.wipeType = 1;
+          out.wipeProgress = Math.min(out.wipeProgress, eased);
+          break;
+        case 'wipeLeft':
+          out.wipeType = 2;
+          out.wipeProgress = Math.min(out.wipeProgress, eased);
+          break;
+        case 'wipeUp':
+          out.wipeType = 3;
+          out.wipeProgress = Math.min(out.wipeProgress, eased);
+          break;
+        case 'wipeDown':
+          out.wipeType = 4;
+          out.wipeProgress = Math.min(out.wipeProgress, eased);
+          break;
+        case 'circleIris':
+          out.wipeType = 5;
+          out.wipeProgress = Math.min(out.wipeProgress, eased);
+          break;
+        case 'slideLeft':
+          out.dx += isOut ? -(1 - eased) * projectWidth * 0.92 : (1 - eased) * projectWidth * 0.92;
+          out.alphaMul *= Math.min(1, raw * 3.0);
+          break;
+        case 'slideRight':
+          out.dx += isOut ? (1 - eased) * projectWidth * 0.92 : -(1 - eased) * projectWidth * 0.92;
+          out.alphaMul *= Math.min(1, raw * 3.0);
+          break;
+        case 'slideUp':
+          out.dy += isOut ? -(1 - eased) * projectHeight * 0.92 : (1 - eased) * projectHeight * 0.92;
+          out.alphaMul *= Math.min(1, raw * 3.0);
+          break;
+        case 'slideDown':
+          out.dy += isOut ? (1 - eased) * projectHeight * 0.92 : -(1 - eased) * projectHeight * 0.92;
+          out.alphaMul *= Math.min(1, raw * 3.0);
+          break;
+        case 'zoomIn':
+          out.scaleMul *= isOut ? (1 + (1 - eased) * 1.15) : (0.28 + 0.72 * eased);
+          out.alphaMul *= eased;
+          break;
+        case 'zoomOut':
+          out.scaleMul *= isOut ? (0.28 + 0.72 * eased) : (1 + (1 - eased) * 1.15);
+          out.alphaMul *= eased;
+          break;
+        case 'spinIn':
+          out.rotDelta += isOut ? -(1 - eased) * 180 : (1 - eased) * 180;
+          out.scaleMul *= 0.42 + 0.58 * eased;
+          out.alphaMul *= eased;
+          break;
+        default:
+          break;
+      }
+    };
+
+    if (tr.inType && tr.inType !== 'none') {
+      const inDur = Math.max(1, Math.min(len * 0.5, Number(tr.inFrames) || 15));
+      if (frame < layer.startFrame + inDur) {
+        const raw = Math.max(0, Math.min(1, (frame - layer.startFrame) / inDur));
+        const eased = 1 - Math.pow(1 - raw, 3);
+        apply(tr.inType, eased, raw, false);
+      }
+    }
+    if (tr.outType && tr.outType !== 'none') {
+      const outDur = Math.max(1, Math.min(len * 0.5, Number(tr.outFrames) || 15));
+      if (frame > layer.endFrame - outDur) {
+        const raw = Math.max(0, Math.min(1, (layer.endFrame - frame) / outDur));
+        const eased = 1 - Math.pow(1 - raw, 3);
+        apply(tr.outType, eased, raw, true);
+      }
+    }
+    return out;
+  }
+
+  getGradientBgCanvas(c0, c1) {
+    const key = `${c0}_${c1}`;
+    if (this.bgGradientCache.key === key && this.bgGradientCache.canvas) {
+      return this.bgGradientCache.canvas;
+    }
+    const c = this.bgGradientCache.canvas || document.createElement('canvas');
+    c.width = 16;
+    c.height = 128;
+    const ctx = c.getContext('2d');
+    const g = ctx.createLinearGradient(0, 0, 16, 128);
+    g.addColorStop(0, c0 || '#0F172A');
+    g.addColorStop(1, c1 || '#1E1B4B');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, 16, 128);
+    this.bgGradientCache = { key, canvas: c };
+    return c;
+  }
+
+  _resetDefaultShaderUniforms(compositor) {
+    const {
+      gl, uAlpha, uPremul, uBright, uContrast, uSat, uTemp,
+      uTint, uExposure, uHighlights, uShadows, uFade, uSharpen,
+      uBlur, uVignette, uGrain, uChromaOn, uOutlineW, uMaskType, uMaskRot,
+      uCropRect, uStab, uVfx, uWipe, uHsl, zeroHsl
+    } = compositor;
+    gl.uniform1f(uAlpha, 1);
+    gl.uniform1f(uPremul, 0);
+    gl.uniform1f(uBright, 0);
+    gl.uniform1f(uContrast, 1);
+    gl.uniform1f(uSat, 1);
+    gl.uniform1f(uTemp, 0);
+    gl.uniform1f(uTint, 0);
+    gl.uniform1f(uExposure, 0);
+    gl.uniform1f(uHighlights, 0);
+    gl.uniform1f(uShadows, 0);
+    gl.uniform1f(uFade, 0);
+    gl.uniform1f(uSharpen, 0);
+    gl.uniform1f(uBlur, 0);
+    gl.uniform1f(uVignette, 0);
+    gl.uniform1f(uGrain, 0);
+    gl.uniform1f(uChromaOn, 0);
+    gl.uniform1f(uOutlineW, 0);
+    gl.uniform1f(uMaskType, 0);
+    gl.uniform1f(uMaskRot, 0);
+    gl.uniform4f(uCropRect, 0, 0, 0, 0);
+    if (uStab) gl.uniform4f(uStab, 0, 0, 0, 1);
+    gl.uniform3f(uVfx, 0, 0, 0);
+    gl.uniform2f(uWipe, 0, 1);
+    if (uHsl) gl.uniform3fv(uHsl, zeroHsl);
+  }
+
+  renderWebGL(compositor, project, frame, mediaMap, outW, outH) {
+    const {
+      gl, prog, uMvp, uAlpha, uPremul,
+      uBright, uContrast, uSat, uTemp,
+      uTint, uExposure, uHighlights, uShadows, uFade, uSharpen,
+      uBlur, uVignette, uGrain, uTexel,
+      uChromaOn, uChromaKey, uChromaSim, uChromaSmooth, uChromaSpill,
+      uOutlineW, uOutlineCol,
+      uMaskType, uMaskRect, uMaskRot, uMaskFeather, uMaskInvert, uCropRect, uStab, uVfx, uWipe, uHsl, zeroHsl
+    } = compositor;
+    gl.useProgram(prog);
+    gl.viewport(0, 0, outW, outH);
+
+    const [bgR, bgG, bgB] = this.hexToRgb01(project.backgroundColor);
+    gl.clearColor(bgR, bgG, bgB, 1.0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+
+    // Draw Canvas Gradient or Canvas Blurred Video/Image Background if active
+    const bgMode = project.backgroundMode || 'color';
+    if (bgMode === 'gradient') {
+      const gradC = this.getGradientBgCanvas(project.backgroundGradient?.[0], project.backgroundGradient?.[1]);
+      this.getOrCreateTexture(compositor, '__bg_grad', gradC);
+      this._resetDefaultShaderUniforms(compositor);
+      gl.uniformMatrix4fv(uMvp, false, Mat4.scale(Mat4.identity(), 2, 2, 1));
+      gl.uniform2f(uTexel, 1 / 16, 1 / 128);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    } else if (bgMode === 'blur') {
+      const bgLayer = [...project.layers].reverse().find(
+        (l) => l.visible && (l.type === 'video' || l.type === 'image') && frame >= l.startFrame && frame <= l.endFrame
+      );
+      if (bgLayer) {
+        const bgDrawable = this.resolveLayerDrawable(bgLayer, frame, project.fps || 30, mediaMap);
+        if (bgDrawable) {
+          this.getOrCreateTexture(compositor, bgLayer.mediaId || bgLayer.id, bgDrawable.el);
+          this._resetDefaultShaderUniforms(compositor);
+          const scaleCover = Math.max(project.width / Math.max(1, bgDrawable.w), project.height / Math.max(1, bgDrawable.h));
+          const sxCover = (bgDrawable.w * scaleCover) / project.width * 2;
+          const syCover = (bgDrawable.h * scaleCover) / project.height * 2;
+          gl.uniformMatrix4fv(uMvp, false, Mat4.scale(Mat4.identity(), sxCover, syCover, 1));
+          gl.uniform2f(uTexel, 1 / Math.max(1, bgDrawable.w), 1 / Math.max(1, bgDrawable.h));
+          gl.uniform1f(uBlur, 3.5 + (project.backgroundBlurLevel ?? 2) * 3.0);
+          gl.uniform1f(uBright, -0.14);
+          gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+        }
+      }
+    }
+
+    const camEnabled = Boolean(project.camera?.enabled);
+    const useMotionBlur = camEnabled && Boolean(project.camera?.motionBlur);
+    const samples = useMotionBlur ? Math.max(2, Math.min(6, project.camera.motionBlurSamples || 4)) : 1;
+
+    const layersById = new Map(project.layers.map((l) => [l.id, l]));
+    const fovRad = (45 * Math.PI) / 180;
+    const aspect = project.width / Math.max(1, project.height);
+    const camDist = (project.height / 2) / Math.tan(fovRad / 2);
+    const projMat = Mat4.perspective(fovRad, aspect, 10, camDist * 20);
+    const fps = Math.max(1, project.fps || 30);
+
+    for (let s = samples - 1; s >= 0; s--) {
+      const subFrame = samples === 1 ? frame : frame - (s / samples) * 0.65;
+      const masterAlpha = samples === 1 ? 1.0 : (s === 0 ? 0.85 : 0.22);
+
+      let viewMat = Mat4.identity();
+      viewMat = Mat4.translate(viewMat, 0, 0, -camDist);
+
+      if (camEnabled) {
+        const cam = KeyframeEngine.getCameraAtFrame(project.camera, subFrame);
+        viewMat = Mat4.scale(viewMat, cam.zoom, cam.zoom, 1);
+        viewMat = Mat4.rotateZ(viewMat, (-cam.rotZ * Math.PI) / 180);
+        viewMat = Mat4.rotateX(viewMat, (cam.rotX * Math.PI) / 180);
+        viewMat = Mat4.rotateY(viewMat, (cam.rotY * Math.PI) / 180);
+        viewMat = Mat4.translate(viewMat, -cam.x, cam.y, -cam.z);
+      }
+
+      for (let i = project.layers.length - 1; i >= 0; i--) {
+        const layer = project.layers[i];
+        if (!layer.visible || layer.type === 'audio' || layer.type === 'group') continue;
+        if (subFrame < layer.startFrame || subFrame > layer.endFrame) continue;
+
+        let parentTf = null;
+        if (layer.parentId) {
+          const parent = layersById.get(layer.parentId);
+          if (parent) {
+            if (!parent.visible || subFrame < parent.startFrame || subFrame > parent.endFrame) continue;
+            parentTf = KeyframeEngine.getTransformAtFrame(parent, subFrame);
+          }
+        }
+
+        const drawable = this.resolveLayerDrawable(layer, subFrame, fps, mediaMap);
+        if (!drawable) continue;
+
+        const tf = KeyframeEngine.getTransformAtFrame(layer, subFrame);
+        const trState = this.computeTransitionState(layer, subFrame, project.width, project.height);
+        let alpha = masterAlpha * Math.max(0, Math.min(1, tf.opacity)) * trState.alphaMul;
+        if (parentTf) alpha *= Math.max(0, Math.min(1, parentTf.opacity));
+        if (alpha <= 0.002) continue;
+
+        let model = Mat4.identity();
+        if (parentTf) {
+          model = Mat4.translate(model, parentTf.x, -parentTf.y, parentTf.z || 0);
+          model = Mat4.rotateZ(model, (-parentTf.rotation * Math.PI) / 180);
+          model = Mat4.rotateX(model, ((parentTf.rotX || 0) * Math.PI) / 180);
+          model = Mat4.rotateY(model, ((parentTf.rotY || 0) * Math.PI) / 180);
+          model = Mat4.scale(model, parentTf.scaleX, parentTf.scaleY, 1);
+        }
+
+        const flipSX = layer.flipX ? -1 : 1;
+        const flipSY = layer.flipY ? -1 : 1;
+        model = Mat4.translate(model, tf.x + trState.dx, -(tf.y + trState.dy), tf.z || 0);
+        model = Mat4.rotateZ(model, (-(tf.rotation + (trState.rotDelta || 0)) * Math.PI) / 180);
+        model = Mat4.rotateX(model, ((tf.rotX || 0) * Math.PI) / 180);
+        model = Mat4.rotateY(model, ((tf.rotY || 0) * Math.PI) / 180);
+        model = Mat4.scale(model, tf.scaleX * trState.scaleMul * flipSX, tf.scaleY * trState.scaleMul * flipSY, 1);
+        model = Mat4.translate(model, -tf.anchorX, tf.anchorY, 0);
+        model = Mat4.scale(model, drawable.w, drawable.h, 1);
+
+        const mvp = Mat4.multiply(projMat, Mat4.multiply(viewMat, model));
+        this.getOrCreateTexture(compositor, layer.mediaId || layer.id, drawable.el);
+
+        const blend = layer.blendMode || 'normal';
+        let premul = 0;
+        if (blend === 'add') {
+          gl.blendFunc(gl.SRC_ALPHA, gl.ONE);
+        } else if (blend === 'screen') {
+          premul = 1;
+          gl.blendFuncSeparate(gl.ONE, gl.ONE_MINUS_SRC_COLOR, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+        } else if (blend === 'multiply') {
+          premul = 1;
+          gl.blendFuncSeparate(gl.DST_COLOR, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+        } else {
+          gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+        }
+
+        const fx = layer.fx || {};
+        const mask = layer.mask || {};
+        const crop = layer.crop || {};
+        const vfx = layer.vfx || {};
+        const vfxSpec = VIDEO_EFFECT_PRESETS.find((v) => v.id === vfx.type);
+        const vfxShaderId = vfxSpec ? vfxSpec.shaderId : 0;
+        const vfxTime = ((subFrame - layer.startFrame) / fps) * (vfx.speed || 1);
+        const keyRgb = this.hexToRgb01(fx.chromaColor || '#00FF00');
+        const outRgb = this.hexToRgb01(fx.outlineColor || '#FFFFFF');
+        const maskSpec = MASK_PRESETS.find((m) => m.id === mask.type);
+        const maskShaderType = maskSpec ? maskSpec.shaderType : 0;
+
+        gl.uniformMatrix4fv(uMvp, false, mvp);
+        gl.uniform1f(uAlpha, alpha);
+        gl.uniform1f(uPremul, premul);
+        gl.uniform1f(uBright, (Number(fx.brightness) || 0) + (trState.brightDelta || 0));
+        gl.uniform1f(uContrast, fx.contrast ?? 1);
+        gl.uniform1f(uSat, fx.saturation ?? 1);
+        gl.uniform1f(uTemp, Number(fx.temperature) || 0);
+        gl.uniform1f(uTint, Number(fx.tint) || 0);
+        gl.uniform1f(uExposure, Number(fx.exposure) || 0);
+        gl.uniform1f(uHighlights, Number(fx.highlights) || 0);
+        gl.uniform1f(uShadows, Number(fx.shadows) || 0);
+        gl.uniform1f(uFade, Number(fx.fade) || 0);
+        gl.uniform1f(uSharpen, Number(fx.sharpen) || 0);
+        gl.uniform1f(uBlur, (Number(fx.blur) || 0) + (trState.blurDelta || 0));
+        gl.uniform1f(uVignette, Number(fx.vignette) || 0);
+        gl.uniform1f(uGrain, Number(fx.grain) || 0);
+        gl.uniform2f(uTexel, 1 / Math.max(1, drawable.w), 1 / Math.max(1, drawable.h));
+        gl.uniform1f(uChromaOn, fx.chromaEnabled ? 1 : 0);
+        gl.uniform3f(uChromaKey, keyRgb[0], keyRgb[1], keyRgb[2]);
+        gl.uniform1f(uChromaSim, fx.chromaSimilarity ?? 0.35);
+        gl.uniform1f(uChromaSmooth, fx.chromaSmoothness ?? 0.12);
+        gl.uniform1f(uChromaSpill, fx.chromaSpill ?? 0.5);
+        gl.uniform1f(uOutlineW, Number(fx.outlineWidth) || 0);
+        gl.uniform3f(uOutlineCol, outRgb[0], outRgb[1], outRgb[2]);
+        gl.uniform1f(uMaskType, maskShaderType);
+        gl.uniform4f(
+          uMaskRect,
+          Number(mask.offsetX) || 0,
+          Number(mask.offsetY) || 0,
+          mask.scaleX ?? 0.85,
+          mask.scaleY ?? 0.85
+        );
+        gl.uniform1f(uMaskRot, ((Number(mask.rotation) || 0) * Math.PI) / 180);
+        gl.uniform1f(uMaskFeather, mask.feather ?? 0.05);
+        gl.uniform1f(uMaskInvert, mask.invert ? 1 : 0);
+        gl.uniform4f(
+          uCropRect,
+          Number(crop.left) || 0,
+          Number(crop.top) || 0,
+          Number(crop.right) || 0,
+          Number(crop.bottom) || 0
+        );
+        if (uStab) {
+          const stab = getStabilizerAtFrame(layer, subFrame, fps);
+          gl.uniform4f(
+            uStab,
+            stab.dx / Math.max(1, drawable.w),
+            stab.dy / Math.max(1, drawable.h),
+            stab.rot,
+            stab.cropScale
+          );
+        }
+        gl.uniform3f(uVfx, vfxShaderId, vfx.intensity ?? 0.65, vfxTime);
+        gl.uniform2f(uWipe, trState.wipeType, trState.wipeProgress);
+        if (uHsl) {
+          if (Array.isArray(fx.hsl) && fx.hsl.length === 8) {
+            const flat = new Float32Array(24);
+            for (let cIdx = 0; cIdx < 8; cIdx++) {
+              const ch = fx.hsl[cIdx] || [0, 0, 0];
+              flat[cIdx * 3] = Number(ch[0]) || 0;
+              flat[cIdx * 3 + 1] = Number(ch[1]) || 0;
+              flat[cIdx * 3 + 2] = Number(ch[2]) || 0;
+            }
+            gl.uniform3fv(uHsl, flat);
+          } else {
+            gl.uniform3fv(uHsl, zeroHsl);
+          }
+        }
+
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+      }
+    }
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  }
+
+  renderCanvas2DFallback(ctx, project, frame, mediaMap, w, h) {
+    ctx.save();
+    if (project.backgroundMode === 'gradient') {
+      const g = ctx.createLinearGradient(0, 0, w, h);
+      g.addColorStop(0, project.backgroundGradient?.[0] || '#0F172A');
+      g.addColorStop(1, project.backgroundGradient?.[1] || '#1E1B4B');
+      ctx.fillStyle = g;
+    } else {
+      ctx.fillStyle = project.backgroundColor || '#05070B';
+    }
+    ctx.fillRect(0, 0, w, h);
+    ctx.scale(w / project.width, h / project.height);
+
+    const layersById = new Map(project.layers.map((l) => [l.id, l]));
+    for (let i = project.layers.length - 1; i >= 0; i--) {
+      const layer = project.layers[i];
+      if (!layer.visible || layer.type === 'audio' || layer.type === 'group') continue;
+      if (frame < layer.startFrame || frame > layer.endFrame) continue;
+
+      let parentTf = null;
+      if (layer.parentId) {
+        const parent = layersById.get(layer.parentId);
+        if (parent) {
+          if (!parent.visible || frame < parent.startFrame || frame > parent.endFrame) continue;
+          parentTf = KeyframeEngine.getTransformAtFrame(parent, frame);
+        }
+      }
+
+      const drawable = this.resolveLayerDrawable(layer, frame, project.fps || 30, mediaMap);
+      if (!drawable) continue;
+      const tf = KeyframeEngine.getTransformAtFrame(layer, frame);
+      const trState = this.computeTransitionState(layer, frame, project.width, project.height);
+      let alpha = Math.max(0, Math.min(1, tf.opacity)) * trState.alphaMul;
+      if (parentTf) alpha *= Math.max(0, Math.min(1, parentTf.opacity));
+      if (alpha <= 0.002) continue;
+
+      ctx.save();
+      const blendMap = { add: 'lighter', screen: 'screen', multiply: 'multiply' };
+      ctx.globalCompositeOperation = blendMap[layer.blendMode] || 'source-over';
+      ctx.translate(project.width / 2, project.height / 2);
+      if (parentTf) {
+        ctx.translate(parentTf.x, parentTf.y);
+        ctx.rotate((parentTf.rotation * Math.PI) / 180);
+        ctx.scale(parentTf.scaleX, parentTf.scaleY);
+      }
+      ctx.translate(tf.x + trState.dx, tf.y + trState.dy);
+      ctx.rotate(((tf.rotation + (trState.rotDelta || 0)) * Math.PI) / 180);
+      ctx.scale(
+        tf.scaleX * trState.scaleMul * (layer.flipX ? -1 : 1),
+        tf.scaleY * trState.scaleMul * (layer.flipY ? -1 : 1)
+      );
+      ctx.translate(-tf.anchorX, -tf.anchorY);
+      ctx.globalAlpha = alpha;
+      if (trState.wipeType > 0) {
+        const p = Math.max(0, Math.min(1, trState.wipeProgress));
+        ctx.beginPath();
+        if (trState.wipeType === 1) ctx.rect(-drawable.w / 2, -drawable.h / 2, drawable.w * p, drawable.h);
+        else if (trState.wipeType === 2) ctx.rect(drawable.w * (0.5 - p), -drawable.h / 2, drawable.w * p, drawable.h);
+        else if (trState.wipeType === 3) ctx.rect(-drawable.w / 2, drawable.h * (0.5 - p), drawable.w, drawable.h * p);
+        else if (trState.wipeType === 4) ctx.rect(-drawable.w / 2, -drawable.h / 2, drawable.w, drawable.h * p);
+        else ctx.arc(0, 0, Math.hypot(drawable.w, drawable.h) * 0.52 * p, 0, Math.PI * 2);
+        ctx.clip();
+      }
+      const crop = layer.crop;
+      if (crop && ((crop.left || 0) > 0 || (crop.right || 0) > 0 || (crop.top || 0) > 0 || (crop.bottom || 0) > 0)) {
+        const cL = Math.max(0, Math.min(0.49, Number(crop.left) || 0));
+        const cR = Math.max(0, Math.min(0.49, Number(crop.right) || 0));
+        const cT = Math.max(0, Math.min(0.49, Number(crop.top) || 0));
+        const cB = Math.max(0, Math.min(0.49, Number(crop.bottom) || 0));
+        const cw = Math.max(0, (1 - cL - cR) * drawable.w);
+        const ch = Math.max(0, (1 - cT - cB) * drawable.h);
+        ctx.beginPath();
+        ctx.rect(-drawable.w / 2 + cL * drawable.w, -drawable.h / 2 + cT * drawable.h, cw, ch);
+        ctx.clip();
+      }
+      const stab = getStabilizerAtFrame(layer, frame, project.fps || 30);
+      if (stab.cropScale > 1.0005 || Math.abs(stab.dx) > 0.05 || Math.abs(stab.dy) > 0.05 || Math.abs(stab.rot) > 0.0001) {
+        ctx.beginPath();
+        ctx.rect(-drawable.w / 2, -drawable.h / 2, drawable.w, drawable.h);
+        ctx.clip();
+        ctx.scale(stab.cropScale, stab.cropScale);
+        ctx.rotate(stab.rot);
+        ctx.translate(stab.dx, stab.dy);
+      }
+      ctx.drawImage(drawable.el, -drawable.w / 2, -drawable.h / 2, drawable.w, drawable.h);
+      ctx.restore();
+    }
+    ctx.restore();
+  }
+
+  computeCameraMatrices(project, frame) {
+    const fovRad = (45 * Math.PI) / 180;
+    const aspect = project.width / Math.max(1, project.height);
+    const camDist = (project.height / 2) / Math.tan(fovRad / 2);
+    const projMat = Mat4.perspective(fovRad, aspect, 10, camDist * 20);
+    const camEnabled = Boolean(project.camera?.enabled);
+    const cam = camEnabled
+      ? KeyframeEngine.getCameraAtFrame(project.camera, frame)
+      : { x: 0, y: 0, z: 0, rotX: 0, rotY: 0, rotZ: 0, zoom: 1 };
+
+    let viewMat = Mat4.identity();
+    viewMat = Mat4.translate(viewMat, 0, 0, -camDist);
+    if (camEnabled) {
+      viewMat = Mat4.scale(viewMat, cam.zoom, cam.zoom, 1);
+      viewMat = Mat4.rotateZ(viewMat, (-cam.rotZ * Math.PI) / 180);
+      viewMat = Mat4.rotateX(viewMat, (cam.rotX * Math.PI) / 180);
+      viewMat = Mat4.rotateY(viewMat, (cam.rotY * Math.PI) / 180);
+      viewMat = Mat4.translate(viewMat, -cam.x, cam.y, -cam.z);
+    }
+    return { fovRad, camDist, projMat, viewMat, pvMat: Mat4.multiply(projMat, viewMat), cam };
+  }
+
+  projectMatPoint(mvp, x, y, z, ow, oh) {
+    const cx = mvp[0] * x + mvp[4] * y + mvp[8] * z + mvp[12];
+    const cy = mvp[1] * x + mvp[5] * y + mvp[9] * z + mvp[13];
+    const cw = mvp[3] * x + mvp[7] * y + mvp[11] * z + mvp[15];
+    if (cw <= 1e-3) return null;
+    const ndcX = cx / cw;
+    const ndcY = cy / cw;
+    return {
+      x: (ndcX * 0.5 + 0.5) * ow,
+      y: (0.5 - ndcY * 0.5) * oh,
+      w: cw
+    };
+  }
+
+  drawBlender3DFloorAndTriad(octx, project, mats, ow, oh) {
+    const { pvMat, cam } = mats;
+    const span = Math.max(project.width, project.height) * 0.9;
+    const floorY = -project.height * 0.38; // World Y down -> negative is bottom half of frame
+    const steps = 8;
+    const stepSize = (span * 2) / steps;
+
+    octx.save();
+    for (let i = 0; i <= steps; i++) {
+      const v = -span + i * stepSize;
+      const isCenter = Math.abs(v) < stepSize * 0.25;
+
+      // Lines along Z
+      const pZ0 = this.projectMatPoint(pvMat, v, floorY, -span, ow, oh);
+      const pZ1 = this.projectMatPoint(pvMat, v, floorY, span, ow, oh);
+      if (pZ0 && pZ1) {
+        octx.strokeStyle = isCenter ? 'rgba(64, 156, 255, 0.55)' : 'rgba(139, 152, 176, 0.16)';
+        octx.lineWidth = isCenter ? 1.4 : 1;
+        octx.beginPath();
+        octx.moveTo(pZ0.x, pZ0.y);
+        octx.lineTo(pZ1.x, pZ1.y);
+        octx.stroke();
+      }
+
+      // Lines along X
+      const pX0 = this.projectMatPoint(pvMat, -span, floorY, v, ow, oh);
+      const pX1 = this.projectMatPoint(pvMat, span, floorY, v, ow, oh);
+      if (pX0 && pX1) {
+        octx.strokeStyle = isCenter ? 'rgba(255, 82, 82, 0.55)' : 'rgba(139, 152, 176, 0.16)';
+        octx.lineWidth = isCenter ? 1.4 : 1;
+        octx.beginPath();
+        octx.moveTo(pX0.x, pX0.y);
+        octx.lineTo(pX1.x, pX1.y);
+        octx.stroke();
+      }
+    }
+
+    // Corner 3D Blender Navigation Triad (bottom-left above 3D toolbar)
+    const triadX = 34;
+    const triadY = oh - 46;
+    let rotOnly = Mat4.identity();
+    rotOnly = Mat4.rotateZ(rotOnly, (-cam.rotZ * Math.PI) / 180);
+    rotOnly = Mat4.rotateX(rotOnly, (cam.rotX * Math.PI) / 180);
+    rotOnly = Mat4.rotateY(rotOnly, (cam.rotY * Math.PI) / 180);
+
+    const axes = [
+      { label: 'X', vec: [1, 0, 0], color: '#FF5252' },
+      { label: 'Y', vec: [0, 1, 0], color: '#69F0AE' },
+      { label: 'Z', vec: [0, 0, 1], color: '#40C4FF' }
+    ];
+    const axisLen = 20;
+    const projectedAxes = axes.map((a) => {
+      const rx = rotOnly[0] * a.vec[0] + rotOnly[4] * a.vec[1] + rotOnly[8] * a.vec[2];
+      const ry = rotOnly[1] * a.vec[0] + rotOnly[5] * a.vec[1] + rotOnly[9] * a.vec[2];
+      const rz = rotOnly[2] * a.vec[0] + rotOnly[6] * a.vec[1] + rotOnly[10] * a.vec[2];
+      return { ...a, px: triadX + rx * axisLen, py: triadY - ry * axisLen, z: rz };
+    }).sort((a, b) => a.z - b.z);
+
+    octx.fillStyle = 'rgba(11, 14, 20, 0.7)';
+    octx.beginPath();
+    octx.arc(triadX, triadY, 26, 0, Math.PI * 2);
+    octx.fill();
+    octx.strokeStyle = 'rgba(255,255,255,0.12)';
+    octx.lineWidth = 1;
+    octx.stroke();
+
+    octx.font = 'bold 9px system-ui, sans-serif';
+    octx.textAlign = 'center';
+    octx.textBaseline = 'middle';
+    for (const a of projectedAxes) {
+      octx.strokeStyle = a.color;
+      octx.lineWidth = 2;
+      octx.beginPath();
+      octx.moveTo(triadX, triadY);
+      octx.lineTo(a.px, a.py);
+      octx.stroke();
+
+      octx.fillStyle = a.color;
+      octx.beginPath();
+      octx.arc(a.px, a.py, 5.5, 0, Math.PI * 2);
+      octx.fill();
+      octx.fillStyle = '#071018';
+      octx.fillText(a.label, a.px, a.py + 0.5);
+    }
+    octx.restore();
+  }
+
+  drawOverlay(project, frame, selectedLayerId) {
+    const octx = this.octx;
+    const ow = this.overlay.width;
+    const oh = this.overlay.height;
+    octx.clearRect(0, 0, ow, oh);
+    this.lastOverlayBox = null;
+    this.lastTrackerBox = null;
+    this.lastGizmoHandles = null;
+    this.renderedLayerQuads = [];
+
+    if (project.settings?.showGrid) {
+      octx.save();
+      octx.strokeStyle = 'rgba(255, 255, 255, 0.14)';
+      octx.lineWidth = 1;
+      for (let i = 1; i <= 2; i++) {
+        const gx = (ow * i) / 3;
+        const gy = (oh * i) / 3;
+        octx.beginPath(); octx.moveTo(gx, 0); octx.lineTo(gx, oh); octx.stroke();
+        octx.beginPath(); octx.moveTo(0, gy); octx.lineTo(ow, gy); octx.stroke();
+      }
+      octx.restore();
+    }
+
+    const mats = this.computeCameraMatrices(project, frame);
+    if (this.viewport3D?.enabled) {
+      this.drawBlender3DFloorAndTriad(octx, project, mats, ow, oh);
+    }
+
+    if (this.trackerOverlay && this.trackerOverlay.active) {
+      this.drawTrackerReticleOverlay(octx, project, frame, ow, oh);
+    }
+
+    const sx = ow / project.width;
+    const sy = oh / project.height;
+    let selectedBoxInfo = null;
+
+    // Collect projected hit-test quads for all visible visual layers (front-to-back)
+    for (let i = 0; i < project.layers.length; i++) {
+      const l = project.layers[i];
+      if (!l.visible || l.type === 'audio' || l.type === 'group') continue;
+      if (frame < l.startFrame || frame > l.endFrame) continue;
+
+      let parentTf = null;
+      if (l.parentId) {
+        const parent = project.layers.find((p) => p.id === l.parentId);
+        if (parent) {
+          if (!parent.visible || frame < parent.startFrame || frame > parent.endFrame) continue;
+          parentTf = KeyframeEngine.getTransformAtFrame(parent, frame);
+        }
+      }
+
+      const tf = KeyframeEngine.getTransformAtFrame(l, frame);
+      const cachedRaster = this.rasterCache.get(l.id);
+      const baseW = Math.max(l.width || 300, cachedRaster?.contentW || 0);
+      const baseH = Math.max(l.height || 200, cachedRaster?.contentH || 0);
+
+      let model = Mat4.identity();
+      if (parentTf) {
+        model = Mat4.translate(model, parentTf.x, -parentTf.y, parentTf.z || 0);
+        model = Mat4.rotateZ(model, (-parentTf.rotation * Math.PI) / 180);
+        model = Mat4.rotateX(model, ((parentTf.rotX || 0) * Math.PI) / 180);
+        model = Mat4.rotateY(model, ((parentTf.rotY || 0) * Math.PI) / 180);
+        model = Mat4.scale(model, parentTf.scaleX, parentTf.scaleY, 1);
+      }
+      model = Mat4.translate(model, tf.x, -tf.y, tf.z || 0);
+      model = Mat4.rotateZ(model, (-tf.rotation * Math.PI) / 180);
+      model = Mat4.rotateX(model, ((tf.rotX || 0) * Math.PI) / 180);
+      model = Mat4.rotateY(model, ((tf.rotY || 0) * Math.PI) / 180);
+      model = Mat4.scale(model, tf.scaleX, tf.scaleY, 1);
+      model = Mat4.translate(model, -tf.anchorX, tf.anchorY, 0);
+
+      const mvpBox = Mat4.multiply(mats.pvMat, model);
+      const pCenter = this.projectMatPoint(mvpBox, 0, 0, 0, ow, oh);
+      const hw = baseW / 2;
+      const hh = baseH / 2;
+      const pTL = this.projectMatPoint(mvpBox, -hw, hh, 0, ow, oh);
+      const pTR = this.projectMatPoint(mvpBox, hw, hh, 0, ow, oh);
+      const pBR = this.projectMatPoint(mvpBox, hw, -hh, 0, ow, oh);
+      const pBL = this.projectMatPoint(mvpBox, -hw, -hh, 0, ow, oh);
+      if (!pCenter || !pTL || !pTR || !pBR || !pBL) continue;
+
+      const corners = [pTL, pTR, pBR, pBL];
+      this.renderedLayerQuads.push({ layerId: l.id, corners });
+      if (l.id === selectedLayerId) {
+        selectedBoxInfo = { l, model, pCenter, pTL, pTR, pBR, pBL, corners };
+      }
+    }
+
+    if (!selectedBoxInfo) return;
+    const { l: layer, model, pCenter, pTL, pTR, pBR, pBL } = selectedBoxInfo;
+
+    const bw = Math.max(16, Math.hypot(pTR.x - pTL.x, pTR.y - pTL.y));
+    const bh = Math.max(16, Math.hypot(pBL.x - pTL.x, pBL.y - pTL.y));
+    const rad = Math.atan2(pTR.y - pTL.y, pTR.x - pTL.x);
+
+    this.lastOverlayBox = {
+      cx: pCenter.x,
+      cy: pCenter.y,
+      bw,
+      bh,
+      rad,
+      sx,
+      sy,
+      layerId: layer.id,
+      corners: [pTL, pTR, pBR, pBL]
+    };
+
+    octx.save();
+    octx.strokeStyle = this.viewport3D?.enabled ? '#40C4FF' : '#00E5FF';
+    octx.lineWidth = 1.6;
+    octx.beginPath();
+    octx.moveTo(pTL.x, pTL.y);
+    octx.lineTo(pTR.x, pTR.y);
+    octx.lineTo(pBR.x, pBR.y);
+    octx.lineTo(pBL.x, pBL.y);
+    octx.closePath();
+    octx.stroke();
+
+    // Scale corner squares
+    octx.fillStyle = '#00E5FF';
+    for (const c of [pTL, pTR, pBR, pBL]) {
+      octx.fillRect(c.x - 4.5, c.y - 4.5, 9, 9);
+    }
+
+    if (this.viewport3D?.enabled) {
+      this.draw3DGizmo(octx, mats, model, pCenter, ow, oh);
+    } else {
+      // Standard 2D rotation stem
+      const midTopX = (pTL.x + pTR.x) / 2;
+      const midTopY = (pTL.y + pTR.y) / 2;
+      const nx = Math.sin(rad) * 20;
+      const ny = -Math.cos(rad) * 20;
+      octx.beginPath();
+      octx.moveTo(midTopX, midTopY);
+      octx.lineTo(midTopX + nx, midTopY + ny);
+      octx.stroke();
+
+      octx.beginPath();
+      octx.arc(midTopX + nx, midTopY + ny, 6, 0, Math.PI * 2);
+      octx.fillStyle = '#7C4DFF';
+      octx.fill();
+      octx.strokeStyle = '#FFFFFF';
+      octx.stroke();
+    }
+    octx.restore();
+  }
+
+  draw3DGizmo(octx, mats, model, pCenter, ow, oh) {
+    const tool = this.viewport3D?.tool || 'move';
+    if (tool === 'camera') return;
+
+    const wx = model[12];
+    const wyGl = model[13];
+    const wz = model[14];
+
+    if (tool === 'move') {
+      const worldSpan = 110;
+      const pX = this.projectMatPoint(mats.pvMat, wx + worldSpan, wyGl, wz, ow, oh);
+      const pY = this.projectMatPoint(mats.pvMat, wx, wyGl + worldSpan, wz, ow, oh);
+      const pZ = this.projectMatPoint(mats.pvMat, wx, wyGl, wz + worldSpan, ow, oh);
+
+      const drawArrow = (target, color, label) => {
+        if (!target) return null;
+        let dx = target.x - pCenter.x;
+        let dy = target.y - pCenter.y;
+        const len = Math.hypot(dx, dy);
+        if (len < 6) {
+          // Ensure Z handle remains reachable even straight-on from front view
+          if (label === 'Z') { dx = -34; dy = 28; }
+          else return null;
+        } else if (len > 62) {
+          dx = (dx / len) * 56;
+          dy = (dy / len) * 56;
+        } else if (len < 36) {
+          dx = (dx / len) * 40;
+          dy = (dy / len) * 40;
+        }
+        const tx = pCenter.x + dx;
+        const ty = pCenter.y + dy;
+        octx.strokeStyle = color;
+        octx.lineWidth = 2.6;
+        octx.beginPath();
+        octx.moveTo(pCenter.x, pCenter.y);
+        octx.lineTo(tx, ty);
+        octx.stroke();
+
+        octx.fillStyle = color;
+        octx.beginPath();
+        octx.arc(tx, ty, 7, 0, Math.PI * 2);
+        octx.fill();
+        octx.fillStyle = '#071018';
+        octx.font = 'bold 9px system-ui, sans-serif';
+        octx.textAlign = 'center';
+        octx.textBaseline = 'middle';
+        octx.fillText(label, tx, ty + 0.5);
+        return { x: tx, y: ty, dirX: dx / Math.max(1, Math.hypot(dx, dy)), dirY: dy / Math.max(1, Math.hypot(dx, dy)) };
+      };
+
+      const hX = drawArrow(pX, '#FF5252', 'X');
+      const hY = drawArrow(pY, '#69F0AE', 'Y');
+      const hZ = drawArrow(pZ, '#40C4FF', 'Z');
+
+      // Center white free-move ring
+      octx.strokeStyle = '#FFFFFF';
+      octx.lineWidth = 1.8;
+      octx.beginPath();
+      octx.arc(pCenter.x, pCenter.y, 8, 0, Math.PI * 2);
+      octx.stroke();
+
+      this.lastGizmoHandles = { tool: 'move', cx: pCenter.x, cy: pCenter.y, x: hX, y: hY, z: hZ };
+    } else if (tool === 'rotate') {
+      const rOuter = 54;
+      const rInner = 38;
+      // Outer Z Roll ring
+      octx.strokeStyle = 'rgba(64, 196, 255, 0.85)';
+      octx.lineWidth = 2.4;
+      octx.beginPath();
+      octx.arc(pCenter.x, pCenter.y, rOuter, 0, Math.PI * 2);
+      octx.stroke();
+
+      // Horizontal Yaw Y ellipse
+      octx.strokeStyle = 'rgba(105, 240, 174, 0.85)';
+      octx.lineWidth = 2;
+      octx.beginPath();
+      octx.ellipse(pCenter.x, pCenter.y, rInner, rInner * 0.36, 0, 0, Math.PI * 2);
+      octx.stroke();
+
+      // Vertical Pitch X ellipse
+      octx.strokeStyle = 'rgba(255, 82, 82, 0.85)';
+      octx.lineWidth = 2;
+      octx.beginPath();
+      octx.ellipse(pCenter.x, pCenter.y, rInner * 0.36, rInner, 0, 0, Math.PI * 2);
+      octx.stroke();
+
+      this.lastGizmoHandles = { tool: 'rotate', cx: pCenter.x, cy: pCenter.y, rInner, rOuter };
+    }
+  }
+
+  drawTrackerReticleOverlay(octx, project, frame, ow, oh) {
+    const tr = this.trackerOverlay;
+    const sx = ow / project.width;
+    const sy = oh / project.height;
+
+    const srcLayer = project.layers.find((l) => l.id === tr.sourceLayerId);
+    const points = srcLayer?.trackData?.points || [];
+
+    // Draw tracked motion path trail if points exist
+    if (points.length > 1) {
+      octx.save();
+      octx.strokeStyle = 'rgba(255, 171, 64, 0.78)';
+      octx.lineWidth = 2;
+      octx.setLineDash([4, 4]);
+      octx.beginPath();
+      points.forEach((p, idx) => {
+        const px = (project.width / 2 + p.x) * sx;
+        const py = (project.height / 2 + p.y) * sy;
+        if (idx === 0) octx.moveTo(px, py);
+        else octx.lineTo(px, py);
+      });
+      octx.stroke();
+      octx.setLineDash([]);
+
+      for (let i = 0; i < points.length; i += Math.max(1, Math.floor(points.length / 24))) {
+        const p = points[i];
+        const px = (project.width / 2 + p.x) * sx;
+        const py = (project.height / 2 + p.y) * sy;
+        octx.fillStyle = p.extrapolated ? '#FF5252' : '#FFAB40';
+        octx.beginPath();
+        octx.arc(px, py, 2.5, 0, Math.PI * 2);
+        octx.fill();
+      }
+      octx.restore();
+    }
+
+    // Active reticle position: follow tracked point during playback/after tracking, or use manual aim target
+    const matchedPt = (tr.followTrackedPoints && !tr.dragging) ? points.find((p) => p.frame === Math.round(frame)) : null;
+    const tx = matchedPt ? matchedPt.x : tr.targetX;
+    const ty = matchedPt ? matchedPt.y : tr.targetY;
+    const rx = (project.width / 2 + tx) * sx;
+    const ry = (project.height / 2 + ty) * sy;
+    const boxW = Math.max(28, (tr.patchRadius || 28) * 2 * sx);
+    const searchW = Math.max(boxW + 18, (tr.searchRadius || 95) * 2 * sx);
+
+    this.lastTrackerBox = { rx, ry, sx, sy, boxW };
+
+    octx.save();
+    octx.translate(rx, ry);
+
+    // Outer dashed search window
+    octx.strokeStyle = 'rgba(0, 229, 255, 0.45)';
+    octx.lineWidth = 1;
+    octx.setLineDash([4, 3]);
+    octx.strokeRect(-searchW / 2, -searchW / 2, searchW, searchW);
+    octx.setLineDash([]);
+
+    // Inner template patch brackets
+    const half = boxW / 2;
+    const bLen = Math.min(12, half * 0.55);
+    octx.strokeStyle = '#FFAB40';
+    octx.lineWidth = 2.2;
+    octx.beginPath();
+    // TL
+    octx.moveTo(-half, -half + bLen); octx.lineTo(-half, -half); octx.lineTo(-half + bLen, -half);
+    // TR
+    octx.moveTo(half - bLen, -half); octx.lineTo(half, -half); octx.lineTo(half, -half + bLen);
+    // BR
+    octx.moveTo(half, half - bLen); octx.lineTo(half, half); octx.lineTo(half - bLen, half);
+    // BL
+    octx.moveTo(-half + bLen, half); octx.lineTo(-half, half); octx.lineTo(-half, half - bLen);
+    octx.stroke();
+
+    // Center crosshair +
+    octx.strokeStyle = '#00E5FF';
+    octx.lineWidth = 1.5;
+    octx.beginPath();
+    octx.moveTo(-8, 0); octx.lineTo(8, 0);
+    octx.moveTo(0, -8); octx.lineTo(0, 8);
+    octx.stroke();
+
+    // Label pill above reticle
+    const scoreTxt = matchedPt ? `TRACK ${Math.round((matchedPt.score || 1) * 100)}%` : 'DRAG TARGET';
+    octx.font = 'bold 10px system-ui, sans-serif';
+    const tw = octx.measureText(scoreTxt).width + 10;
+    octx.fillStyle = 'rgba(11, 14, 20, 0.85)';
+    octx.fillRect(-tw / 2, -half - 20, tw, 15);
+    octx.fillStyle = '#FFAB40';
+    octx.textAlign = 'center';
+    octx.textBaseline = 'middle';
+    octx.fillText(scoreTxt, 0, -half - 12.5);
+
+    octx.restore();
+  }
+
+  hitTestOverlay(px, py) {
+    if (this.trackerOverlay?.active && this.lastTrackerBox) {
+      const tb = this.lastTrackerBox;
+      if (Math.hypot(px - tb.rx, py - tb.ry) <= Math.max(32, tb.boxW * 0.75)) {
+        return 'tracker';
+      }
+    }
+
+    // Check 3D Gizmo handles first when Blender 3D Viewport is active
+    if (this.viewport3D?.enabled && this.lastGizmoHandles) {
+      const g = this.lastGizmoHandles;
+      if (g.tool === 'move') {
+        if (g.x && Math.hypot(px - g.x.x, py - g.x.y) <= 22) return 'gizmo_x';
+        if (g.y && Math.hypot(px - g.y.x, py - g.y.y) <= 22) return 'gizmo_y';
+        if (g.z && Math.hypot(px - g.z.x, py - g.z.y) <= 22) return 'gizmo_z';
+        if (Math.hypot(px - g.cx, py - g.cy) <= 16) return 'move';
+      } else if (g.tool === 'rotate') {
+        const dist = Math.hypot(px - g.cx, py - g.cy);
+        if (dist <= g.rOuter + 14) {
+          return dist >= g.rInner + 4 ? 'gizmo_rot_z' : 'gizmo_rot_xy';
+        }
+      }
+    }
+
+    const box = this.lastOverlayBox;
+    if (box && !(this.viewport3D?.enabled && this.viewport3D.tool === 'camera')) {
+      if (Array.isArray(box.corners) && box.corners.length === 4) {
+        for (const c of box.corners) {
+          if (Math.hypot(px - c.x, py - c.y) <= 18) return 'scale';
+        }
+      }
+
+      const dx = px - box.cx;
+      const dy = py - box.cy;
+      const cos = Math.cos(-box.rad);
+      const sin = Math.sin(-box.rad);
+      const lx = dx * cos - dy * sin;
+      const ly = dx * sin + dy * cos;
+
+      if (!this.viewport3D?.enabled && Math.hypot(lx - 0, ly - (-box.bh / 2 - 22)) <= 18) {
+        return 'rotate';
+      }
+
+      if (Array.isArray(box.corners) && box.corners.length === 4 && this._pointInConvexQuad(px, py, box.corners, 8)) {
+        return 'move';
+      }
+      if (Math.abs(lx) <= box.bw / 2 + 10 && Math.abs(ly) <= box.bh / 2 + 10) return 'move';
+    }
+
+    if (this.viewport3D?.enabled) {
+      return 'cam_orbit';
+    }
+    return null;
+  }
+
+  _pointInConvexQuad(px, py, corners, pad = 0) {
+    let cx = 0;
+    let cy = 0;
+    for (const c of corners) { cx += c.x; cy += c.y; }
+    cx /= 4;
+    cy /= 4;
+    const pts = pad > 0 ? corners.map((c) => {
+      const vx = c.x - cx;
+      const vy = c.y - cy;
+      const len = Math.max(1, Math.hypot(vx, vy));
+      return { x: c.x + (vx / len) * pad, y: c.y + (vy / len) * pad };
+    }) : corners;
+
+    let pos = 0;
+    let neg = 0;
+    for (let i = 0; i < 4; i++) {
+      const a = pts[i];
+      const b = pts[(i + 1) % 4];
+      const cross = (b.x - a.x) * (py - a.y) - (b.y - a.y) * (px - a.x);
+      if (cross > 0) pos++;
+      else if (cross < 0) neg++;
+    }
+    return pos === 0 || neg === 0;
+  }
+
+  hitTestAnyLayer(px, py) {
+    if (!Array.isArray(this.renderedLayerQuads)) return null;
+    for (const q of this.renderedLayerQuads) {
+      if (this._pointInConvexQuad(px, py, q.corners, 6)) {
+        return q.layerId;
+      }
+    }
+    return null;
+  }
+
+  async captureSourceLayerPng(project, frame, mediaMap, layerId) {
+    const layer = project.layers.find((l) => l.id === layerId);
+    if (!layer) return null;
+    await this.seekVideosForFrame(project, frame, mediaMap, true);
+    const drawable = this.resolveLayerDrawable(layer, frame, project.fps || 30, mediaMap);
+    if (!drawable || !drawable.el) return null;
+    const w = Math.max(2, Math.round(drawable.el.videoWidth || drawable.el.naturalWidth || drawable.w || layer.width || 640));
+    const h = Math.max(2, Math.round(drawable.el.videoHeight || drawable.el.naturalHeight || drawable.h || layer.height || 360));
+    const c = document.createElement('canvas');
+    c.width = w;
+    c.height = h;
+    const ctx = c.getContext('2d');
+    ctx.drawImage(drawable.el, 0, 0, w, h);
+    return {
+      dataUrl: c.toDataURL('image/png'),
+      width: w,
+      height: h
+    };
+  }
+
+  capturePreviewThumbnailDataUrl(maxW = 128, maxH = 96) {
+    try {
+      const src = this.canvas;
+      if (!src || !src.width || !src.height) return null;
+      const scale = Math.min(maxW / src.width, maxH / src.height, 1);
+      const w = Math.max(24, Math.round(src.width * scale));
+      const h = Math.max(24, Math.round(src.height * scale));
+      const c = document.createElement('canvas');
+      c.width = w;
+      c.height = h;
+      const ctx = c.getContext('2d');
+      ctx.drawImage(src, 0, 0, w, h);
+      return c.toDataURL('image/jpeg', 0.72);
+    } catch {
+      return null;
+    }
+  }
+}
