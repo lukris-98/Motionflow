@@ -15,6 +15,16 @@ import { parseSrtOrLyrics, FILTER_PRESETS, VIDEO_EFFECT_PRESETS, TRANSITION_PRES
 import { ExportEngine } from '../src/main/assets/www/js/export/exportEngine.js';
 import { createEmptyProject, deserializeProject } from '../src/main/assets/www/js/storage/projectStorage.js';
 import { extractGrayscale, extractTemplatePatch, matchTemplateCoarseToFine } from '../src/main/assets/www/js/engine/trackerEngine.js';
+import {
+  analyzeRgbaPalette,
+  analyzeShapePalette,
+  applyFxToPalette,
+  computeTimelineAveragePalette,
+  computeColorMatchFx,
+  applyColorMatchToLayer,
+  setLayerColorMatchIntensity,
+  toggleLayerColorMatch
+} from '../src/main/assets/www/js/engine/colorMatchEngine.js';
 
 test('KeyframeEngine smooth Catmull-Rom spline & smoothCameraKeyframes', () => {
   assert.ok(EASING_TYPES.some((e) => e.key === 'smooth'));
@@ -562,5 +572,235 @@ test('ExportEngine supports 60fps bitrate scaling and file size estimation', () 
   const size60 = exporter.estimateFileSizeMb(proj, '1080p', 'high', true, true, 60);
   assert.ok(size60 > size30, `Expected 60fps estimated MB (${size60}) > 30fps (${size30})`);
 });
+
+test('ColorMatchEngine analyzes pixel palettes, computes duration-weighted timeline average & adjusts new layer fx', () => {
+  const makeSolidRgba = (r, g, b, pxCount = 16) => {
+    const arr = new Uint8ClampedArray(pxCount * 4);
+    for (let i = 0; i < pxCount; i++) {
+      arr[i * 4] = r;
+      arr[i * 4 + 1] = g;
+      arr[i * 4 + 2] = b;
+      arr[i * 4 + 3] = 255;
+    }
+    return arr;
+  };
+
+  // Warm bright sunset palette vs dark cool blue palette
+  const warmPal = analyzeRgbaPalette(makeSolidRgba(235, 160, 75), 4, 4);
+  const coolPal = analyzeRgbaPalette(makeSolidRgba(45, 70, 155), 4, 4);
+  assert.ok(warmPal && coolPal);
+  assert.ok(warmPal.warmth > 0.4, `Expected warm palette warmth > 0.4, got ${warmPal.warmth}`);
+  assert.ok(coolPal.warmth < -0.2, `Expected cool palette warmth < -0.2, got ${coolPal.warmth}`);
+  assert.ok(warmPal.meanLuma > coolPal.meanLuma);
+  assert.ok(warmPal.swatches.length >= 1 && warmPal.swatches[0].hex.startsWith('#'));
+
+  // Shape palette & grading awareness
+  const shapePal = analyzeShapePalette({ fillColor: '#E07030', strokeColor: '#FFD166' });
+  assert.ok(shapePal && shapePal.warmth > 0.3);
+  const brightened = applyFxToPalette(coolPal, { exposure: 0.4, brightness: 0.2, contrast: 1.1 });
+  assert.ok(brightened.meanLuma > coolPal.meanLuma);
+  const warmed = applyFxToPalette(coolPal, { temperature: 0.5 });
+  assert.ok(warmed.warmth > coolPal.warmth);
+
+  // Project timeline with existing warm Main Track clip, ignored sticker/audio, and new cool clip
+  const proj = createEmptyProject('ColorMatchProj', { width: 1080, height: 1920, fps: 30, durationSec: 10 });
+  const warmClip = TimelineEngine.createMediaLayer(proj, { id: 'm_warm', name: 'Sunset', type: 'image', width: 1080, height: 1920, durationMs: 4000 }, 0, { trackRole: 'main' });
+  const coolNew = TimelineEngine.createMediaLayer(proj, { id: 'm_cool', name: 'BlueClip', type: 'image', width: 1080, height: 1920, durationMs: 3000 }, 120, { trackRole: 'main' });
+  const stickerOverlay = TimelineEngine.createMediaLayer(proj, { id: 'stk_badge', name: 'Sticker', type: 'image', width: 200, height: 200, durationMs: 2000 }, 0, { trackRole: 'overlay' });
+  const bgMusic = TimelineEngine.createMediaLayer(proj, { id: 'aud_1', name: 'BGM', type: 'audio', durationMs: 4000 }, 0);
+
+  TimelineEngine.addToMainTrack(proj, warmClip);
+  TimelineEngine.addToMainTrack(proj, coolNew);
+  TimelineEngine.addLayer(proj, stickerOverlay);
+  TimelineEngine.addLayer(proj, bgMusic);
+
+  // Use a separate blue-tinted palette on sticker to confirm stk_ & target clip are excluded
+  const paletteMap = new Map([
+    ['m_warm', warmPal],
+    ['m_cool', coolPal],
+    ['stk_badge', coolPal]
+  ]);
+
+  const timelineAvg = computeTimelineAveragePalette(proj, paletteMap, { excludeLayerId: coolNew.id });
+  assert.ok(timelineAvg);
+  assert.equal(timelineAvg.layerCount, 1);
+  assert.ok(timelineAvg.warmth > 0.4);
+
+  const computed = computeColorMatchFx(coolPal, timelineAvg, 0.8);
+  assert.ok(computed.temperature > 0.2, `Expected positive warmth temperature shift, got ${computed.temperature}`);
+  assert.ok(computed.exposure > 0 || computed.brightness > 0);
+
+  coolNew.fx.contrast = 1.1; // Pre-existing user base contrast should be preserved/multiplied
+  assert.equal(applyColorMatchToLayer(coolNew, coolPal, timelineAvg, 0.8), true);
+  assert.equal(coolNew.colorMatch.enabled, true);
+  assert.ok(coolNew.fx.temperature > 0.2);
+
+  // Adjusting match intensity scales adjustments smoothly
+  const temp80 = coolNew.fx.temperature;
+  assert.equal(setLayerColorMatchIntensity(coolNew, 0.4), true);
+  assert.ok(coolNew.fx.temperature > 0 && coolNew.fx.temperature < temp80);
+
+  // Toggling Color Match OFF restores baseFx; toggling ON re-applies
+  assert.equal(toggleLayerColorMatch(coolNew, false), true);
+  assert.equal(coolNew.fx.temperature, 0);
+  assert.equal(coolNew.fx.contrast, 1.1);
+  assert.equal(toggleLayerColorMatch(coolNew, true), true);
+  assert.ok(coolNew.fx.temperature > 0);
+});
+
+test('CapCut-style Main Track magnetic timeline: append, Z-order, ripple delete/trim, reorder, split & role switch', () => {
+  const proj = createEmptyProject('CapCutTL', { width: 1080, height: 1920, fps: 30, durationSec: 15 });
+  assert.equal(proj.settings.rippleMode, true);
+  assert.equal(proj.settings.autoColorMatch, true);
+
+  const m1 = TimelineEngine.createMediaLayer(proj, { id: 'v1', name: 'Clip 1', type: 'video', width: 1080, height: 1920, durationMs: 2000 }, 0); // 60f
+  const m2 = TimelineEngine.createMediaLayer(proj, { id: 'v2', name: 'Clip 2', type: 'video', width: 1080, height: 1920, durationMs: 3000 }, 0); // 90f
+  const m3 = TimelineEngine.createMediaLayer(proj, { id: 'v3', name: 'Clip 3', type: 'image', width: 1080, height: 1920, durationMs: 1000 }, 0); // 30f
+
+  TimelineEngine.addToMainTrack(proj, m1);
+  TimelineEngine.addToMainTrack(proj, m2);
+  TimelineEngine.addToMainTrack(proj, m3);
+
+  // Add independent Overlay (PiP) + Audio track
+  const pip = TimelineEngine.createMediaLayer(proj, { id: 'p1', name: 'PiP', type: 'image', width: 400, height: 400, durationMs: 2000 }, 30, { trackRole: 'overlay' });
+  TimelineEngine.addLayer(proj, pip);
+  const audio = TimelineEngine.createMediaLayer(proj, { id: 'a1', name: 'BGM', type: 'audio', durationMs: 4000 }, 15);
+  TimelineEngine.addLayer(proj, audio);
+  TimelineEngine.normalizeTrackZOrder(proj);
+
+  // Verify zero-gap contiguous placement: m1 [0..60], m2 [60..150], m3 [150..180]
+  assert.equal(m1.startFrame, 0); assert.equal(m1.endFrame, 60);
+  assert.equal(m2.startFrame, 60); assert.equal(m2.endFrame, 150);
+  assert.equal(m3.startFrame, 150); assert.equal(m3.endFrame, 180);
+
+  // Z-order: Overlay sits above Main Track, Audio sits below Main Track
+  const pipIdx = proj.layers.indexOf(pip);
+  const m1Idx = proj.layers.indexOf(m1);
+  const audIdx = proj.layers.indexOf(audio);
+  assert.ok(pipIdx < m1Idx && m1Idx < audIdx, `Expected overlay(${pipIdx}) < main(${m1Idx}) < audio(${audIdx})`);
+
+  // Keyframe on m3 shifts along with m3 during magnetic trim/delete
+  KeyframeEngine.setKeyframe(m3, 'x', 160, 50, 'linear');
+
+  // Magnetic right-edge trim of m1 from 60 -> 90 ripples m2 [90..180] and m3 [180..210] (+30f)
+  TimelineEngine.trimMainOrClip(proj, m1.id, 'right', 90, false, 0);
+  assert.equal(m1.endFrame, 90);
+  assert.equal(m2.startFrame, 90); assert.equal(m2.endFrame, 180);
+  assert.equal(m3.startFrame, 180); assert.equal(m3.endFrame, 210);
+  assert.equal(m3.keyframes.x[0].frame, 190);
+  assert.equal(pip.startFrame, 30); // Overlay stays pinned independently!
+
+  // Horizontal drag-to-reorder: drag m3 past m1's center toward frame 5 => order becomes [m3, m1, m2]
+  assert.equal(TimelineEngine.reorderMainTrackClipByFrame(proj, m3.id, 5), true);
+  assert.deepEqual(TimelineEngine.getMainTrackClips(proj).map((c) => c.id), [m3.id, m1.id, m2.id]);
+  assert.equal(m3.startFrame, 0); assert.equal(m3.endFrame, 30);
+  assert.equal(m1.startFrame, 30); assert.equal(m1.endFrame, 120);
+  assert.equal(m2.startFrame, 120); assert.equal(m2.endFrame, 210);
+
+  // Split m1 [30..120] at 75 => right half inherits trackRole: 'main', and Main Track stays separated from PiP seams
+  const m1Right = TimelineEngine.splitClipAtFrame(proj, m1.id, 75);
+  assert.ok(m1Right);
+  assert.equal(m1Right.trackRole, 'main');
+  const junctions = TimelineEngine.findTransitionJunctions(proj);
+  assert.ok(junctions.some((j) => j.leftId === m1.id && j.rightId === m1Right.id && j.seamFrame === 75));
+  assert.ok(!junctions.some((j) => j.leftId === pip.id || j.rightId === pip.id));
+
+  // Switch m1Right from Main Track -> Overlay closes its gap magnetically without shifting PiP
+  assert.equal(TimelineEngine.switchLayerTrackRole(proj, m1Right.id, 'overlay'), true);
+  assert.equal(m1Right.trackRole, 'overlay');
+  assert.deepEqual(TimelineEngine.getMainTrackClips(proj).map((c) => c.id), [m3.id, m1.id, m2.id]);
+  assert.equal(m2.startFrame, 75); assert.equal(m2.endFrame, 165);
+
+  // Switch m1Right back Overlay -> Main Track appends it cleanly to end [165..210]
+  assert.equal(TimelineEngine.switchLayerTrackRole(proj, m1Right.id, 'main'), true);
+  assert.equal(m1Right.trackRole, 'main');
+  assert.equal(m1Right.startFrame, 165); assert.equal(m1Right.endFrame, 210);
+
+  // Magnetic delete of m1 closes gap for m2 [30..120] and m1Right [120..165]
+  assert.equal(TimelineEngine.deleteMainOrLayer(proj, m1.id), true);
+  assert.equal(m2.startFrame, 30); assert.equal(m2.endFrame, 120);
+  assert.equal(m1Right.startFrame, 120); assert.equal(m1Right.endFrame, 165);
+
+  // Turning rippleMode OFF allows deleting m2 while leaving an intentional gap [30..120]
+  proj.settings.rippleMode = false;
+  assert.equal(TimelineEngine.deleteMainOrLayer(proj, m2.id), true);
+  assert.equal(m1Right.startFrame, 120);
+  // Closing gaps via reflowMainTrack packs remaining clips [m3: 0..30, m1Right: 30..75]
+  TimelineEngine.reflowMainTrack(proj, 0);
+  assert.equal(m1Right.startFrame, 30); assert.equal(m1Right.endFrame, 75);
+});
+
+test('Timeline items extend beyond duration, trim/delete split Left & Right at playhead, and 2D drag & drop across tracks', () => {
+  const proj = createEmptyProject('ExtendDrop', { width: 1080, height: 1920, fps: 30, durationSec: 5 }); // 150f initial
+  const v1 = TimelineEngine.createMediaLayer(proj, { id: 'vid1', name: 'V1', type: 'video', width: 1080, height: 1920, durationMs: 3000 }, 0); // 90f
+  const txt = TimelineEngine.createTextLayer(proj, 15); // [15..105]
+  const aud = TimelineEngine.createMediaLayer(proj, { id: 'aud1', name: 'Music', type: 'audio', durationMs: 2000 }, 0); // [0..60]
+  const ovl = TimelineEngine.createMediaLayer(proj, { id: 'ovl1', name: 'PiP', type: 'image', width: 400, height: 400, durationMs: 2000 }, 20, { trackRole: 'overlay' });
+
+  TimelineEngine.addToMainTrack(proj, v1);
+  TimelineEngine.addLayer(proj, txt);
+  TimelineEngine.addLayer(proj, aud);
+  TimelineEngine.addLayer(proj, ovl);
+  TimelineEngine.normalizeTrackZOrder(proj);
+
+  // 1. Extending any item type past project duration expands durationFrames smoothly
+  TimelineEngine.trimMainOrClip(proj, txt.id, 'right', 210, false, 0);
+  assert.equal(txt.endFrame, 210);
+  assert.ok(proj.durationFrames >= 210);
+  TimelineEngine.trimMainOrClip(proj, aud.id, 'right', 240, false, 0);
+  assert.equal(aud.endFrame, 240);
+  assert.ok(proj.durationFrames >= 240);
+
+  // 2. Delete Left inside clip trims head, preserves mediaOffsetFrames & boundary keyframe, ripples Main Track
+  const v2 = TimelineEngine.createMediaLayer(proj, { id: 'vid2', name: 'V2', type: 'video', width: 1080, height: 1920, durationMs: 2000 }, 0); // 60f -> [90..150]
+  TimelineEngine.addToMainTrack(proj, v2);
+  KeyframeEngine.setKeyframe(v1, 'x', 0, 10, 'linear');
+  KeyframeEngine.setKeyframe(v1, 'x', 90, 100, 'linear');
+  const trimLeftRes = TimelineEngine.trimDeleteSideAtPlayhead(proj, v1.id, 'left', 30);
+  assert.ok(trimLeftRes && trimLeftRes.action === 'trimmed_left');
+  assert.equal(v1.mediaOffsetFrames, 30);
+  assert.equal(v1.startFrame, 0); // Reflowed flush to 0 on Magnetic Main Track
+  assert.equal(v1.endFrame, 60);
+  assert.equal(v2.startFrame, 60);
+  assert.equal(v1.keyframes.x[0].frame, 0);
+
+  // 3. Delete Right inside text clip trims tail cleanly
+  const trimRightRes = TimelineEngine.trimDeleteSideAtPlayhead(proj, txt.id, 'right', 120);
+  assert.ok(trimRightRes && trimRightRes.action === 'trimmed_right');
+  assert.equal(txt.endFrame, 120);
+
+  // 4. Split v2 [60..120] at 90, then Del Left at seam deletes left piece (v2) and keeps right piece flush
+  const v2Right = TimelineEngine.splitClipAtFrame(proj, v2.id, 90);
+  assert.ok(v2Right);
+  const delSeamLeft = TimelineEngine.trimDeleteSideAtPlayhead(proj, v2Right.id, 'left', 90);
+  assert.ok(delSeamLeft && delSeamLeft.action === 'deleted_left');
+  assert.equal(proj.layers.some((l) => l.id === v2.id), false);
+  assert.equal(v2Right.startFrame, 60);
+  assert.equal(v2Right.endFrame, 90);
+
+  // 5. Split text [15..120] at 60, then Del Right at seam deletes right piece (txtRight) cleanly
+  const txtRight = TimelineEngine.splitClipAtFrame(proj, txt.id, 60);
+  assert.ok(txtRight);
+  const delSeamRight = TimelineEngine.trimDeleteSideAtPlayhead(proj, txtRight.id, 'right', 60);
+  assert.ok(delSeamRight && delSeamRight.action === 'deleted_right');
+  assert.equal(proj.layers.some((l) => l.id === txtRight.id), false);
+  assert.equal(txt.endFrame, 60);
+
+  // 6. 2D Drag & Drop: drag Overlay (ovl) onto Main Track at slot 0 (before v1), then drag v2Right to Overlay
+  assert.equal(
+    TimelineEngine.dropLayerInTimeline(proj, ovl.id, { targetRole: 'main', targetStartFrame: 0, dragCenterFrame: 5 }),
+    true
+  );
+  assert.equal(ovl.trackRole, 'main');
+  assert.deepEqual(TimelineEngine.getMainTrackClips(proj).map((c) => c.id), [ovl.id, v1.id, v2Right.id]);
+  assert.equal(
+    TimelineEngine.dropLayerInTimeline(proj, v2Right.id, { targetRole: 'overlay', targetStartFrame: 45 }),
+    true
+  );
+  assert.equal(v2Right.trackRole, 'overlay');
+  assert.equal(v2Right.startFrame, 45);
+});
+
+
 
 

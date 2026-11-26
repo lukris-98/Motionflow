@@ -12,6 +12,7 @@ import { RendererEngine } from './engine/rendererEngine.js';
 import { StabilizerEngine } from './engine/stabilizerEngine.js';
 import { TimelineEngine } from './engine/timelineEngine.js';
 import { TrackerEngine } from './engine/trackerEngine.js';
+import { ColorMatchEngine } from './engine/colorMatchEngine.js';
 import { ExportEngine } from './export/exportEngine.js';
 import { WasmBridge } from './engine/wasmBridge.js';
 import {
@@ -55,6 +56,7 @@ class MotionFlowApp {
     this.exportEngine = new ExportEngine(this.renderer, this.audioEngine);
     this.trackerEngine = new TrackerEngine(this.renderer);
     this.stabilizerEngine = new StabilizerEngine(this.renderer);
+    this.colorMatchEngine = new ColorMatchEngine(this.renderer);
     this.stabilizerState = {
       isStabilizing: false,
       targetLayerId: null,
@@ -119,6 +121,40 @@ class MotionFlowApp {
       onOpenTransitionJunction: (leftId, rightId) => {
         this.openTransitionsSheet({ mode: 'junction', leftId, rightId, layerId: leftId });
       },
+      onReorderMainClipByFrame: (id, centerFrame) => {
+        const moved = TimelineEngine.reorderMainTrackClipByFrame(this.project, id, centerFrame);
+        if (moved) {
+          this.onTimelineMutated();
+          this.showToast('Reordered Main Track clip');
+        } else {
+          this.refreshTimelineOnly();
+        }
+      },
+      onDropClipInTimeline: (id, dropSpec) => {
+        const ok = TimelineEngine.dropLayerInTimeline(this.project, id, dropSpec);
+        if (ok) {
+          this.onTimelineMutated();
+          const msg = dropSpec.targetRole === 'main'
+            ? 'Moved clip to Main Track'
+            : dropSpec.targetRole === 'overlay'
+              ? 'Moved clip to Overlay track'
+              : 'Moved item in timeline';
+          this.showToast(msg);
+        } else {
+          this.refreshTimelineOnly();
+        }
+      },
+      onToggleRippleMode: () => this.toggleRippleMode(),
+      onToggleMainTrackProp: (prop) => this.toggleMainTrackProp(prop),
+      onQuickAddMainClip: () => {
+        this.mediaPickerContext = null;
+        if (this.mediaItems.some((m) => m.type === 'video' || m.type === 'image')) {
+          this.openSheet('sheetMedia');
+        } else {
+          this.triggerDeviceVisualPick('main_append');
+        }
+      },
+      onCloseMainGaps: () => this.closeMainTrackGaps(),
       getPlayheadFrame: () => this.currentFrame
     });
 
@@ -237,6 +273,7 @@ class MotionFlowApp {
     document.getElementById('lblProjectName').textContent = this.project.name;
     document.getElementById('hudResFps').textContent = `${this.project.width}×${this.project.height} · ${this.project.fps} FPS`;
     document.getElementById('btnToggleSnap').classList.toggle('active', Boolean(this.project.settings?.snapToTimeline));
+    document.getElementById('btnToggleRipple')?.classList.toggle('active', this.project.settings?.rippleMode !== false);
     document.getElementById('btnToggleGrid').classList.toggle('active', Boolean(this.project.settings?.showGrid));
     document.getElementById('btnOpenTrackerQuick')?.classList.toggle('tracking-active', Boolean(this.trackerState.active));
     this.syncViewport3DUI();
@@ -523,9 +560,13 @@ class MotionFlowApp {
   }
 
   splitSelectedAtPlayhead() {
-    const layer = this.getSelectedLayer();
-    if (!layer) return this.showToast('Select a layer first');
     const f = Math.round(this.currentFrame);
+    let layer = this.getSelectedLayer();
+    if (!layer) {
+      const mainSeq = TimelineEngine.getMainTrackClips(this.project);
+      layer = mainSeq.find((c) => f > c.startFrame + 2 && f < c.endFrame - 2) || null;
+    }
+    if (!layer) return this.showToast('Select a clip or place playhead inside Main Track clip');
     if (f <= layer.startFrame + 2 || f >= layer.endFrame - 2) {
       return this.showToast('Place playhead inside the clip to split');
     }
@@ -540,22 +581,123 @@ class MotionFlowApp {
     }
   }
 
+  deleteSplitSideAtPlayhead(side) {
+    const f = Math.round(this.currentFrame);
+    const layer = this.getSelectedLayer();
+    const prevRedo = Array.isArray(this.history?.redoStack) ? [...this.history.redoStack] : [];
+    this.pushUndo();
+    const res = TimelineEngine.trimDeleteSideAtPlayhead(this.project, layer?.id || null, side, f);
+    if (!res) {
+      if (Array.isArray(this.history?.undoStack)) {
+        this.history.undoStack.pop();
+        this.history.redoStack = prevRedo;
+        this.updateUndoRedoButtons();
+      }
+      return this.showToast(
+        side === 'left'
+          ? 'Nothing left of playhead to trim/delete'
+          : 'Nothing right of playhead to trim/delete'
+      );
+    }
+    this.selectedLayerId = res.selectedId;
+    const nextFrame = Math.max(0, Math.min(this.project.durationFrames, res.playheadFrame));
+    this.currentFrame = nextFrame;
+    this.onTimelineMutated();
+    this.seekToFrame(nextFrame);
+    this.showToast(
+      res.action === 'trimmed_left' || res.action === 'deleted_left'
+        ? 'Deleted left of split'
+        : 'Deleted right of split'
+    );
+  }
+
   duplicateSelectedLayer() {
     const layer = this.getSelectedLayer();
     if (!layer) return;
     this.mutateProject(() => {
       const copy = TimelineEngine.duplicateLayer(this.project, layer.id);
-      if (copy) this.selectedLayerId = copy.id;
+      if (copy) {
+        if (copy.trackRole === 'main' && this.project.settings?.rippleMode !== false) {
+          TimelineEngine.reflowMainTrack(this.project, 0);
+        }
+        this.selectedLayerId = copy.id;
+      }
     });
   }
 
   deleteSelectedLayer() {
     const layer = this.getSelectedLayer();
     if (!layer) return;
+    const wasMain = layer.trackRole === 'main';
     this.mutateProject(() => {
-      TimelineEngine.deleteLayer(this.project, layer.id);
-      this.selectedLayerId = this.project.layers[0]?.id || null;
+      TimelineEngine.deleteMainOrLayer(this.project, layer.id);
+      if (wasMain) {
+        const remainingMain = TimelineEngine.getMainTrackClips(this.project);
+        this.selectedLayerId = remainingMain[0]?.id || this.project.layers[0]?.id || null;
+      } else {
+        this.selectedLayerId = this.project.layers[0]?.id || null;
+      }
     });
+    if (wasMain && this.project.settings?.rippleMode !== false) {
+      this.showToast('Clip deleted & Main Track gap closed');
+    }
+  }
+
+  toggleRippleMode() {
+    const next = !(this.project.settings?.rippleMode !== false);
+    this.mutateProject(() => {
+      if (!this.project.settings) this.project.settings = {};
+      this.project.settings.rippleMode = next;
+      if (next) {
+        TimelineEngine.reflowMainTrack(this.project, 0);
+      }
+    });
+    this.showToast(next ? 'Magnetic Main Track ON (gaps auto-close)' : 'Magnetic Main Track OFF (free gaps)');
+  }
+
+  toggleMainTrackProp(prop) {
+    const mainClips = TimelineEngine.getMainTrackClips(this.project);
+    if (mainClips.length === 0) return;
+    this.mutateProject(() => {
+      if (prop === 'visible') {
+        const anyVisible = mainClips.some((c) => c.visible);
+        mainClips.forEach((c) => { c.visible = !anyVisible; });
+      } else if (prop === 'locked') {
+        const allLocked = mainClips.every((c) => c.locked);
+        mainClips.forEach((c) => { c.locked = !allLocked; });
+      }
+    });
+  }
+
+  closeMainTrackGaps() {
+    this.mutateProject(() => {
+      TimelineEngine.reflowMainTrack(this.project, 0);
+    });
+    this.showToast('Closed Main Track gaps');
+  }
+
+  switchSelectedTrackRole(targetRole) {
+    const layer = this.getSelectedLayer();
+    if (!layer || (layer.type !== 'video' && layer.type !== 'image')) return;
+    let changed = false;
+    this.mutateProject(() => {
+      changed = TimelineEngine.switchLayerTrackRole(this.project, layer.id, targetRole, this.currentFrame);
+    });
+    if (changed) {
+      this.showToast(targetRole === 'main' ? 'Moved clip to Main Track' : 'Moved clip to Overlay track');
+    }
+  }
+
+  moveSelectedMainClip(delta) {
+    const layer = this.getSelectedLayer();
+    if (!layer || layer.trackRole !== 'main') return;
+    let moved = false;
+    this.mutateProject(() => {
+      moved = TimelineEngine.moveMainTrackClipStep(this.project, layer.id, delta);
+    });
+    if (moved) {
+      this.showToast(delta < 0 ? 'Moved clip left on Main Track' : 'Moved clip right on Main Track');
+    }
   }
 
   detachAudioFromSelected() {
@@ -599,16 +741,21 @@ class MotionFlowApp {
     bootstrap.Offcanvas.getOrCreateInstance(document.getElementById('sheetMedia')).show();
   }
 
-  replaceSelectedWithMedia(mediaItem) {
+  async replaceSelectedWithMedia(mediaItem) {
     const layer = this.getSelectedLayer();
     if (!layer || !mediaItem) return;
+    const existingOthers = this.project.layers.filter((l) => l.id !== layer.id);
     this.mutateProject(() => {
+      layer.colorMatch = null;
       TimelineEngine.replaceLayerMedia(this.project, layer.id, mediaItem);
     });
     this.mediaPickerContext = null;
     this.importIntent = 'library';
     this.hideOpenSheets();
     this.showToast(`Replaced clip with "${mediaItem.name}"`);
+    if (mediaItem.type === 'video' || mediaItem.type === 'image') {
+      await this.autoMatchLayerColor(layer, existingOthers);
+    }
   }
 
   async freezeSelectedFrame() {
@@ -1282,6 +1429,8 @@ class MotionFlowApp {
     const commonAnim = ['bi-diamond-half text-info', 'Anim', () => this.openSheet('sheetKeyframes')];
     const commonTransition = ['bi-intersect text-info', 'Transition', () => this.openTransitionsSheet({ layerId: layer.id })];
     const commonSplit = ['bi-scissors', 'Split', () => this.splitSelectedAtPlayhead()];
+    const commonDelLeft = ['bi-arrow-bar-left text-warning', 'Del Left', () => this.deleteSplitSideAtPlayhead('left')];
+    const commonDelRight = ['bi-arrow-bar-right text-warning', 'Del Right', () => this.deleteSplitSideAtPlayhead('right')];
     const commonDup = ['bi-copy', 'Duplicate', () => this.duplicateSelectedLayer()];
     const commonDel = ['bi-trash', 'Delete', () => this.deleteSelectedLayer(), 'mf-nav-danger'];
     const commonRippleDel = ['bi-backspace', 'Ripple Del', () => this.rippleDeleteSelectedLayer(), 'mf-nav-danger'];
@@ -1289,13 +1438,30 @@ class MotionFlowApp {
     const commonPasteStyle = this.copiedClipStyle ? ['bi-clipboard-check text-warning', 'Paste FX', () => this.pasteStyleToSelected()] : null;
 
     let ctxItems = [];
+    const mainCount = TimelineEngine.getMainTrackClips(this.project).length;
+    const trackToggleBtn = [
+      'bi-layers-half text-info',
+      layer.trackRole === 'main' ? 'Overlay' : 'Main Track',
+      () => this.switchSelectedTrackRole(layer.trackRole === 'main' ? 'overlay' : 'main')
+    ];
+    const reorderBtns = (layer.trackRole === 'main' && mainCount > 1)
+      ? [
+          ['bi-arrow-left-square text-light', 'Move Left', () => this.moveSelectedMainClip(-1)],
+          ['bi-arrow-right-square text-light', 'Move Right', () => this.moveSelectedMainClip(1)]
+        ]
+      : [];
+
     if (layer.type === 'video') {
       ctxItems = [
         commonSplit,
+        commonDelLeft,
+        commonDelRight,
         ['bi-speedometer2 text-info', 'Speed', () => this.openSheet('sheetStyle', 'layer')],
         ['bi-volume-up', 'Volume/FX', () => this.openSheet('sheetStyle', 'layer')],
         commonAnim,
         commonTransition,
+        trackToggleBtn,
+        ...reorderBtns,
         ['bi-stars text-info', 'Effects', () => this.openSheet('sheetStyle', 'fx', 'effects')],
         ['bi-palette-fill text-success', 'Filters', () => this.openSheet('sheetStyle', 'fx', 'filters')],
         ['bi-sliders2', 'Adjust', () => this.openSheet('sheetStyle', 'fx', 'adjust')],
@@ -1323,8 +1489,12 @@ class MotionFlowApp {
     } else if (layer.type === 'image') {
       ctxItems = [
         commonSplit,
+        commonDelLeft,
+        commonDelRight,
         commonAnim,
         commonTransition,
+        trackToggleBtn,
+        ...reorderBtns,
         ['bi-stars text-info', 'Effects', () => this.openSheet('sheetStyle', 'fx', 'effects')],
         ['bi-palette-fill text-success', 'Filters', () => this.openSheet('sheetStyle', 'fx', 'filters')],
         ['bi-sliders2', 'Adjust', () => this.openSheet('sheetStyle', 'fx', 'adjust')],
@@ -1348,6 +1518,8 @@ class MotionFlowApp {
         ['bi-card-heading text-warning', 'Templates', () => this.openSheet('sheetStyle', 'layer', 'templates')],
         ['bi-megaphone text-info', 'TTS/Caps', () => this.openSheet('sheetStyle', 'layer', 'voice')],
         commonSplit,
+        commonDelLeft,
+        commonDelRight,
         ['bi-chat-square-text', 'Bubble', () => this.openSheet('sheetStyle', 'layer', 'bubble')],
         commonAnim,
         commonTransition,
@@ -1362,6 +1534,8 @@ class MotionFlowApp {
     } else if (layer.type === 'shape') {
       ctxItems = [
         commonSplit,
+        commonDelLeft,
+        commonDelRight,
         ['bi-palette2 text-warning', 'Style', () => this.openSheet('sheetStyle', 'layer')],
         commonAnim,
         commonTransition,
@@ -1376,6 +1550,8 @@ class MotionFlowApp {
     } else if (layer.type === 'audio') {
       ctxItems = [
         commonSplit,
+        commonDelLeft,
+        commonDelRight,
         ['bi-volume-up text-warning', 'Volume', () => this.openSheet('sheetStyle', 'layer')],
         ['bi-soundwave text-info', 'Voice FX', () => this.openSheet('sheetStyle', 'layer')],
         ['bi-graph-up', 'Fade', () => this.openSheet('sheetStyle', 'layer')],
@@ -1393,6 +1569,8 @@ class MotionFlowApp {
     } else {
       ctxItems = [
         commonSplit,
+        commonDelLeft,
+        commonDelRight,
         ['bi-diagram-2 text-warning', 'Ungroup', () => {
           this.mutateProject(() => TimelineEngine.ungroupChildren(this.project, layer.id));
           this.showToast('Group children ungrouped');
@@ -1693,20 +1871,80 @@ class MotionFlowApp {
     }
   }
 
-  addMediaToTimeline(mediaItem) {
+  async autoMatchLayerColor(layer, existingPoolLayers, opts = {}) {
+    if (!layer || !this.colorMatchEngine) return null;
+    if (!opts.force && this.project.settings?.autoColorMatch === false) return null;
+    if (!this.project.layers.some((l) => l.id === layer.id)) return null;
+
+    const result = await this.colorMatchEngine.autoMatchLayerToTimeline(
+      this.project,
+      layer,
+      existingPoolLayers,
+      this.mediaMap,
+      opts.intensity ?? (layer.colorMatch?.intensity ?? 0.78)
+    );
+    if (result) {
+      this.renderPreview();
+      this.refreshTimelineOnly();
+      this.panels.renderStylePanel();
+      this.scheduleAutosave();
+      if (!opts.silent) {
+        this.showToast(`Color matched "${layer.name}" to timeline palette`);
+      }
+    }
+    return result;
+  }
+
+  async matchSelectedToTimelinePalette() {
+    const layer = this.getSelectedLayer();
+    if (!layer || (layer.type !== 'video' && layer.type !== 'image')) {
+      return this.showToast('Select a video or image layer first');
+    }
+    const existingOthers = this.project.layers.filter((l) => l.id !== layer.id);
+    if (existingOthers.length === 0) {
+      return this.showToast('Add at least one other visual clip to match');
+    }
+    this.pushUndo();
+    const res = await this.autoMatchLayerColor(layer, existingOthers, { force: true, silent: true });
+    if (res) {
+      this.showToast('Matched color palette to existing timeline');
+    } else {
+      this.showToast('No visual palette found on existing timeline');
+    }
+  }
+
+  async addMediaToTimeline(mediaItem, opts = {}) {
+    const existingBefore = [...this.project.layers];
+    const asOverlay = Boolean(opts.asOverlay || this.mediaPickerContext === 'overlay');
+    this.mediaPickerContext = null;
+
+    let createdLayer = null;
     this.mutateProject(() => {
-      const layer = TimelineEngine.createMediaLayer(this.project, mediaItem, this.currentFrame);
-      TimelineEngine.addLayer(this.project, layer);
-      this.selectedLayerId = layer.id;
+      if (mediaItem.type === 'audio' || asOverlay) {
+        createdLayer = TimelineEngine.createMediaLayer(this.project, mediaItem, this.currentFrame, {
+          trackRole: mediaItem.type === 'audio' ? null : 'overlay'
+        });
+        TimelineEngine.addLayer(this.project, createdLayer);
+        TimelineEngine.normalizeTrackZOrder(this.project);
+      } else {
+        createdLayer = TimelineEngine.createMediaLayer(this.project, mediaItem, 0, { trackRole: 'main' });
+        TimelineEngine.addToMainTrack(this.project, createdLayer);
+      }
+      this.selectedLayerId = createdLayer.id;
     });
     this.hideOpenSheets();
-    this.showToast(`Added "${mediaItem.name}" to timeline`);
+    this.showToast(`Added "${mediaItem.name}" to ${asOverlay && mediaItem.type !== 'audio' ? 'Overlay' : 'Main Track'}`);
+
+    if (createdLayer && (mediaItem.type === 'video' || mediaItem.type === 'image')) {
+      await this.autoMatchLayerColor(createdLayer, existingBefore);
+    }
   }
 
   async deleteMediaFromLibrary(mediaItem) {
     await ProjectStorage.deleteMediaItem(mediaItem.id);
     this.audioEngine.purgeMediaCache(mediaItem.id);
     this.renderer.purgeMediaCache(mediaItem.id);
+    this.colorMatchEngine?.purgeMediaCache(mediaItem.id);
     this.timelineView?.filmstripCache?.delete(mediaItem.id);
     if (typeof mediaItem.url === 'string' && mediaItem.url.startsWith('blob:')) {
       try { URL.revokeObjectURL(mediaItem.url); } catch {}
@@ -2158,15 +2396,11 @@ class MotionFlowApp {
         this.panels.renderMediaLibrary(this.mediaItems);
 
         if (intent === 'main_append' || intent === 'overlay_at_playhead' || intent === 'audio_at_playhead') {
-          let cursor = 0;
-          if (intent === 'main_append') {
-            const visualEnds = this.project.layers
-              .filter((l) => l.type === 'video' || l.type === 'image')
-              .map((l) => l.endFrame || 0);
-            cursor = visualEnds.length > 0 ? Math.max(...visualEnds) : 0;
-          } else {
-            cursor = this.currentFrame;
-          }
+          const existingBeforeImport = [...this.project.layers];
+          const createdLayers = [];
+          let cursor = intent === 'main_append'
+            ? TimelineEngine.getMainTrackEndFrame(this.project)
+            : this.currentFrame;
 
           let firstCreated = null;
           let lastCreated = null;
@@ -2188,17 +2422,44 @@ class MotionFlowApp {
               }
             }
             for (const item of imported) {
-              const layer = TimelineEngine.createMediaLayer(this.project, item, cursor);
-              TimelineEngine.addLayer(this.project, layer);
-              if (!firstCreated) firstCreated = layer;
-              lastCreated = layer;
-              cursor = layer.endFrame;
+              if (intent === 'main_append' && item.type !== 'audio') {
+                const layer = TimelineEngine.createMediaLayer(this.project, item, cursor, { trackRole: 'main' });
+                TimelineEngine.addToMainTrack(this.project, layer);
+                createdLayers.push(layer);
+                if (!firstCreated) firstCreated = layer;
+                lastCreated = layer;
+                cursor = layer.endFrame;
+              } else {
+                const role = (intent === 'overlay_at_playhead' && item.type !== 'audio') ? 'overlay' : null;
+                const layer = TimelineEngine.createMediaLayer(this.project, item, cursor, { trackRole: role });
+                TimelineEngine.addLayer(this.project, layer);
+                TimelineEngine.normalizeTrackZOrder(this.project);
+                createdLayers.push(layer);
+                if (!firstCreated) firstCreated = layer;
+                lastCreated = layer;
+                cursor = layer.endFrame;
+              }
             }
             if (lastCreated) this.selectedLayerId = lastCreated.id;
           });
           this.hideOpenSheets();
           if (firstCreated) await this.seekToFrame(firstCreated.startFrame);
-          this.showToast(`Added ${imported.length} clip(s) to timeline`);
+
+          // Automatically match color palette of newly added visual clips to existing timeline
+          const pool = [...existingBeforeImport];
+          let matchedAny = false;
+          for (const created of createdLayers) {
+            if (created.type === 'video' || created.type === 'image') {
+              const matched = await this.autoMatchLayerColor(created, pool, { silent: true });
+              if (matched) matchedAny = true;
+              pool.push(created);
+            }
+          }
+          this.showToast(
+            matchedAny
+              ? `Added ${imported.length} clip(s) · Auto color matched`
+              : `Added ${imported.length} clip(s) to timeline`
+          );
         } else {
           this.showToast(`Imported ${imported.length} media item(s)`);
         }
@@ -2294,6 +2555,10 @@ class MotionFlowApp {
       document.getElementById('selProjectFps').value = String(this.project.fps);
       document.getElementById('inpProjectDuration').value = String(Math.round(this.project.durationFrames / this.project.fps));
       document.getElementById('inpProjectBg').value = this.project.backgroundColor || '#05070B';
+      const rippleChk = document.getElementById('chkSettingRipple');
+      if (rippleChk) rippleChk.checked = this.project.settings?.rippleMode !== false;
+      const cmChk = document.getElementById('chkSettingAutoColorMatch');
+      if (cmChk) cmChk.checked = this.project.settings?.autoColorMatch !== false;
       bootstrap.Modal.getOrCreateInstance(document.getElementById('modalSettings')).show();
     };
 
@@ -2303,6 +2568,8 @@ class MotionFlowApp {
       const durSec = Math.max(2, Number(document.getElementById('inpProjectDuration').value) || 10);
       const bg = document.getElementById('inpProjectBg').value;
       const name = document.getElementById('inpProjectName').value.trim() || this.project.name;
+      const rippleMode = document.getElementById('chkSettingRipple')?.checked !== false;
+      const autoColorMatch = document.getElementById('chkSettingAutoColorMatch')?.checked !== false;
       this.mutateProject(() => {
         this.project.name = name;
         this.project.width = w;
@@ -2310,6 +2577,12 @@ class MotionFlowApp {
         this.project.fps = fps;
         this.project.durationFrames = fps * durSec;
         this.project.backgroundColor = bg;
+        if (!this.project.settings) this.project.settings = {};
+        this.project.settings.rippleMode = rippleMode;
+        this.project.settings.autoColorMatch = autoColorMatch;
+        if (rippleMode) {
+          TimelineEngine.reflowMainTrack(this.project, 0);
+        }
         this.currentFrame = Math.min(this.currentFrame, this.project.durationFrames);
       });
       bootstrap.Modal.getInstance(document.getElementById('modalSettings'))?.hide();
@@ -2350,6 +2623,9 @@ class MotionFlowApp {
       this.project.settings.snapToTimeline = !this.project.settings.snapToTimeline;
       this.onTimelineMutated();
     };
+    document.getElementById('btnToggleRipple')?.addEventListener('click', () => {
+      this.toggleRippleMode();
+    });
     document.getElementById('btnZoomIn').onclick = () => { this.timelineView.zoomIn(this.currentFrame); this.refreshTimelineOnly(); };
     document.getElementById('btnZoomOut').onclick = () => { this.timelineView.zoomOut(this.currentFrame); this.refreshTimelineOnly(); };
     window.addEventListener('resize', () => {
@@ -2445,7 +2721,11 @@ class MotionFlowApp {
 
     // Media Import buttons
     document.getElementById('btnImportVisual').onclick = () => {
-      const intent = this.mediaPickerContext === 'replace' ? 'replace_selected' : 'main_append';
+      const intent = this.mediaPickerContext === 'replace'
+        ? 'replace_selected'
+        : this.mediaPickerContext === 'overlay'
+          ? 'overlay_at_playhead'
+          : 'main_append';
       this.triggerDeviceVisualPick(intent);
     };
     document.getElementById('btnImportAudio').onclick = () => {

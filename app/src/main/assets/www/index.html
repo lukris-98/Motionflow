@@ -131,6 +131,9 @@
       <button id="btnToggleSnap" class="btn btn-sm btn-dark mf-icon-btn active" title="Snap to Timeline" aria-label="Toggle Snap">
         <i class="bi bi-magnet-fill"></i>
       </button>
+      <button id="btnToggleRipple" class="btn btn-sm btn-dark mf-icon-btn active" title="Magnetic Main Track (Auto Close Gaps)" aria-label="Toggle Magnetic Main Track">
+        <i class="bi bi-link-45deg"></i>
+      </button>
       <button id="btnZoomOut" class="btn btn-sm btn-dark mf-icon-btn" title="Zoom Out Timeline" aria-label="Zoom Out">
         <i class="bi bi-zoom-out"></i>
       </button>
@@ -453,7 +456,7 @@
               </select>
             </div>
           </div>
-          <div class="row g-2">
+          <div class="row g-2 mb-2">
             <div class="col-6">
               <label class="form-label small text-secondary">Duration (Seconds)</label>
               <input id="inpProjectDuration" type="number" min="2" max="300" step="1" class="form-control form-control-sm" />
@@ -461,6 +464,20 @@
             <div class="col-6">
               <label class="form-label small text-secondary">Canvas Background</label>
               <input id="inpProjectBg" type="color" class="form-control form-control-color form-control-sm w-100" value="#05070B" />
+            </div>
+          </div>
+          <div class="p-2 rounded bg-black bg-opacity-25 border border-secondary-subtle">
+            <div class="d-flex align-items-center justify-content-between py-1">
+              <label class="small mb-0" for="chkSettingRipple"><i class="bi bi-link-45deg me-1 text-info"></i>Magnetic Main Track (Auto Ripple Gaps)</label>
+              <div class="form-check form-switch m-0">
+                <input class="form-check-input" type="checkbox" id="chkSettingRipple" checked />
+              </div>
+            </div>
+            <div class="d-flex align-items-center justify-content-between py-1 border-top border-secondary-subtle">
+              <label class="small mb-0" for="chkSettingAutoColorMatch"><i class="bi bi-palette2 me-1 text-warning"></i>Auto-Match Color Palette on New Media</label>
+              <div class="form-check form-switch m-0">
+                <input class="form-check-input" type="checkbox" id="chkSettingAutoColorMatch" checked />
+              </div>
             </div>
           </div>
         </div>

@@ -17,6 +17,7 @@ import {
 import { SPEED_CURVE_PRESETS, TimelineEngine } from '../engine/timelineEngine.js';
 import { STABILIZE_PRESETS } from '../engine/stabilizerEngine.js';
 import { TrackerEngine } from '../engine/trackerEngine.js';
+import { setLayerColorMatchIntensity, toggleLayerColorMatch } from '../engine/colorMatchEngine.js';
 import { formatBytes, formatDurationMs } from '../utils/math.js';
 
 const SAMPLE_PREVIEW_SVG = 'data:image/svg+xml;utf8,' + encodeURIComponent(
@@ -111,6 +112,7 @@ export class PanelsUI {
     empty.classList.toggle('d-none', mediaItems.length > 0);
 
     const isReplace = this.app.mediaPickerContext === 'replace';
+    const isOverlay = this.app.mediaPickerContext === 'overlay';
     const sel = this.app.getSelectedLayer();
     if (isReplace && sel) {
       const banner = document.createElement('div');
@@ -126,6 +128,20 @@ export class PanelsUI {
         this.renderMediaLibrary(mediaItems);
       };
       grid.appendChild(banner);
+    } else if (isOverlay) {
+      const banner = document.createElement('div');
+      banner.className = 'col-12';
+      banner.innerHTML = `
+        <div class="alert alert-success py-1 px-2 mb-1 d-flex align-items-center justify-content-between small">
+          <span><i class="bi bi-layers-half me-1"></i>Adding as <strong>Overlay (PIP)</strong> at playhead</span>
+          <button id="btnCancelOverlayMode" class="btn btn-xs btn-outline-light py-0 px-2">Main Track Instead</button>
+        </div>
+      `;
+      banner.querySelector('#btnCancelOverlayMode').onclick = () => {
+        this.app.mediaPickerContext = null;
+        this.renderMediaLibrary(mediaItems);
+      };
+      grid.appendChild(banner);
     }
 
     mediaItems.forEach((item) => {
@@ -136,7 +152,7 @@ export class PanelsUI {
         : `<div class="mf-media-thumb d-flex align-items-center justify-content-center"><i class="bi ${item.type === 'audio' ? 'bi-music-note-beamed text-warning' : 'bi-film text-info'} fs-2"></i></div>`;
 
       const resLabel = item.type === 'audio' ? formatDurationMs(item.durationMs) : `${item.width}×${item.height} · ${formatDurationMs(item.durationMs)}`;
-      const actionLabel = isReplace && sel ? 'Replace' : 'Timeline';
+      const actionLabel = isReplace && sel ? 'Replace' : (isOverlay && item.type !== 'audio' ? 'Add Overlay' : 'Main Track');
       col.innerHTML = `
         <div class="mf-media-card h-100 d-flex flex-column">
           ${thumbHtml}
@@ -156,7 +172,7 @@ export class PanelsUI {
         if (this.app.mediaPickerContext === 'replace' && this.app.getSelectedLayer()) {
           this.app.replaceSelectedWithMedia(item);
         } else {
-          this.app.addMediaToTimeline(item);
+          this.app.addMediaToTimeline(item, { asOverlay: isOverlay });
         }
       };
       col.querySelector('[data-act="del"]').onclick = () => this.app.deleteMediaFromLibrary(item);
@@ -190,13 +206,25 @@ export class PanelsUI {
           ${(layer.type === 'video' || layer.type === 'image' || layer.type === 'audio') ? `<button id="inspReplace" class="btn btn-sm btn-outline-light" title="Replace Clip Media"><i class="bi bi-arrow-left-right"></i></button>` : ''}
           ${layer.type === 'group' ? `<button id="inspUngroup" class="btn btn-sm btn-outline-warning" title="Ungroup Children"><i class="bi bi-diagram-2"></i></button>` : ''}
           <button id="inspSplit" class="btn btn-sm btn-outline-info" title="Split at Playhead"><i class="bi bi-scissors"></i></button>
+          <button id="inspDelLeft" class="btn btn-sm btn-outline-warning" title="Delete Split Left of Playhead"><i class="bi bi-arrow-bar-left"></i></button>
+          <button id="inspDelRight" class="btn btn-sm btn-outline-warning" title="Delete Split Right of Playhead"><i class="bi bi-arrow-bar-right"></i></button>
           <button id="inspDup" class="btn btn-sm btn-outline-light" title="Duplicate"><i class="bi bi-copy"></i></button>
           <button id="inspRippleDel" class="btn btn-sm btn-outline-warning" title="Ripple Delete (Close Gap)"><i class="bi bi-backspace"></i></button>
           <button id="inspDel" class="btn btn-sm btn-outline-danger" title="Delete Layer"><i class="bi bi-trash"></i></button>
         </div>
       </div>
 
-      <div class="d-flex flex-wrap gap-1 mb-2">
+      <div class="d-flex flex-wrap align-items-center gap-1 mb-2">
+        ${(layer.type === 'video' || layer.type === 'image') ? `
+          <span class="badge ${layer.trackRole === 'main' ? 'text-bg-info' : 'text-bg-secondary'} me-1">${layer.trackRole === 'main' ? 'Main Track' : 'Overlay / PIP'}</span>
+          <button id="inspSwitchTrackRole" class="btn btn-xs btn-outline-info py-1 px-2">
+            <i class="bi bi-layers-half me-1"></i>${layer.trackRole === 'main' ? 'Move to Overlay' : 'Move to Main Track'}
+          </button>
+          ${layer.trackRole === 'main' && TimelineEngine.getMainTrackClips(this.app.project).length > 1 ? `
+            <button id="inspMainLeft" class="btn btn-xs btn-outline-light py-1 px-2" title="Reorder Left on Main Track"><i class="bi bi-chevron-left"></i></button>
+            <button id="inspMainRight" class="btn btn-xs btn-outline-light py-1 px-2" title="Reorder Right on Main Track"><i class="bi bi-chevron-right"></i></button>
+          ` : ''}
+        ` : ''}
         <button id="inspRotMinus90" class="btn btn-xs btn-outline-light py-1 px-2"><i class="bi bi-arrow-counterclockwise me-1"></i>-90°</button>
         <button id="inspRotPlus90" class="btn btn-xs btn-outline-light py-1 px-2"><i class="bi bi-arrow-clockwise me-1"></i>+90°</button>
         <button id="inspFlipX" class="btn btn-xs ${layer.flipX ? 'btn-info text-dark fw-semibold' : 'btn-outline-light'} py-1 px-2"><i class="bi bi-symmetry-vertical me-1"></i>Mirror H</button>
@@ -272,6 +300,11 @@ export class PanelsUI {
     body.querySelector('#inspLayerName').onchange = (e) => this.app.mutateProject(() => { layer.name = e.target.value.trim() || layer.name; });
     body.querySelector('#inspMoveUp').onclick = () => this.app.mutateProject(() => TimelineEngine.reorderLayer(this.app.project, layer.id, 'up'));
     body.querySelector('#inspMoveDown').onclick = () => this.app.mutateProject(() => TimelineEngine.reorderLayer(this.app.project, layer.id, 'down'));
+    body.querySelector('#inspSwitchTrackRole')?.addEventListener('click', () => {
+      this.app.switchSelectedTrackRole(layer.trackRole === 'main' ? 'overlay' : 'main');
+    });
+    body.querySelector('#inspMainLeft')?.addEventListener('click', () => this.app.moveSelectedMainClip(-1));
+    body.querySelector('#inspMainRight')?.addEventListener('click', () => this.app.moveSelectedMainClip(1));
     body.querySelector('#inspRotMinus90')?.addEventListener('click', () => this.app.rotateSelected90(-90));
     body.querySelector('#inspRotPlus90')?.addEventListener('click', () => this.app.rotateSelected90(90));
     body.querySelector('#inspFlipX')?.addEventListener('click', () => this.app.flipSelected('x'));
@@ -285,6 +318,8 @@ export class PanelsUI {
       this.app.showToast('Group children ungrouped');
     });
     body.querySelector('#inspSplit').onclick = () => this.app.splitSelectedAtPlayhead();
+    body.querySelector('#inspDelLeft').onclick = () => this.app.deleteSplitSideAtPlayhead('left');
+    body.querySelector('#inspDelRight').onclick = () => this.app.deleteSplitSideAtPlayhead('right');
     body.querySelector('#inspDup').onclick = () => this.app.duplicateSelectedLayer();
     body.querySelector('#inspRippleDel').onclick = () => this.app.rippleDeleteSelectedLayer();
     body.querySelector('#inspDel').onclick = () => this.app.deleteSelectedLayer();
@@ -347,10 +382,10 @@ export class PanelsUI {
       this.app.mutateProject(() => TimelineEngine.assignToGroup(this.app.project, layer.id, e.target.value || null));
     });
     body.querySelector('#inspStartF').addEventListener('change', (e) => {
-      this.app.mutateProject(() => TimelineEngine.trimClip(this.app.project, layer.id, 'left', Number(e.target.value), false, 0));
+      this.app.mutateProject(() => TimelineEngine.trimMainOrClip(this.app.project, layer.id, 'left', Number(e.target.value), false, 0));
     });
     body.querySelector('#inspEndF').addEventListener('change', (e) => {
-      this.app.mutateProject(() => TimelineEngine.trimClip(this.app.project, layer.id, 'right', Number(e.target.value), false, 0));
+      this.app.mutateProject(() => TimelineEngine.trimMainOrClip(this.app.project, layer.id, 'right', Number(e.target.value), false, 0));
     });
   }
 
@@ -1578,6 +1613,56 @@ export class PanelsUI {
           <button id="btnAdjApplyAll" type="button" class="btn btn-xs btn-outline-light py-1 px-2">Apply to All</button>
         </div>
 
+        ${(layer.type === 'video' || layer.type === 'image') ? (() => {
+          const cm = layer.colorMatch;
+          const cmEnabled = Boolean(cm?.enabled);
+          const cmPct = Math.round((cm?.intensity ?? 0.78) * 100);
+          const tlSwatches = cm?.targetPalette?.swatches || [];
+          const srcSwatches = cm?.sourcePalette?.swatches || [];
+          return `
+            <div class="p-2 rounded bg-dark border border-secondary-subtle mb-2">
+              <div class="d-flex justify-content-between align-items-center gap-2 mb-1">
+                <div class="d-flex align-items-center gap-1">
+                  <i class="bi bi-palette2 text-info"></i>
+                  <span class="small fw-semibold">Auto Color Match</span>
+                  <span class="badge ${cmEnabled ? 'bg-info text-dark' : 'bg-secondary'} px-1" style="font-size:0.58rem;">${cmEnabled ? 'Matched' : 'Off'}</span>
+                </div>
+                <div class="d-flex align-items-center gap-2">
+                  <button id="btnColorMatchNow" type="button" class="btn btn-xs btn-outline-info py-0 px-2">Match Timeline</button>
+                  ${cm ? `
+                    <div class="form-check form-switch m-0">
+                      <input class="form-check-input" type="checkbox" id="chkColorMatchOn" ${cmEnabled ? 'checked' : ''} aria-label="Toggle Auto Color Match" />
+                    </div>
+                  ` : ''}
+                </div>
+              </div>
+              ${cm ? `
+                <div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mb-1">
+                  <div class="d-flex align-items-center gap-1">
+                    <span class="text-secondary" style="font-size:0.64rem;">Timeline Avg</span>
+                    <div class="mf-color-swatch-row">
+                      ${tlSwatches.slice(0, 4).map((s) => `<span class="mf-color-swatch-dot" style="background:${s.hex};" title="${s.hex}"></span>`).join('')}
+                    </div>
+                  </div>
+                  <i class="bi bi-arrow-left text-info small"></i>
+                  <div class="d-flex align-items-center gap-1">
+                    <span class="text-secondary" style="font-size:0.64rem;">Clip Raw</span>
+                    <div class="mf-color-swatch-row">
+                      ${srcSwatches.slice(0, 4).map((s) => `<span class="mf-color-swatch-dot" style="background:${s.hex};" title="${s.hex}"></span>`).join('')}
+                    </div>
+                  </div>
+                </div>
+                <div>
+                  <label class="form-label small text-secondary mb-0">Match Strength (<span id="lblColorMatchInt">${cmPct}%</span>)</label>
+                  <input id="rngColorMatchInt" type="range" min="0" max="1" step="0.02" class="form-range" value="${cm.intensity ?? 0.78}" />
+                </div>
+              ` : `
+                <div class="text-secondary" style="font-size:0.66rem;">Matches this clip's brightness, contrast &amp; white balance to the average palette of existing timeline clips.</div>
+              `}
+            </div>
+          `;
+        })() : ''}
+
         <div class="row g-2 mb-2 align-items-center">
           <div class="col-7">
             <label class="form-label small text-secondary mb-0">Blend Mode</label>
@@ -1762,6 +1847,33 @@ export class PanelsUI {
     body.querySelector('#btnAdjApplyAll')?.addEventListener('click', () => this.app.applyFilterAndAdjustToAllClips(layer));
     body.querySelector('#btnStyleCopy')?.addEventListener('click', () => this.app.copySelectedStyle());
     body.querySelector('#btnStylePaste')?.addEventListener('click', () => this.app.pasteStyleToSelected());
+    body.querySelector('#btnColorMatchNow')?.addEventListener('click', () => this.app.matchSelectedToTimelinePalette());
+    body.querySelector('#chkColorMatchOn')?.addEventListener('change', (e) => {
+      this.app.mutateProject(() => toggleLayerColorMatch(layer, e.target.checked));
+    });
+    const cmRng = body.querySelector('#rngColorMatchInt');
+    const lblCm = body.querySelector('#lblColorMatchInt');
+    if (cmRng) {
+      let startCm = layer.colorMatch?.intensity ?? 0.78;
+      let capCm = false;
+      const capStart = () => { if (!capCm) { startCm = layer.colorMatch?.intensity ?? 0.78; capCm = true; } };
+      cmRng.addEventListener('pointerdown', capStart);
+      cmRng.addEventListener('input', (e) => {
+        capStart();
+        const v = Number(e.target.value);
+        if (lblCm) lblCm.textContent = `${Math.round(v * 100)}%`;
+        setLayerColorMatchIntensity(layer, v);
+        this.app.renderPreview();
+      });
+      cmRng.addEventListener('change', (e) => {
+        const nextV = Number(e.target.value);
+        setLayerColorMatchIntensity(layer, startCm);
+        capCm = false;
+        this.app.mutateProject(() => {
+          setLayerColorMatchIntensity(layer, nextV);
+        });
+      });
+    }
     body.querySelector('#btnOpenCutoutBrush')?.addEventListener('click', () => {
       this.app.hideOpenSheets();
       this.app.openCutoutBrushForSelected();

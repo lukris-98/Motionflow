@@ -19,6 +19,8 @@ export function createBaseLayer(type, name, project, overrides = {}) {
     id: uid('layer'),
     type,
     name,
+    trackRole: overrides.trackRole ?? null, // 'main' | 'overlay' | null
+    colorMatch: overrides.colorMatch || null,
     parentId: null,
     startFrame: overrides.startFrame ?? 0,
     endFrame: overrides.endFrame ?? defaultLen,
@@ -184,7 +186,7 @@ export const TimelineEngine = {
     });
   },
 
-  createMediaLayer(project, mediaItem, startFrame = 0) {
+  createMediaLayer(project, mediaItem, startFrame = 0, overrides = {}) {
     const fps = project.fps || 30;
     const rawDurFrames = Math.max(15, Math.round(((mediaItem.durationMs || 4000) / 1000) * fps));
     const endFrame = Math.min(project.durationFrames, startFrame + rawDurFrames);
@@ -197,6 +199,7 @@ export const TimelineEngine = {
     const fitScale = mediaItem.type === 'audio' ? 1 : Math.min(maxW / mw, maxH / mh, 1);
 
     return createBaseLayer(mediaItem.type, mediaItem.name || 'Media Clip', project, {
+      trackRole: overrides.trackRole ?? null,
       startFrame,
       endFrame: Math.max(startFrame + 15, endFrame),
       mediaId: mediaItem.id,
@@ -768,20 +771,539 @@ export const TimelineEngine = {
       KeyframeEngine.applyCameraPreset(project.camera, 'kenBurns', cursor);
     }
 
-    // Replace visual layers cleanly or append
+    // Assign all generated clips onto Main Track sequentially
+    created.forEach((l) => { l.trackRole = 'main'; });
     project.layers = [...created.reverse(), ...project.layers.filter((l) => l.type === 'audio')];
+    this.normalizeTrackZOrder(project);
     project.beatMarkers = [...new Set([...(project.beatMarkers || []), ...beats])].sort((a, b) => a - b);
     this.ensureProjectDuration(project, cursor + fps);
     return created.length;
   },
 
+  isMainTrackLayer(layer) {
+    return Boolean(layer && layer.trackRole === 'main');
+  },
+
+  getMainTrackClips(project) {
+    if (!project || !Array.isArray(project.layers)) return [];
+    return project.layers
+      .filter((l) => l.trackRole === 'main')
+      .sort((a, b) => (a.startFrame - b.startFrame) || (a.endFrame - b.endFrame));
+  },
+
+  getMainTrackEndFrame(project) {
+    const mainClips = this.getMainTrackClips(project);
+    if (mainClips.length === 0) return 0;
+    return Math.max(0, ...mainClips.map((c) => Number(c.endFrame) || 0));
+  },
+
+  shiftLayerKeyframes(layer, deltaFrames) {
+    if (!layer || !deltaFrames || !layer.keyframes) return;
+    for (const prop of Object.keys(layer.keyframes)) {
+      const list = layer.keyframes[prop];
+      if (!Array.isArray(list)) continue;
+      for (const kf of list) {
+        kf.frame = Math.max(0, Math.round(kf.frame + deltaFrames));
+      }
+      list.sort((a, b) => a.frame - b.frame);
+    }
+  },
+
+  /**
+   * Ensures Z-order in project.layers renders Overlays/Text/Shapes ABOVE Main Track,
+   * while Audio sits below Main Track, preserving relative order inside each group.
+   */
+  normalizeTrackZOrder(project) {
+    if (!project || !Array.isArray(project.layers)) return;
+    const overlays = [];
+    const mainTrack = [];
+    const audios = [];
+    for (const l of project.layers) {
+      if (l.type === 'audio') audios.push(l);
+      else if (l.trackRole === 'main') mainTrack.push(l);
+      else overlays.push(l);
+    }
+    // Keep mainTrack sorted reverse-chronologically in layers[] or sequential (rendered bottom-up doesn't matter when contiguous,
+    // reverse chronological ensures earlier clip sits last if overlapped cleanly during transitions)
+    mainTrack.sort((a, b) => (b.startFrame - a.startFrame) || (b.endFrame - a.endFrame));
+    project.layers = [...overlays, ...mainTrack, ...audios];
+  },
+
+  /**
+   * Packs Main Track clips contiguously starting from anchorFrame (default 0).
+   * If orderedIds is provided, clips are arranged in that exact sequence.
+   */
+  reflowMainTrack(project, anchorFrame = 0, orderedIds = null) {
+    if (!project || !Array.isArray(project.layers)) return [];
+    const currentClips = this.getMainTrackClips(project);
+    if (currentClips.length === 0) return [];
+
+    let sequence = currentClips;
+    if (Array.isArray(orderedIds) && orderedIds.length > 0) {
+      const byId = new Map(currentClips.map((c) => [c.id, c]));
+      const reordered = [];
+      for (const id of orderedIds) {
+        const c = byId.get(id);
+        if (c) {
+          reordered.push(c);
+          byId.delete(id);
+        }
+      }
+      for (const rem of byId.values()) reordered.push(rem);
+      sequence = reordered;
+    }
+
+    const oldNeighbors = new Map();
+    for (let i = 0; i < currentClips.length; i++) {
+      oldNeighbors.set(currentClips[i].id, {
+        prevId: i > 0 ? currentClips[i - 1].id : null,
+        nextId: i < currentClips.length - 1 ? currentClips[i + 1].id : null
+      });
+    }
+
+    let cursor = Math.max(0, Math.round(anchorFrame));
+    for (let i = 0; i < sequence.length; i++) {
+      const clip = sequence[i];
+      const len = Math.max(5, (clip.endFrame || 0) - (clip.startFrame || 0));
+      const delta = cursor - clip.startFrame;
+      clip.startFrame = cursor;
+      clip.endFrame = cursor + len;
+      if (delta !== 0) {
+        this.shiftLayerKeyframes(clip, delta);
+      }
+      // If neighbor sequence changed due to reorder, clear broken edge transitions
+      if (Array.isArray(orderedIds)) {
+        const prevOld = oldNeighbors.get(clip.id);
+        const newPrevId = i > 0 ? sequence[i - 1].id : null;
+        const newNextId = i < sequence.length - 1 ? sequence[i + 1].id : null;
+        if (clip.transitions) {
+          if (prevOld && prevOld.prevId !== newPrevId && clip.transitions.inType !== 'none') {
+            clip.transitions.inType = 'none';
+          }
+          if (prevOld && prevOld.nextId !== newNextId && clip.transitions.outType !== 'none') {
+            clip.transitions.outType = 'none';
+          }
+        }
+      }
+      cursor += len;
+    }
+
+    this.normalizeTrackZOrder(project);
+    this.ensureProjectDuration(project, cursor);
+    return sequence;
+  },
+
+  addToMainTrack(project, layer, options = {}) {
+    if (!project || !layer) return null;
+    layer.trackRole = 'main';
+    const len = Math.max(15, (layer.endFrame || 0) - (layer.startFrame || 0));
+    const currentEnd = this.getMainTrackEndFrame(project);
+    const startF = options.insertFrame !== undefined && options.insertFrame !== null
+      ? Math.max(0, Math.round(options.insertFrame))
+      : currentEnd;
+
+    layer.startFrame = startF;
+    layer.endFrame = startF + len;
+    project.layers.push(layer);
+
+    if (options.insertFrame !== undefined && options.insertFrame !== null && project.settings?.rippleMode !== false) {
+      const ordered = this.getMainTrackClips(project);
+      // Put newly inserted clip before any existing clip that started at/after insertFrame
+      const existingOthers = ordered.filter((c) => c.id !== layer.id);
+      const insertIdx = existingOthers.findIndex((c) => (c.startFrame + c.endFrame) * 0.5 >= startF);
+      const nextSeq = insertIdx >= 0
+        ? [...existingOthers.slice(0, insertIdx), layer, ...existingOthers.slice(insertIdx)]
+        : [...existingOthers, layer];
+      this.reflowMainTrack(project, 0, nextSeq.map((c) => c.id));
+    } else if (project.settings?.rippleMode !== false) {
+      this.reflowMainTrack(project, 0);
+    } else {
+      this.normalizeTrackZOrder(project);
+      this.ensureProjectDuration(project, layer.endFrame);
+    }
+    return layer;
+  },
+
+  deleteMainOrLayer(project, layerId) {
+    const target = project?.layers?.find((l) => l.id === layerId);
+    if (!target) return false;
+    const wasMain = target.trackRole === 'main';
+    const deleted = this.deleteLayer(project, layerId);
+    if (!deleted) return false;
+    if (wasMain && project.settings?.rippleMode !== false) {
+      this.reflowMainTrack(project, 0);
+    }
+    return true;
+  },
+
+  trimMainOrClip(project, layerId, edge, newFrame, snapEnabled = true, playheadFrame = 0) {
+    const layer = project?.layers?.find((l) => l.id === layerId);
+    if (!layer || layer.locked) return;
+    if (layer.trackRole !== 'main' || project.settings?.rippleMode === false) {
+      this.trimClip(project, layerId, edge, newFrame, snapEnabled, playheadFrame);
+      return;
+    }
+
+    const mainSeq = this.getMainTrackClips(project);
+    const idx = mainSeq.findIndex((c) => c.id === layerId);
+    const oldStart = layer.startFrame;
+    const oldEnd = layer.endFrame;
+    const minLen = 5;
+
+    if (edge === 'right') {
+      let f = Math.max(oldStart + minLen, Math.round(newFrame));
+      if (snapEnabled && Math.abs(f - playheadFrame) <= 4 && playheadFrame >= oldStart + minLen) {
+        f = playheadFrame;
+      }
+      layer.endFrame = f;
+      const delta = layer.endFrame - oldEnd;
+      if (delta !== 0 && idx >= 0) {
+        for (let i = idx + 1; i < mainSeq.length; i++) {
+          const sib = mainSeq[i];
+          sib.startFrame = Math.max(0, sib.startFrame + delta);
+          sib.endFrame = Math.max(sib.startFrame + minLen, sib.endFrame + delta);
+          this.shiftLayerKeyframes(sib, delta);
+        }
+      }
+      this.ensureProjectDuration(project, this.getMainTrackEndFrame(project));
+    } else {
+      const maxStart = oldEnd - minLen;
+      let f = Math.max(0, Math.min(maxStart, Math.round(newFrame)));
+      if (snapEnabled && Math.abs(f - playheadFrame) <= 4 && playheadFrame <= maxStart) {
+        f = Math.max(0, playheadFrame);
+      }
+      const trimDelta = f - oldStart;
+      layer.startFrame = f;
+      layer.mediaOffsetFrames = Math.max(0, (layer.mediaOffsetFrames || 0) + Math.round(trimDelta * (layer.speed || 1)));
+      // Re-pack Main Track flush so trimming head doesn't leave a magnetic gap
+      this.reflowMainTrack(project, 0, mainSeq.map((c) => c.id));
+    }
+  },
+
+  reorderMainTrackClip(project, layerId, targetSlotIdx) {
+    const seq = this.getMainTrackClips(project);
+    const curIdx = seq.findIndex((c) => c.id === layerId);
+    if (curIdx < 0) return false;
+    const clamped = Math.max(0, Math.min(seq.length - 1, Math.round(targetSlotIdx)));
+    if (clamped === curIdx) return false;
+    const next = [...seq];
+    const [moved] = next.splice(curIdx, 1);
+    next.splice(clamped, 0, moved);
+    this.reflowMainTrack(project, 0, next.map((c) => c.id));
+    return true;
+  },
+
+  moveMainTrackClipStep(project, layerId, delta) {
+    const seq = this.getMainTrackClips(project);
+    const curIdx = seq.findIndex((c) => c.id === layerId);
+    if (curIdx < 0) return false;
+    return this.reorderMainTrackClip(project, layerId, curIdx + delta);
+  },
+
+  computeMainTrackTargetSlot(project, movingLayerId, dragCenterFrame) {
+    const others = this.getMainTrackClips(project).filter((c) => c.id !== movingLayerId);
+    for (let i = 0; i < others.length; i++) {
+      const mid = (others[i].startFrame + others[i].endFrame) * 0.5;
+      if (dragCenterFrame < mid) return i;
+    }
+    return others.length;
+  },
+
+  reorderMainTrackClipByFrame(project, layerId, dragCenterFrame) {
+    const seq = this.getMainTrackClips(project);
+    if (seq.length <= 1 || !seq.some((c) => c.id === layerId)) return false;
+    const targetSlot = this.computeMainTrackTargetSlot(project, layerId, dragCenterFrame);
+    return this.reorderMainTrackClip(project, layerId, targetSlot);
+  },
+
+  switchLayerTrackRole(project, layerId, targetRole, playheadFrame = 0) {
+    const layer = project?.layers?.find((l) => l.id === layerId);
+    if (!layer) return false;
+    if (layer.type !== 'video' && layer.type !== 'image') return false;
+    const nextRole = targetRole === 'main' ? 'main' : 'overlay';
+    if (layer.trackRole === nextRole) return false;
+
+    if (nextRole === 'overlay') {
+      layer.trackRole = 'overlay';
+      if (project.settings?.rippleMode !== false) {
+        this.reflowMainTrack(project, 0);
+      } else {
+        this.normalizeTrackZOrder(project);
+      }
+      return true;
+    }
+
+    // Moving overlay -> main track
+    const len = Math.max(5, (layer.endFrame || 0) - (layer.startFrame || 0));
+    layer.trackRole = 'main';
+    const mainOthers = this.getMainTrackClips(project).filter((c) => c.id !== layer.id);
+    if (project.settings?.rippleMode !== false) {
+      const appendStart = mainOthers.length > 0 ? Math.max(...mainOthers.map((c) => c.endFrame)) : 0;
+      const oldStart = layer.startFrame;
+      layer.startFrame = appendStart;
+      layer.endFrame = appendStart + len;
+      this.shiftLayerKeyframes(layer, appendStart - oldStart);
+      this.reflowMainTrack(project, 0);
+    } else {
+      const targetStart = Math.max(0, Math.round(playheadFrame));
+      const oldStart = layer.startFrame;
+      layer.startFrame = targetStart;
+      layer.endFrame = targetStart + len;
+      this.shiftLayerKeyframes(layer, targetStart - oldStart);
+      this.normalizeTrackZOrder(project);
+      this.ensureProjectDuration(project, layer.endFrame);
+    }
+    return true;
+  },
+
+  /**
+   * CapCut-style Delete Left / Delete Right at playhead:
+   * - When playhead is inside the clip: trims/removes the left or right portion of the clip cleanly
+   *   (updating mediaOffsetFrames, partitioning keyframes, and rippling Main Track if magnetic).
+   * - When playhead is at/on a split seam or edge: deletes the adjacent left/right split piece on that track.
+   */
+  trimDeleteSideAtPlayhead(project, layerId, side, playheadFrame = 0) {
+    if (!project || !Array.isArray(project.layers)) return null;
+    const isLeft = side === 'left';
+    const f = Math.max(0, Math.round(playheadFrame));
+    let layer = project.layers.find((l) => l.id === layerId) || null;
+    if (!layer) {
+      const mainSeq = this.getMainTrackClips(project);
+      layer = mainSeq.find((c) => f >= c.startFrame && f <= c.endFrame) || null;
+    }
+    if (!layer || layer.locked) return null;
+
+    const minLen = 5;
+    const wasMain = layer.trackRole === 'main';
+    const rippleOn = project.settings?.rippleMode !== false;
+
+    // Case 1: Playhead is strictly inside the target clip (at least minLen remains on kept side)
+    if (isLeft && f > layer.startFrame + 1 && f <= layer.endFrame - minLen) {
+      const origStart = layer.startFrame;
+      const origEnd = layer.endFrame;
+      const origOffset = layer.mediaOffsetFrames || 0;
+      const spd = layer.speed || 1;
+      const reversed = Boolean(layer.reversed);
+
+      const wasmOffsets = WasmBridge.splitOffsets(origStart, origEnd, f, origOffset, spd, reversed);
+      const rightOffset = wasmOffsets
+        ? wasmOffsets.rightOffset
+        : reversed
+          ? origOffset
+          : origOffset + Math.round((f - origStart) * spd);
+
+      if (layer.keyframes) {
+        for (const prop of Object.keys(layer.keyframes)) {
+          const list = layer.keyframes[prop];
+          if (!Array.isArray(list) || list.length === 0) continue;
+          const valAtSplit = KeyframeEngine.getValueAtFrame(layer, prop, f, layer.transform?.[prop] ?? 0);
+          const hasBoundary = list.some((k) => k.frame === f);
+          layer.keyframes[prop] = list.filter((k) => k.frame >= f);
+          if (!hasBoundary) {
+            KeyframeEngine.setKeyframe(layer, prop, f, valAtSplit, 'linear');
+          }
+        }
+      }
+      layer.startFrame = f;
+      layer.mediaOffsetFrames = Math.max(0, rightOffset);
+      if (layer.transitions) layer.transitions.inType = 'none';
+
+      if (wasMain && rippleOn) {
+        this.reflowMainTrack(project, 0);
+      }
+      return {
+        action: 'trimmed_left',
+        selectedId: layer.id,
+        playheadFrame: wasMain && rippleOn ? layer.startFrame : f
+      };
+    }
+
+    if (!isLeft && f >= layer.startFrame + minLen && f < layer.endFrame - 1) {
+      const origStart = layer.startFrame;
+      const origEnd = layer.endFrame;
+      const origOffset = layer.mediaOffsetFrames || 0;
+      const spd = layer.speed || 1;
+      const reversed = Boolean(layer.reversed);
+
+      if (reversed) {
+        const wasmOffsets = WasmBridge.splitOffsets(origStart, origEnd, f, origOffset, spd, true);
+        layer.mediaOffsetFrames = Math.max(
+          0,
+          wasmOffsets ? wasmOffsets.leftOffset : origOffset + Math.round((origEnd - f) * spd)
+        );
+      }
+
+      if (layer.keyframes) {
+        for (const prop of Object.keys(layer.keyframes)) {
+          const list = layer.keyframes[prop];
+          if (!Array.isArray(list) || list.length === 0) continue;
+          const valAtSplit = KeyframeEngine.getValueAtFrame(layer, prop, f, layer.transform?.[prop] ?? 0);
+          const hasBoundary = list.some((k) => k.frame === f);
+          layer.keyframes[prop] = list.filter((k) => k.frame <= f);
+          if (!hasBoundary) {
+            KeyframeEngine.setKeyframe(layer, prop, f, valAtSplit, 'linear');
+          }
+        }
+      }
+      layer.endFrame = f;
+      if (layer.transitions) layer.transitions.outType = 'none';
+
+      if (wasMain && rippleOn) {
+        this.reflowMainTrack(project, 0);
+      }
+      return {
+        action: 'trimmed_right',
+        selectedId: layer.id,
+        playheadFrame: Math.min(f, layer.endFrame)
+      };
+    }
+
+    // Case 2: Playhead sits on/near a split seam — remove the adjacent split clip on the requested side
+    const pool = wasMain
+      ? this.getMainTrackClips(project)
+      : project.layers
+          .filter((l) => l.trackRole !== 'main' && l.type === layer.type && !l.locked)
+          .sort((a, b) => (a.startFrame - b.startFrame) || (a.endFrame - b.endFrame));
+
+    let victim = null;
+    if (isLeft) {
+      if (layer.endFrame <= f + 2) {
+        victim = layer;
+      } else {
+        const leftCands = pool
+          .filter((c) => c.id !== layer.id && c.endFrame <= f + 2 && !c.locked)
+          .sort((a, b) => (a.endFrame - b.endFrame) || (a.startFrame - b.startFrame));
+        if (leftCands.length > 0) {
+          victim = leftCands[leftCands.length - 1];
+        }
+      }
+    } else {
+      if (layer.startFrame >= f - 2) {
+        victim = layer;
+      } else {
+        const rightCands = pool
+          .filter((c) => c.id !== layer.id && c.startFrame >= f - 2 && !c.locked)
+          .sort((a, b) => (a.startFrame - b.startFrame) || (a.endFrame - b.endFrame));
+        if (rightCands.length > 0) {
+          victim = rightCands[0];
+        }
+      }
+    }
+    if (!victim) return null;
+
+    const victimStart = victim.startFrame;
+    const victimWasMain = victim.trackRole === 'main';
+    const survivorHint = pool.find((c) => c.id !== victim.id && (isLeft ? c.startFrame >= victim.endFrame - 2 : c.endFrame <= victim.startFrame + 2))
+      || pool.find((c) => c.id !== victim.id)
+      || null;
+
+    this.deleteMainOrLayer(project, victim.id);
+    const nextSelectedId = (layer.id !== victim.id && project.layers.some((l) => l.id === layer.id))
+      ? layer.id
+      : (survivorHint && project.layers.some((l) => l.id === survivorHint.id) ? survivorHint.id : (project.layers[0]?.id || null));
+
+    return {
+      action: isLeft ? 'deleted_left' : 'deleted_right',
+      selectedId: nextSelectedId,
+      playheadFrame: victimWasMain && rippleOn ? victimStart : f
+    };
+  },
+
+  /**
+   * 2D Drag & Drop placement inside the timeline:
+   * - Drop visual overlay clip onto Main Track at dragCenterFrame slot
+   * - Drop Main Track clip into Overlay track at targetStartFrame
+   * - Reorder Overlay / Text / Shape / Audio lane vertically while updating time position
+   */
+  dropLayerInTimeline(project, layerId, {
+    targetRole = null,
+    targetLayerIndex = null,
+    targetStartFrame = null,
+    dragCenterFrame = null
+  } = {}) {
+    const layer = project?.layers?.find((l) => l.id === layerId);
+    if (!layer || layer.locked) return false;
+
+    const oldStart = layer.startFrame;
+    const len = Math.max(5, (layer.endFrame || 0) - oldStart);
+    let changed = false;
+
+    if (targetRole === 'main' && (layer.type === 'video' || layer.type === 'image')) {
+      layer.trackRole = 'main';
+      if (!project.layers.some((l) => l.id === layer.id)) {
+        project.layers.push(layer);
+      }
+      const centerF = Number.isFinite(dragCenterFrame) ? dragCenterFrame : (oldStart + len * 0.5);
+      const slot = this.computeMainTrackTargetSlot(project, layer.id, centerF);
+      const others = this.getMainTrackClips(project).filter((c) => c.id !== layer.id);
+      const clampedSlot = Math.max(0, Math.min(others.length, slot));
+      const nextSeq = [...others.slice(0, clampedSlot), layer, ...others.slice(clampedSlot)];
+      if (project.settings?.rippleMode !== false) {
+        this.reflowMainTrack(project, 0, nextSeq.map((c) => c.id));
+      } else {
+        const nextS = Math.max(0, Math.round(targetStartFrame ?? oldStart));
+        layer.startFrame = nextS;
+        layer.endFrame = nextS + len;
+        this.shiftLayerKeyframes(layer, nextS - oldStart);
+        this.normalizeTrackZOrder(project);
+        this.ensureProjectDuration(project, layer.endFrame);
+      }
+      return true;
+    }
+
+    if (targetRole === 'overlay' && layer.trackRole === 'main') {
+      layer.trackRole = 'overlay';
+      const nextS = Math.max(0, Math.round(targetStartFrame ?? oldStart));
+      layer.startFrame = nextS;
+      layer.endFrame = nextS + len;
+      this.shiftLayerKeyframes(layer, nextS - oldStart);
+      if (project.settings?.rippleMode !== false) {
+        this.reflowMainTrack(project, 0);
+      }
+      if (Number.isInteger(targetLayerIndex)) {
+        this.moveLayerToIndex(project, layer.id, targetLayerIndex);
+      }
+      this.normalizeTrackZOrder(project);
+      this.ensureProjectDuration(project, layer.endFrame);
+      return true;
+    }
+
+    if (Number.isFinite(targetStartFrame)) {
+      const nextS = Math.max(0, Math.round(targetStartFrame));
+      if (nextS !== oldStart) {
+        layer.startFrame = nextS;
+        layer.endFrame = nextS + len;
+        this.shiftLayerKeyframes(layer, nextS - oldStart);
+        this.ensureProjectDuration(project, layer.endFrame);
+        changed = true;
+      }
+    }
+
+    if (Number.isInteger(targetLayerIndex)) {
+      if (this.moveLayerToIndex(project, layer.id, targetLayerIndex)) {
+        this.normalizeTrackZOrder(project);
+        changed = true;
+      }
+    }
+
+    return changed;
+  },
+
   findTransitionJunctions(project) {
     if (!project || !Array.isArray(project.layers)) return [];
-    const groups = [
-      project.layers.filter((l) => l.type === 'video' || l.type === 'image'),
-      project.layers.filter((l) => l.type === 'text'),
-      project.layers.filter((l) => l.type === 'shape')
-    ];
+    const hasExplicitMain = project.layers.some((l) => l.trackRole === 'main');
+    const groups = hasExplicitMain
+      ? [
+          project.layers.filter((l) => l.trackRole === 'main'),
+          project.layers.filter((l) => l.trackRole !== 'main' && (l.type === 'video' || l.type === 'image')),
+          project.layers.filter((l) => l.type === 'text'),
+          project.layers.filter((l) => l.type === 'shape')
+        ]
+      : [
+          project.layers.filter((l) => l.type === 'video' || l.type === 'image'),
+          project.layers.filter((l) => l.type === 'text'),
+          project.layers.filter((l) => l.type === 'shape')
+        ];
     const junctions = [];
     const fps = Math.max(1, project.fps || 30);
 

@@ -105,6 +105,11 @@ export class TimelineView {
     this._waveEntries = [];
     this._filmstripEntries = [];
     this._lastRenderContext = null;
+    this._isPinching = false;
+    this._zoomRafId = null;
+    this._pinchEndTimer = null;
+    this._activeClipAbort = null;
+    this._zoomRefs = { clips: [], seams: [], gaps: [], addBtns: [] };
 
     this.bindRulerAndScroll();
     this.bindPinchZoom();
@@ -200,16 +205,116 @@ export class TimelineView {
 
   zoomIn(anchorFrame = null) {
     this._setZoomAnchored(this.pxPerFrame * 1.55, anchorFrame);
+    this._applyFastZoomLayout();
+    this._scheduleCrispRedraw(40);
   }
 
   zoomOut(anchorFrame = null) {
     this._setZoomAnchored(this.pxPerFrame / 1.55, anchorFrame);
+    this._applyFastZoomLayout();
+    this._scheduleCrispRedraw(40);
+  }
+
+  _scheduleFastZoomUpdate() {
+    if (this._zoomRafId !== null) return;
+    this._zoomRafId = requestAnimationFrame(() => {
+      this._zoomRafId = null;
+      this._applyFastZoomLayout();
+    });
+  }
+
+  _applyFastZoomLayout() {
+    const ctx = this._lastRenderContext;
+    const project = ctx?.project;
+    if (!project) return;
+    const fps = Math.max(1, project.fps || 30);
+    const totalFrames = Math.max(project.durationFrames, fps * 5);
+    const totalWidth = Math.max(this.scrollEl.clientWidth || 360, Math.ceil(totalFrames * this.pxPerFrame) + 120);
+
+    this.contentEl.style.width = `${totalWidth}px`;
+    if (this._pendingScrollLeft !== null) {
+      const maxScroll = Math.max(0, totalWidth - (this.scrollEl.clientWidth || 0));
+      this.scrollEl.scrollLeft = Math.min(maxScroll, Math.max(0, this._pendingScrollLeft));
+      this._pendingScrollLeft = null;
+    }
+
+    const px = this.pxPerFrame;
+    this.drawRuler(totalWidth, fps, totalFrames);
+    this.updatePlayhead(this.cb.getPlayheadFrame?.() ?? 0);
+
+    for (const ref of this._zoomRefs.clips) {
+      const l = ref.layer;
+      const leftPx = l.startFrame * px;
+      const widthPx = Math.max(24, (l.endFrame - l.startFrame) * px);
+      ref.clip.style.left = `${leftPx}px`;
+      ref.clip.style.width = `${widthPx}px`;
+
+      // Smoothly CSS-stretch cached filmstrip/waveform bitmaps during active pinch without resampling pixels
+      if (ref.filmCanvas) {
+        ref.filmCanvas.style.left = '0px';
+        ref.filmCanvas.style.width = '100%';
+      }
+      if (ref.waveCanvas) {
+        ref.waveCanvas.style.left = '0px';
+        ref.waveCanvas.style.width = '100%';
+      }
+      for (const d of ref.diamonds) {
+        const relPx = (d.frame - l.startFrame) * px;
+        d.el.style.left = `${relPx}px`;
+        d.el.style.display = relPx >= 0 && relPx <= widthPx ? '' : 'none';
+      }
+    }
+
+    for (const s of this._zoomRefs.seams) {
+      s.el.style.left = `${s.frame * px}px`;
+    }
+    for (const g of this._zoomRefs.gaps) {
+      g.el.style.left = `${g.frame * px}px`;
+    }
+    for (const b of this._zoomRefs.addBtns) {
+      b.el.style.left = `${b.frame * px + 8}px`;
+    }
+  }
+
+  _scheduleCrispRedraw(delayMs = 90) {
+    clearTimeout(this._pinchEndTimer);
+    this._pinchEndTimer = setTimeout(() => {
+      if (this._isPinching) return;
+      for (const entry of this._waveEntries) {
+        entry.leftPx = entry.layer.startFrame * this.pxPerFrame;
+        entry.widthPx = Math.max(24, (entry.layer.endFrame - entry.layer.startFrame) * this.pxPerFrame);
+        entry.renderedStart = -1;
+        entry.renderedEnd = -1;
+      }
+      for (const entry of this._filmstripEntries) {
+        if (entry.layer) {
+          entry.leftPx = entry.layer.startFrame * this.pxPerFrame;
+          entry.widthPx = Math.max(24, (entry.layer.endFrame - entry.layer.startFrame) * this.pxPerFrame);
+        }
+        entry.renderedStart = -1;
+        entry.renderedEnd = -1;
+      }
+      this.redrawVisibleClipCanvases();
+    }, delayMs);
   }
 
   bindPinchZoom() {
+    this.scrollEl.addEventListener('touchmove', (e) => {
+      if (e.touches && e.touches.length >= 2) {
+        e.preventDefault();
+      }
+    }, { passive: false });
+
     this.scrollEl.addEventListener('pointerdown', (e) => {
       this.activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
-      if (this.activePointers.size === 2) {
+      if (this.activePointers.size >= 2) {
+        this._isPinching = true;
+        clearTimeout(this._pinchEndTimer);
+        // Cancel any single-finger drag/trim that began on finger #1
+        if (this._activeClipAbort) {
+          this._activeClipAbort();
+          this._activeClipAbort = null;
+        }
         const pts = [...this.activePointers.values()];
         this.pinchStartDist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
         this.pinchStartPx = this.pxPerFrame;
@@ -218,24 +323,32 @@ export class TimelineView {
         this.pinchPivotScreenX = midScreenX;
         this.pinchPivotFrame = (this.scrollEl.scrollLeft + midScreenX) / Math.max(MIN_PX_PER_FRAME, this.pxPerFrame);
       }
-    });
+    }, { capture: true });
+
     this.scrollEl.addEventListener('pointermove', (e) => {
       if (!this.activePointers.has(e.pointerId)) return;
       this.activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
-      if (this.activePointers.size === 2 && this.pinchStartDist > 10) {
+      if (this.activePointers.size === 2 && this.pinchStartDist > 8) {
         const pts = [...this.activePointers.values()];
         const dist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
         const ratio = dist / this.pinchStartDist;
         this._setZoomAnchored(this.pinchStartPx * ratio, this.pinchPivotFrame, this.pinchPivotScreenX);
-        this.cb.onPinchZoom();
+        this._scheduleFastZoomUpdate();
       }
-    });
+    }, { capture: true });
+
     const endPtr = (e) => {
       this.activePointers.delete(e.pointerId);
-      if (this.activePointers.size < 2) this.pinchStartDist = null;
+      if (this.activePointers.size < 2) {
+        this.pinchStartDist = null;
+        if (this._isPinching && this.activePointers.size === 0) {
+          this._isPinching = false;
+          this._scheduleCrispRedraw(70);
+        }
+      }
     };
-    this.scrollEl.addEventListener('pointerup', endPtr);
-    this.scrollEl.addEventListener('pointercancel', endPtr);
+    this.scrollEl.addEventListener('pointerup', endPtr, { capture: true });
+    this.scrollEl.addEventListener('pointercancel', endPtr, { capture: true });
   }
 
   bindRulerAndScroll() {
@@ -458,14 +571,367 @@ export class TimelineView {
     this.playheadEl.style.transform = `translateX(${x}px)`;
   }
 
+  _buildClipElement(project, layer, isSelected, audioEngine, mediaMap) {
+    const leftPx = layer.startFrame * this.pxPerFrame;
+    const widthPx = Math.max(24, (layer.endFrame - layer.startFrame) * this.pxPerFrame);
+
+    const clip = document.createElement('div');
+    clip.className = `mf-clip mf-clip-${layer.type} ${isSelected ? 'selected' : ''}`;
+    clip.dataset.layerId = layer.id;
+    clip.style.left = `${leftPx}px`;
+    clip.style.width = `${widthPx}px`;
+
+    const mediaBg = document.createElement('div');
+    mediaBg.className = 'mf-clip-media-bg';
+    clip.appendChild(mediaBg);
+
+    let filmEntry = null;
+    let filmCanvas = null;
+    if ((layer.type === 'video' || layer.type === 'image') && layer.mediaId && mediaMap) {
+      const mItem = mediaMap.get(layer.mediaId);
+      const tiles = mItem ? this._ensureFilmstripTile(mItem) : null;
+      if (tiles && tiles.length > 0) {
+        filmCanvas = document.createElement('canvas');
+        filmCanvas.className = 'mf-clip-filmstrip';
+        mediaBg.appendChild(filmCanvas);
+        filmEntry = { canvas: filmCanvas, layer, tiles, leftPx, widthPx, renderedStart: -1, renderedEnd: -1 };
+        this._filmstripEntries.push(filmEntry);
+        this._paintFilmstripEntry(filmEntry, true);
+      }
+    }
+
+    let waveEntry = null;
+    let waveCanvas = null;
+    if ((layer.type === 'audio' || layer.type === 'video') && layer.mediaId) {
+      const mItem = mediaMap?.get(layer.mediaId);
+      if (mItem && !audioEngine.hasBuffer?.(layer.mediaId) && !audioEngine.failedIds?.has(layer.mediaId)) {
+        audioEngine.loadBuffer(mItem).then((buf) => {
+          if (buf) this.cb.onPinchZoom?.();
+        });
+      }
+      const hasAudioOrVol = Boolean(
+        audioEngine.hasBuffer?.(layer.mediaId) ||
+        audioEngine.getPeaks(layer.mediaId)?.length ||
+        layer.keyframes?.volume?.length
+      );
+      if (hasAudioOrVol) {
+        waveCanvas = document.createElement('canvas');
+        waveCanvas.className = 'mf-clip-wave';
+        mediaBg.appendChild(waveCanvas);
+        waveEntry = {
+          canvas: waveCanvas,
+          layer,
+          project,
+          audioEngine,
+          leftPx,
+          widthPx,
+          renderedStart: -1,
+          renderedEnd: -1
+        };
+        this._waveEntries.push(waveEntry);
+        this._paintWaveEntry(waveEntry, true);
+      }
+    }
+
+    const label = document.createElement('span');
+    label.className = 'mf-clip-label';
+    const tags = [];
+    if (layer.speed && layer.speed !== 1) tags.push(`${layer.speed.toFixed(2)}x`);
+    if (layer.speedCurve && layer.speedCurve !== 'none') tags.push('⚡');
+    if (layer.reversed) tags.push('⇄');
+    if (layer.isFreezeFrame) tags.push('❄');
+    if (layer.colorMatch?.enabled) tags.push('🎨');
+    if (layer.trackData?.points?.length) tags.push('⊕');
+    const suffix = tags.length > 0 ? ` (${tags.join(' ')})` : '';
+    label.textContent = `${layer.name}${suffix}`;
+    clip.appendChild(label);
+
+    const diamonds = [];
+    const kfFrames = KeyframeEngine.getAllKeyframeFrames(layer);
+    kfFrames.forEach((kfFrame) => {
+      const relPx = (kfFrame - layer.startFrame) * this.pxPerFrame;
+      if (relPx >= 0 && relPx <= widthPx) {
+        const diamond = document.createElement('div');
+        diamond.className = 'mf-kf-diamond';
+        diamond.style.left = `${relPx}px`;
+        diamond.title = `Keyframe @ F${kfFrame} (Drag to move)`;
+        this.bindDiamondGesture(diamond, layer, kfFrame);
+        clip.appendChild(diamond);
+        diamonds.push({ el: diamond, frame: kfFrame });
+      }
+    });
+
+    const leftTrim = document.createElement('div');
+    leftTrim.className = 'mf-trim-handle left';
+    leftTrim.title = 'Drag to Trim / Extend Start';
+    const rightTrim = document.createElement('div');
+    rightTrim.className = 'mf-trim-handle right';
+    rightTrim.title = 'Drag to Trim / Extend End';
+    clip.appendChild(leftTrim);
+    clip.appendChild(rightTrim);
+
+    this._zoomRefs.clips.push({ clip, layer, filmCanvas, waveCanvas, diamonds });
+
+    return { clip, leftTrim, rightTrim, waveEntry, filmEntry };
+  }
+
+  _appendSingleLayerRow(project, layer, selectedLayerId, audioEngine, mediaMap, junctionByLeftId) {
+    const layerIndex = project.layers.findIndex((l) => l.id === layer.id);
+    const isSelected = layer.id === selectedLayerId;
+    const isChecked = this.checkedLayerIds.has(layer.id);
+
+    const hdr = document.createElement('div');
+    hdr.className = `mf-track-header-item d-flex align-items-center justify-content-between ${isSelected ? 'selected' : ''} ${layer.parentId ? 'child-layer' : ''}`;
+    hdr.dataset.index = String(layerIndex);
+    hdr.dataset.layerId = layer.id;
+    const roleHint = layer.type === 'video' || layer.type === 'image' ? 'PIP · ' : '';
+    hdr.innerHTML = `
+      <div class="d-flex align-items-center gap-1 min-w-0 flex-grow-1">
+        <span class="mf-drag-handle" title="Drag to Reorder"><i class="bi bi-grip-vertical"></i></span>
+        ${layer.type !== 'group' ? `<input type="checkbox" class="form-check-input m-0 flex-shrink-0" style="width:12px;height:12px;" ${isChecked ? 'checked' : ''} aria-label="Select for Group" />` : ''}
+        <i class="bi ${LAYER_ICONS[layer.type] || 'bi-layers'} small flex-shrink-0"></i>
+        <span class="mf-track-title">${roleHint}${this.escapeHtml(layer.name)}</span>
+      </div>
+      <div class="d-flex align-items-center flex-shrink-0">
+        <button class="mf-mini-btn ${layer.visible ? 'on' : ''}" data-act="vis" title="Visibility">
+          <i class="bi ${layer.visible ? 'bi-eye-fill' : 'bi-eye-slash'}"></i>
+        </button>
+        <button class="mf-mini-btn ${layer.locked ? 'locked' : ''}" data-act="lock" title="Lock">
+          <i class="bi ${layer.locked ? 'bi-lock-fill' : 'bi-unlock'}"></i>
+        </button>
+      </div>
+    `;
+
+    const cbEl = hdr.querySelector('input[type="checkbox"]');
+    if (cbEl) {
+      cbEl.addEventListener('click', (e) => {
+        e.stopPropagation();
+        if (cbEl.checked) this.checkedLayerIds.add(layer.id);
+        else this.checkedLayerIds.delete(layer.id);
+        this.btnGroupChecked?.classList.toggle('d-none', this.checkedLayerIds.size < 2);
+      });
+    }
+
+    const dragHandle = hdr.querySelector('.mf-drag-handle');
+    let draggingRow = false;
+    let startY = 0;
+    dragHandle.addEventListener('pointerdown', (e) => {
+      e.stopPropagation();
+      draggingRow = true;
+      startY = e.clientY;
+      dragHandle.setPointerCapture(e.pointerId);
+    });
+    dragHandle.addEventListener('pointermove', (e) => {
+      if (!draggingRow) return;
+      const deltaRows = Math.round((e.clientY - startY) / 44);
+      const targetIdx = Math.max(0, Math.min(project.layers.length - 1, layerIndex + deltaRows));
+      this.headersList.querySelectorAll('.mf-track-header-item[data-layer-id]').forEach((el) => {
+        const elIdx = Number(el.dataset.index);
+        el.classList.toggle('drag-over', elIdx === targetIdx && elIdx !== layerIndex);
+      });
+    });
+    const finishReorder = (e) => {
+      if (!draggingRow) return;
+      draggingRow = false;
+      const deltaRows = Math.round((e.clientY - startY) / 44);
+      this.headersList.querySelectorAll('.mf-track-header-item').forEach((el) => el.classList.remove('drag-over'));
+      if (deltaRows !== 0) {
+        const targetIdx = Math.max(0, Math.min(project.layers.length - 1, layerIndex + deltaRows));
+        this.cb.onReorderLayerToIndex(layer.id, targetIdx);
+      }
+    };
+    dragHandle.addEventListener('pointerup', finishReorder);
+    dragHandle.addEventListener('pointercancel', finishReorder);
+
+    hdr.addEventListener('click', (e) => {
+      const btn = e.target.closest('button');
+      if (btn) {
+        e.stopPropagation();
+        const act = btn.dataset.act;
+        if (act === 'vis') this.cb.onToggleVisibility(layer.id);
+        if (act === 'lock') this.cb.onToggleLock(layer.id);
+        return;
+      }
+      this.cb.onSelectLayer(layer.id);
+    });
+    this.headersList.appendChild(hdr);
+
+    const lane = document.createElement('div');
+    lane.className = `mf-track-lane ${isSelected ? 'selected' : ''}`;
+    lane.dataset.laneType = 'single';
+    lane.dataset.layerId = layer.id;
+    lane.dataset.layerIndex = String(layerIndex);
+    const { clip, leftTrim, rightTrim, waveEntry, filmEntry } = this._buildClipElement(
+      project, layer, isSelected, audioEngine, mediaMap
+    );
+    this.bindClipGestures(clip, leftTrim, rightTrim, project, layer, waveEntry, filmEntry, lane, null);
+    lane.appendChild(clip);
+
+    const junc = junctionByLeftId.get(layer.id);
+    if (junc) {
+      this._appendSeamButton(lane, junc);
+    }
+
+    this.lanesList.appendChild(lane);
+  }
+
+  _appendSeamButton(lane, junc) {
+    const seamBtn = document.createElement('button');
+    seamBtn.type = 'button';
+    const hasTr = junc.type && junc.type !== 'none';
+    seamBtn.className = `mf-trans-seam-btn ${hasTr ? 'has-trans' : ''}`;
+    seamBtn.style.left = `${junc.seamFrame * this.pxPerFrame}px`;
+    seamBtn.title = hasTr
+      ? `Transition (${junc.type}) between ${junc.left.name} & ${junc.right.name}`
+      : `Add transition between ${junc.left.name} & ${junc.right.name}`;
+    seamBtn.setAttribute('aria-label', seamBtn.title);
+    seamBtn.innerHTML = hasTr ? `<i class="bi bi-intersect"></i>` : `<i class="bi bi-plus-slash-minus"></i>`;
+    seamBtn.addEventListener('pointerdown', (e) => e.stopPropagation());
+    seamBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      this.cb.onOpenTransitionJunction?.(junc.leftId, junc.rightId);
+    });
+    lane.appendChild(seamBtn);
+    this._zoomRefs.seams.push({ el: seamBtn, frame: junc.seamFrame });
+  }
+
+  _appendMainTrackRow(project, mainClips, selectedLayerId, audioEngine, mediaMap, junctionByLeftId) {
+    const anySelected = mainClips.some((c) => c.id === selectedLayerId);
+    const rippleOn = project.settings?.rippleMode !== false;
+    const allHidden = mainClips.every((c) => !c.visible);
+    const allLocked = mainClips.every((c) => c.locked);
+
+    const hdr = document.createElement('div');
+    hdr.className = `mf-track-header-item main-track d-flex align-items-center justify-content-between ${anySelected ? 'selected' : ''}`;
+    hdr.innerHTML = `
+      <div class="d-flex align-items-center gap-1 min-w-0 flex-grow-1">
+        <i class="bi bi-film text-info small flex-shrink-0"></i>
+        <span class="mf-track-title text-info">Main</span>
+        <span class="badge bg-info bg-opacity-25 text-info px-1" style="font-size:0.58rem;">${mainClips.length}</span>
+      </div>
+      <div class="d-flex align-items-center flex-shrink-0">
+        <button class="mf-mini-btn ${rippleOn ? 'on' : ''}" data-act="ripple" title="Magnetic Main Track (${rippleOn ? 'ON' : 'OFF'})">
+          <i class="bi bi-link-45deg"></i>
+        </button>
+        <button class="mf-mini-btn ${!allHidden ? 'on' : ''}" data-act="main-vis" title="Toggle Main Track Visibility">
+          <i class="bi ${!allHidden ? 'bi-eye-fill' : 'bi-eye-slash'}"></i>
+        </button>
+        <button class="mf-mini-btn ${allLocked ? 'locked' : ''}" data-act="main-lock" title="Lock Main Track">
+          <i class="bi ${allLocked ? 'bi-lock-fill' : 'bi-unlock'}"></i>
+        </button>
+      </div>
+    `;
+
+    hdr.addEventListener('click', (e) => {
+      const btn = e.target.closest('button');
+      if (btn) {
+        e.stopPropagation();
+        const act = btn.dataset.act;
+        if (act === 'ripple') this.cb.onToggleRippleMode?.();
+        if (act === 'main-vis') this.cb.onToggleMainTrackProp?.('visible');
+        if (act === 'main-lock') this.cb.onToggleMainTrackProp?.('locked');
+        return;
+      }
+      if (mainClips.length > 0) {
+        const playF = this.cb.getPlayheadFrame();
+        const activeAtPlayhead = mainClips.find((c) => playF >= c.startFrame && playF <= c.endFrame);
+        this.cb.onSelectLayer((activeAtPlayhead || mainClips[0]).id);
+      }
+    });
+    this.headersList.appendChild(hdr);
+
+    const lane = document.createElement('div');
+    lane.className = `mf-track-lane main-track ${anySelected ? 'selected' : ''}`;
+    lane.dataset.laneType = 'main';
+
+    const dropMarker = document.createElement('div');
+    dropMarker.className = 'mf-reorder-indicator d-none';
+    lane.appendChild(dropMarker);
+
+    const clipRecords = [];
+    for (const clipLayer of mainClips) {
+      const isSelected = clipLayer.id === selectedLayerId;
+      const built = this._buildClipElement(project, clipLayer, isSelected, audioEngine, mediaMap);
+      clipRecords.push({ layer: clipLayer, ...built });
+      lane.appendChild(built.clip);
+    }
+
+    for (const rec of clipRecords) {
+      this.bindClipGestures(
+        rec.clip,
+        rec.leftTrim,
+        rec.rightTrim,
+        project,
+        rec.layer,
+        rec.waveEntry,
+        rec.filmEntry,
+        lane,
+        { dropMarker, clipRecords }
+      );
+      const junc = junctionByLeftId.get(rec.layer.id);
+      if (junc) {
+        this._appendSeamButton(lane, junc);
+      }
+    }
+
+    // Gap close pills when Magnetic Main Track is OFF and a gap >= 4f exists
+    if (!rippleOn && mainClips.length > 0) {
+      if (mainClips[0].startFrame >= 4) {
+        this._appendGapClosePill(lane, mainClips[0].startFrame * 0.5);
+      }
+      for (let i = 0; i < mainClips.length - 1; i++) {
+        const gap = mainClips[i + 1].startFrame - mainClips[i].endFrame;
+        if (gap >= 4) {
+          this._appendGapClosePill(lane, (mainClips[i].endFrame + mainClips[i + 1].startFrame) * 0.5);
+        }
+      }
+    }
+
+    // Trailing CapCut '+' Add Clip button at end of Main Track
+    const mainEndFrame = mainClips.length > 0 ? Math.max(...mainClips.map((c) => c.endFrame)) : 0;
+    const addBtn = document.createElement('button');
+    addBtn.type = 'button';
+    addBtn.className = 'mf-main-add-btn';
+    addBtn.style.left = `${mainEndFrame * this.pxPerFrame + 8}px`;
+    addBtn.title = 'Add Clip to Main Track';
+    addBtn.setAttribute('aria-label', 'Add Clip to Main Track');
+    addBtn.innerHTML = `<i class="bi bi-plus-lg"></i>`;
+    addBtn.addEventListener('pointerdown', (e) => e.stopPropagation());
+    addBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      this.cb.onQuickAddMainClip?.();
+    });
+    lane.appendChild(addBtn);
+    this._zoomRefs.addBtns.push({ el: addBtn, frame: mainEndFrame });
+
+    this.lanesList.appendChild(lane);
+  }
+
+  _appendGapClosePill(lane, centerFrame) {
+    const pill = document.createElement('button');
+    pill.type = 'button';
+    pill.className = 'mf-gap-pill';
+    pill.style.left = `${centerFrame * this.pxPerFrame}px`;
+    pill.textContent = 'Close Gap';
+    pill.title = 'Snap all Main Track clips tightly without gaps';
+    pill.addEventListener('pointerdown', (e) => e.stopPropagation());
+    pill.addEventListener('click', (e) => {
+      e.stopPropagation();
+      this.cb.onCloseMainGaps?.();
+    });
+    lane.appendChild(pill);
+    this._zoomRefs.gaps.push({ el: pill, frame: centerFrame });
+  }
+
   renderHeadersAndLanes(project, selectedLayerId, audioEngine, mediaMap = null) {
     this.headersList.innerHTML = '';
     this.lanesList.innerHTML = '';
+    this._zoomRefs = { clips: [], seams: [], gaps: [], addBtns: [] };
 
     if (project.layers.length === 0) {
       const empty = document.createElement('div');
       empty.className = 'text-secondary small p-3';
-      empty.textContent = 'Tap Media or Add below to insert clips or motion layers.';
+      empty.textContent = 'Tap Edit / Media below to add clips to your Main Track.';
       this.lanesList.appendChild(empty);
       return;
     }
@@ -477,201 +943,21 @@ export class TimelineView {
     const junctions = TimelineEngine.findTransitionJunctions(project);
     const junctionByLeftId = new Map(junctions.map((j) => [j.leftId, j]));
 
-    project.layers.forEach((layer, layerIndex) => {
-      const isSelected = layer.id === selectedLayerId;
-      const isChecked = this.checkedLayerIds.has(layer.id);
+    const mainClips = TimelineEngine.getMainTrackClips(project);
+    const nonMainOverlays = project.layers.filter((l) => l.trackRole !== 'main' && l.type !== 'audio');
+    const audioLayers = project.layers.filter((l) => l.trackRole !== 'main' && l.type === 'audio');
 
-      // Left Header Item
-      const hdr = document.createElement('div');
-      hdr.className = `mf-track-header-item d-flex align-items-center justify-content-between ${isSelected ? 'selected' : ''} ${layer.parentId ? 'child-layer' : ''}`;
-      hdr.dataset.index = String(layerIndex);
-      hdr.innerHTML = `
-        <div class="d-flex align-items-center gap-1 min-w-0 flex-grow-1">
-          <span class="mf-drag-handle" title="Drag to Reorder"><i class="bi bi-grip-vertical"></i></span>
-          ${layer.type !== 'group' ? `<input type="checkbox" class="form-check-input m-0 flex-shrink-0" style="width:12px;height:12px;" ${isChecked ? 'checked' : ''} aria-label="Select for Group" />` : ''}
-          <i class="bi ${LAYER_ICONS[layer.type] || 'bi-layers'} small flex-shrink-0"></i>
-          <span class="mf-track-title">${this.escapeHtml(layer.name)}</span>
-        </div>
-        <div class="d-flex align-items-center flex-shrink-0">
-          <button class="mf-mini-btn ${layer.visible ? 'on' : ''}" data-act="vis" title="Visibility">
-            <i class="bi ${layer.visible ? 'bi-eye-fill' : 'bi-eye-slash'}"></i>
-          </button>
-          <button class="mf-mini-btn ${layer.locked ? 'locked' : ''}" data-act="lock" title="Lock">
-            <i class="bi ${layer.locked ? 'bi-lock-fill' : 'bi-unlock'}"></i>
-          </button>
-        </div>
-      `;
+    for (const layer of nonMainOverlays) {
+      this._appendSingleLayerRow(project, layer, selectedLayerId, audioEngine, mediaMap, junctionByLeftId);
+    }
 
-      const cbEl = hdr.querySelector('input[type="checkbox"]');
-      if (cbEl) {
-        cbEl.addEventListener('click', (e) => {
-          e.stopPropagation();
-          if (cbEl.checked) this.checkedLayerIds.add(layer.id);
-          else this.checkedLayerIds.delete(layer.id);
-          this.btnGroupChecked?.classList.toggle('d-none', this.checkedLayerIds.size < 2);
-        });
-      }
+    if (mainClips.length > 0) {
+      this._appendMainTrackRow(project, mainClips, selectedLayerId, audioEngine, mediaMap, junctionByLeftId);
+    }
 
-      // Drag handle reorder vertically
-      const dragHandle = hdr.querySelector('.mf-drag-handle');
-      let draggingRow = false;
-      let startY = 0;
-      dragHandle.addEventListener('pointerdown', (e) => {
-        e.stopPropagation();
-        draggingRow = true;
-        startY = e.clientY;
-        dragHandle.setPointerCapture(e.pointerId);
-      });
-      dragHandle.addEventListener('pointermove', (e) => {
-        if (!draggingRow) return;
-        const deltaRows = Math.round((e.clientY - startY) / 44);
-        const targetIdx = Math.max(0, Math.min(project.layers.length - 1, layerIndex + deltaRows));
-        this.headersList.querySelectorAll('.mf-track-header-item').forEach((el, idx) => {
-          el.classList.toggle('drag-over', idx === targetIdx && idx !== layerIndex);
-        });
-      });
-      const finishReorder = (e) => {
-        if (!draggingRow) return;
-        draggingRow = false;
-        const deltaRows = Math.round((e.clientY - startY) / 44);
-        this.headersList.querySelectorAll('.mf-track-header-item').forEach((el) => el.classList.remove('drag-over'));
-        if (deltaRows !== 0) {
-          const targetIdx = Math.max(0, Math.min(project.layers.length - 1, layerIndex + deltaRows));
-          this.cb.onReorderLayerToIndex(layer.id, targetIdx);
-        }
-      };
-      dragHandle.addEventListener('pointerup', finishReorder);
-      dragHandle.addEventListener('pointercancel', finishReorder);
-
-      hdr.addEventListener('click', (e) => {
-        const btn = e.target.closest('button');
-        if (btn) {
-          e.stopPropagation();
-          const act = btn.dataset.act;
-          if (act === 'vis') this.cb.onToggleVisibility(layer.id);
-          if (act === 'lock') this.cb.onToggleLock(layer.id);
-          return;
-        }
-        this.cb.onSelectLayer(layer.id);
-      });
-      this.headersList.appendChild(hdr);
-
-      // Right Lane (empty lane tap bubbles to scrollEl to deselect active clip)
-      const lane = document.createElement('div');
-      lane.className = `mf-track-lane ${isSelected ? 'selected' : ''}`;
-
-      const leftPx = layer.startFrame * this.pxPerFrame;
-      const widthPx = Math.max(24, (layer.endFrame - layer.startFrame) * this.pxPerFrame);
-
-      const clip = document.createElement('div');
-      clip.className = `mf-clip mf-clip-${layer.type} ${isSelected ? 'selected' : ''}`;
-      clip.style.left = `${leftPx}px`;
-      clip.style.width = `${widthPx}px`;
-
-      let filmEntry = null;
-      if ((layer.type === 'video' || layer.type === 'image') && layer.mediaId && mediaMap) {
-        const mItem = mediaMap.get(layer.mediaId);
-        const tiles = mItem ? this._ensureFilmstripTile(mItem) : null;
-        if (tiles && tiles.length > 0) {
-          const fCanvas = document.createElement('canvas');
-          fCanvas.className = 'mf-clip-filmstrip';
-          clip.appendChild(fCanvas);
-          filmEntry = { canvas: fCanvas, tiles, leftPx, widthPx, renderedStart: -1, renderedEnd: -1 };
-          this._filmstripEntries.push(filmEntry);
-          this._paintFilmstripEntry(filmEntry, true);
-        }
-      }
-
-      let waveEntry = null;
-      if ((layer.type === 'audio' || layer.type === 'video') && layer.mediaId) {
-        const mItem = mediaMap?.get(layer.mediaId);
-        if (mItem && !audioEngine.hasBuffer?.(layer.mediaId) && !audioEngine.failedIds?.has(layer.mediaId)) {
-          audioEngine.loadBuffer(mItem).then((buf) => {
-            if (buf) this.cb.onPinchZoom?.();
-          });
-        }
-        const hasAudioOrVol = Boolean(
-          audioEngine.hasBuffer?.(layer.mediaId) ||
-          audioEngine.getPeaks(layer.mediaId)?.length ||
-          layer.keyframes?.volume?.length
-        );
-        if (hasAudioOrVol) {
-          const wCanvas = document.createElement('canvas');
-          wCanvas.className = 'mf-clip-wave';
-          clip.appendChild(wCanvas);
-          waveEntry = {
-            canvas: wCanvas,
-            layer,
-            project,
-            audioEngine,
-            leftPx,
-            widthPx,
-            renderedStart: -1,
-            renderedEnd: -1
-          };
-          this._waveEntries.push(waveEntry);
-          this._paintWaveEntry(waveEntry, true);
-        }
-      }
-
-      const label = document.createElement('span');
-      label.className = 'mf-clip-label';
-      const tags = [];
-      if (layer.speed && layer.speed !== 1) tags.push(`${layer.speed.toFixed(2)}x`);
-      if (layer.speedCurve && layer.speedCurve !== 'none') tags.push('⚡');
-      if (layer.reversed) tags.push('⇄');
-      if (layer.isFreezeFrame) tags.push('❄');
-      if (layer.trackData?.points?.length) tags.push('⊕');
-      const suffix = tags.length > 0 ? ` (${tags.join(' ')})` : '';
-      label.textContent = `${layer.name}${suffix}`;
-      clip.appendChild(label);
-
-      // Draggable Keyframe diamonds inside clip
-      const kfFrames = KeyframeEngine.getAllKeyframeFrames(layer);
-      kfFrames.forEach((kfFrame) => {
-        const relPx = (kfFrame - layer.startFrame) * this.pxPerFrame;
-        if (relPx >= 0 && relPx <= widthPx) {
-          const diamond = document.createElement('div');
-          diamond.className = 'mf-kf-diamond';
-          diamond.style.left = `${relPx}px`;
-          diamond.title = `Keyframe @ F${kfFrame} (Drag to move)`;
-          this.bindDiamondGesture(diamond, layer, kfFrame);
-          clip.appendChild(diamond);
-        }
-      });
-
-      const leftTrim = document.createElement('div');
-      leftTrim.className = 'mf-trim-handle left';
-      const rightTrim = document.createElement('div');
-      rightTrim.className = 'mf-trim-handle right';
-      clip.appendChild(leftTrim);
-      clip.appendChild(rightTrim);
-
-      this.bindClipGestures(clip, leftTrim, rightTrim, project, layer, waveEntry, filmEntry);
-      lane.appendChild(clip);
-
-      const junc = junctionByLeftId.get(layer.id);
-      if (junc) {
-        const seamBtn = document.createElement('button');
-        seamBtn.type = 'button';
-        const hasTr = junc.type && junc.type !== 'none';
-        seamBtn.className = `mf-trans-seam-btn ${hasTr ? 'has-trans' : ''}`;
-        seamBtn.style.left = `${junc.seamFrame * this.pxPerFrame}px`;
-        seamBtn.title = hasTr
-          ? `Transition (${junc.type}) between ${junc.left.name} & ${junc.right.name}`
-          : `Add transition between ${junc.left.name} & ${junc.right.name}`;
-        seamBtn.setAttribute('aria-label', seamBtn.title);
-        seamBtn.innerHTML = hasTr ? `<i class="bi bi-intersect"></i>` : `<i class="bi bi-plus-slash-minus"></i>`;
-        seamBtn.addEventListener('pointerdown', (e) => e.stopPropagation());
-        seamBtn.addEventListener('click', (e) => {
-          e.stopPropagation();
-          this.cb.onOpenTransitionJunction?.(junc.leftId, junc.rightId);
-        });
-        lane.appendChild(seamBtn);
-      }
-
-      this.lanesList.appendChild(lane);
-    });
+    for (const layer of audioLayers) {
+      this._appendSingleLayerRow(project, layer, selectedLayerId, audioEngine, mediaMap, junctionByLeftId);
+    }
   }
 
   bindDiamondGesture(diamond, layer, origFrame) {
@@ -717,27 +1003,103 @@ export class TimelineView {
     diamond.addEventListener('pointercancel', endDrag);
   }
 
-  bindClipGestures(clip, leftTrim, rightTrim, project, layer, waveEntry = null, filmEntry = null) {
+  bindClipGestures(clip, leftTrim, rightTrim, project, layer, waveEntry = null, filmEntry = null, laneEl = null, mainCtx = null) {
     let mode = null;
     let startX = 0;
+    let startY = 0;
+    let startScrollLeft = 0;
     let origStart = 0;
     let origEnd = 0;
     let origMediaOffset = 0;
     let origKeyframes = null;
+    let origMainSnapshot = null;
     let pushedUndo = false;
+    let pendingCenterFrame = null;
+    let pendingDrop = null;
+
+    const isMainMagnetic = Boolean(
+      mainCtx &&
+      layer.trackRole === 'main' &&
+      project.settings?.rippleMode !== false
+    );
+
+    const clearDropHighlights = () => {
+      this.lanesList.querySelectorAll('.mf-track-lane').forEach((ln) => {
+        ln.classList.remove('drop-target', 'main-drop-target');
+      });
+      this.lanesList.querySelector('.mf-track-lane.main-track .mf-reorder-indicator')?.classList.add('d-none');
+      clip.style.transform = '';
+      if (origMainSnapshot) {
+        for (const snap of origMainSnapshot) {
+          if (snap.clipEl !== clip) {
+            snap.clipEl.style.left = `${snap.layer.startFrame * this.pxPerFrame}px`;
+          }
+        }
+      }
+    };
+
+    const restoreOrigState = () => {
+      if (origMainSnapshot) {
+        for (const snap of origMainSnapshot) {
+          snap.layer.startFrame = snap.startFrame;
+          snap.layer.endFrame = snap.endFrame;
+          snap.layer.mediaOffsetFrames = snap.mediaOffsetFrames;
+          snap.layer.keyframes = JSON.parse(JSON.stringify(snap.keyframes));
+          snap.clipEl.style.left = `${snap.startFrame * this.pxPerFrame}px`;
+          snap.clipEl.style.width = `${Math.max(24, (snap.endFrame - snap.startFrame) * this.pxPerFrame)}px`;
+        }
+      } else {
+        layer.startFrame = origStart;
+        layer.endFrame = origEnd;
+        layer.mediaOffsetFrames = origMediaOffset;
+        layer.keyframes = JSON.parse(JSON.stringify(origKeyframes || {}));
+        clip.style.left = `${origStart * this.pxPerFrame}px`;
+        clip.style.width = `${Math.max(24, (origEnd - origStart) * this.pxPerFrame)}px`;
+      }
+      clip.classList.remove('mf-clip-dragging-reorder');
+      this.dragTooltipEl?.classList.add('d-none');
+      clearDropHighlights();
+      mode = null;
+    };
 
     const onDown = (e, hitMode) => {
       if (e.target.classList.contains('mf-kf-diamond')) return;
+      if (this._isPinching || this.activePointers.size >= 2) return;
       e.stopPropagation();
       this.cb.onSelectLayer(layer.id);
       if (layer.locked) return;
       mode = hitMode;
       startX = e.clientX;
+      startY = e.clientY;
+      startScrollLeft = this.scrollEl.scrollLeft;
       origStart = layer.startFrame;
       origEnd = layer.endFrame;
       origMediaOffset = layer.mediaOffsetFrames || 0;
       origKeyframes = JSON.parse(JSON.stringify(layer.keyframes || {}));
+      pendingCenterFrame = null;
+      pendingDrop = null;
+      if (mainCtx?.clipRecords) {
+        origMainSnapshot = mainCtx.clipRecords.map((r) => ({
+          layer: r.layer,
+          clipEl: r.clip,
+          startFrame: r.layer.startFrame,
+          endFrame: r.layer.endFrame,
+          mediaOffsetFrames: r.layer.mediaOffsetFrames || 0,
+          keyframes: JSON.parse(JSON.stringify(r.layer.keyframes || {}))
+        }));
+      } else {
+        origMainSnapshot = null;
+      }
       pushedUndo = false;
+      this._activeClipAbort = () => {
+        if (!pushedUndo && mode) {
+          restoreOrigState();
+        } else if (mode) {
+          mode = null;
+          clearDropHighlights();
+          this.dragTooltipEl?.classList.add('d-none');
+        }
+      };
       clip.setPointerCapture(e.pointerId);
     };
 
@@ -749,14 +1111,142 @@ export class TimelineView {
     });
 
     clip.addEventListener('pointermove', (e) => {
-      if (!mode) return;
-      const dx = e.clientX - startX;
-      if (Math.abs(dx) < 3 && !pushedUndo) return;
+      if (!mode || this._isPinching || this.activePointers.size >= 2) return;
+
+      // Auto-scroll horizontally near viewport edges so users can extend/drag items freely past screen edge
+      const sRect = this.scrollEl.getBoundingClientRect();
+      if (e.clientX > sRect.right - 26) {
+        const curW = parseFloat(this.contentEl.style.width || '0') || this.contentEl.clientWidth;
+        const neededW = this.scrollEl.scrollLeft + sRect.width + 180;
+        if (neededW > curW) this.contentEl.style.width = `${Math.ceil(neededW)}px`;
+        this.scrollEl.scrollLeft += Math.min(22, (e.clientX - (sRect.right - 26)) * 0.45);
+      } else if (e.clientX < sRect.left + 26 && this.scrollEl.scrollLeft > 0) {
+        this.scrollEl.scrollLeft = Math.max(0, this.scrollEl.scrollLeft - Math.min(22, ((sRect.left + 26) - e.clientX) * 0.45));
+      }
+
+      const scrollDx = this.scrollEl.scrollLeft - startScrollLeft;
+      const dx = (e.clientX - startX) + scrollDx;
+      const dy = e.clientY - startY;
+      if (Math.hypot(dx, dy) < 3 && !pushedUndo) return;
       if (!pushedUndo) {
         this.cb.onPushUndo();
         pushedUndo = true;
       }
       const deltaFrames = Math.round(dx / this.pxPerFrame);
+
+      // 2D Drag & Drop target detection across lanes when moving vertically >= 24px
+      let hoveredLane = null;
+      if (mode === 'move' && Math.abs(dy) >= 24) {
+        const lanes = [...this.lanesList.querySelectorAll('.mf-track-lane')];
+        for (const ln of lanes) {
+          const r = ln.getBoundingClientRect();
+          if (e.clientY >= r.top && e.clientY <= r.bottom) {
+            hoveredLane = ln;
+            break;
+          }
+        }
+      }
+
+      // Case 1: Visual Overlay dragged vertically onto Main Track
+      if (mode === 'move' && layer.trackRole !== 'main' && (layer.type === 'video' || layer.type === 'image') && hoveredLane?.dataset?.laneType === 'main') {
+        clearDropHighlights();
+        hoveredLane.classList.add('main-drop-target');
+        const len = Math.max(5, origEnd - origStart);
+        const dragStart = Math.max(0, origStart + deltaFrames);
+        const centerFrame = dragStart + len * 0.5;
+        const others = TimelineEngine.getMainTrackClips(project).filter((c) => c.id !== layer.id);
+        const targetSlot = TimelineEngine.computeMainTrackTargetSlot(project, layer.id, centerFrame);
+        let seamFrame = 0;
+        if (others.length > 0) {
+          if (targetSlot === 0) seamFrame = others[0].startFrame;
+          else if (targetSlot >= others.length) seamFrame = others[others.length - 1].endFrame;
+          else seamFrame = others[targetSlot].startFrame;
+        }
+        const mainDropMarker = hoveredLane.querySelector('.mf-reorder-indicator');
+        if (mainDropMarker) {
+          mainDropMarker.style.left = `${seamFrame * this.pxPerFrame}px`;
+          mainDropMarker.classList.remove('d-none');
+        }
+        clip.classList.add('mf-clip-dragging-reorder');
+        clip.style.left = `${dragStart * this.pxPerFrame}px`;
+        clip.style.transform = `translateY(${dy}px) scale(1.03)`;
+        pendingDrop = { targetRole: 'main', targetStartFrame: dragStart, dragCenterFrame: centerFrame };
+        if (this.dragTooltipEl) {
+          this.dragTooltipEl.textContent = `Drop onto Main Track · Slot #${targetSlot + 1}`;
+          this.dragTooltipEl.classList.remove('d-none');
+        }
+        return;
+      }
+
+      // Case 2: Main Track clip dragged vertically off Main Track into Overlay zone
+      if (mode === 'move' && layer.trackRole === 'main' && Math.abs(dy) >= 26 && (!hoveredLane || hoveredLane.dataset.laneType !== 'main')) {
+        const mainRect = laneEl?.getBoundingClientRect();
+        if (mainRect && (e.clientY < mainRect.top - 10 || e.clientY > mainRect.bottom + 10)) {
+          clearDropHighlights();
+          if (hoveredLane) hoveredLane.classList.add('drop-target');
+          const dragStart = Math.max(0, origStart + deltaFrames);
+          clip.classList.add('mf-clip-dragging-reorder');
+          clip.style.left = `${dragStart * this.pxPerFrame}px`;
+          clip.style.transform = `translateY(${dy}px) scale(1.03)`;
+          const tgtIdx = hoveredLane?.dataset?.layerIndex ? Number(hoveredLane.dataset.layerIndex) : null;
+          pendingDrop = { targetRole: 'overlay', targetLayerIndex: Number.isInteger(tgtIdx) ? tgtIdx : null, targetStartFrame: dragStart };
+          if (this.dragTooltipEl) {
+            const fps = Math.max(1, project.fps || 30);
+            this.dragTooltipEl.textContent = `Drop as Overlay @ ${(dragStart / fps).toFixed(2)}s`;
+            this.dragTooltipEl.classList.remove('d-none');
+          }
+          return;
+        }
+      }
+
+      // Case 3: CapCut Main Track Horizontal Drag-to-Reorder with live sibling preview slide
+      if (mode === 'move' && isMainMagnetic) {
+        pendingDrop = null;
+        this.lanesList.querySelectorAll('.mf-track-lane').forEach((ln) => ln.classList.remove('drop-target', 'main-drop-target'));
+        clip.style.transform = '';
+        const len = Math.max(5, origEnd - origStart);
+        const dragStart = Math.max(0, origStart + deltaFrames);
+        const centerFrame = dragStart + len * 0.5;
+        pendingCenterFrame = centerFrame;
+        clip.classList.add('mf-clip-dragging-reorder');
+        clip.style.left = `${dragStart * this.pxPerFrame}px`;
+
+        const others = TimelineEngine.getMainTrackClips(project).filter((c) => c.id !== layer.id);
+        const targetSlot = TimelineEngine.computeMainTrackTargetSlot(project, layer.id, centerFrame);
+        let seamFrame = 0;
+        if (others.length > 0) {
+          if (targetSlot === 0) seamFrame = others[0].startFrame;
+          else if (targetSlot >= others.length) seamFrame = others[others.length - 1].endFrame;
+          else seamFrame = others[targetSlot].startFrame;
+        }
+        // Live visual preview of Main Track sibling order
+        let cursorF = 0;
+        for (let i = 0; i <= others.length; i++) {
+          if (i === targetSlot) {
+            seamFrame = cursorF;
+            cursorF += len;
+          }
+          if (i < others.length) {
+            const sib = others[i];
+            const sibRec = origMainSnapshot?.find((s) => s.layer.id === sib.id);
+            if (sibRec) sibRec.clipEl.style.left = `${cursorF * this.pxPerFrame}px`;
+            cursorF += Math.max(5, sib.endFrame - sib.startFrame);
+          }
+        }
+        if (mainCtx?.dropMarker) {
+          mainCtx.dropMarker.style.left = `${seamFrame * this.pxPerFrame}px`;
+          mainCtx.dropMarker.classList.remove('d-none');
+        }
+        if (this.dragTooltipEl) {
+          this.dragTooltipEl.textContent = `Move to Slot #${targetSlot + 1} · Release to reorder`;
+          this.dragTooltipEl.classList.remove('d-none');
+        }
+        return;
+      }
+
+      // Case 4: Standard Move (plus optional vertical row drop across single lanes) or Left/Right Trim/Extend
+      clearDropHighlights();
+      pendingDrop = null;
 
       if (mode === 'move') {
         layer.startFrame = origStart;
@@ -769,34 +1259,55 @@ export class TimelineView {
           Boolean(project.settings?.snapToTimeline),
           this.cb.getPlayheadFrame()
         );
-      } else if (mode === 'left') {
-        layer.startFrame = origStart;
-        layer.endFrame = origEnd;
-        layer.mediaOffsetFrames = origMediaOffset;
-        TimelineEngine.trimClip(
+
+        if (hoveredLane && hoveredLane !== laneEl && hoveredLane.dataset.laneType === 'single' && layer.type !== 'audio') {
+          const targetIdx = Number(hoveredLane.dataset.layerIndex);
+          if (Number.isInteger(targetIdx)) {
+            hoveredLane.classList.add('drop-target');
+            clip.classList.add('mf-clip-dragging-reorder');
+            clip.style.transform = `translateY(${dy}px) scale(1.03)`;
+            pendingDrop = { targetLayerIndex: targetIdx, targetStartFrame: layer.startFrame };
+          }
+        }
+      } else if (mode === 'left' || mode === 'right') {
+        if (origMainSnapshot) {
+          for (const snap of origMainSnapshot) {
+            snap.layer.startFrame = snap.startFrame;
+            snap.layer.endFrame = snap.endFrame;
+            snap.layer.mediaOffsetFrames = snap.mediaOffsetFrames;
+            snap.layer.keyframes = JSON.parse(JSON.stringify(snap.keyframes));
+          }
+        } else {
+          layer.startFrame = origStart;
+          layer.endFrame = origEnd;
+          layer.mediaOffsetFrames = origMediaOffset;
+        }
+        const targetFrame = (mode === 'left' ? origStart : origEnd) + deltaFrames;
+        TimelineEngine.trimMainOrClip(
           project,
           layer.id,
-          'left',
-          origStart + deltaFrames,
+          mode,
+          targetFrame,
           Boolean(project.settings?.snapToTimeline),
           this.cb.getPlayheadFrame()
         );
-      } else if (mode === 'right') {
-        layer.startFrame = origStart;
-        layer.endFrame = origEnd;
-        layer.mediaOffsetFrames = origMediaOffset;
-        TimelineEngine.trimClip(
-          project,
-          layer.id,
-          'right',
-          origEnd + deltaFrames,
-          Boolean(project.settings?.snapToTimeline),
-          this.cb.getPlayheadFrame()
-        );
+
+        if (origMainSnapshot) {
+          for (const snap of origMainSnapshot) {
+            const sLeft = snap.layer.startFrame * this.pxPerFrame;
+            const sWidth = Math.max(24, (snap.layer.endFrame - snap.layer.startFrame) * this.pxPerFrame);
+            snap.clipEl.style.left = `${sLeft}px`;
+            snap.clipEl.style.width = `${sWidth}px`;
+          }
+        }
       }
 
       const nextLeftPx = layer.startFrame * this.pxPerFrame;
       const nextWidthPx = Math.max(24, (layer.endFrame - layer.startFrame) * this.pxPerFrame);
+      const curContentW = parseFloat(this.contentEl.style.width || '0') || 0;
+      if (nextLeftPx + nextWidthPx + 140 > curContentW) {
+        this.contentEl.style.width = `${Math.ceil(nextLeftPx + nextWidthPx + 180)}px`;
+      }
       clip.style.left = `${nextLeftPx}px`;
       clip.style.width = `${nextWidthPx}px`;
 
@@ -819,14 +1330,49 @@ export class TimelineView {
         const offsetInfo = mode === 'left'
           ? ` · Offset ${((layer.mediaOffsetFrames || 0) / fps).toFixed(2)}s`
           : '';
-        this.dragTooltipEl.textContent = `${startS}s → ${(layer.endFrame / fps).toFixed(2)}s · Dur ${durS}s (${durF}f)${offsetInfo}`;
+        const dropLabel = pendingDrop ? ' · Drop to Reorder Track' : '';
+        this.dragTooltipEl.textContent = `${startS}s → ${(layer.endFrame / fps).toFixed(2)}s · Dur ${durS}s (${durF}f)${offsetInfo}${dropLabel}`;
         this.dragTooltipEl.classList.remove('d-none');
       }
       this.cb.onPreviewRefresh();
     });
 
     const onEnd = () => {
+      this._activeClipAbort = null;
       this.dragTooltipEl?.classList.add('d-none');
+      clip.classList.remove('mf-clip-dragging-reorder');
+      clearDropHighlights();
+
+      if (mode === 'move' && pendingDrop && pushedUndo) {
+        const d = pendingDrop;
+        pendingDrop = null;
+        mode = null;
+        if (origMainSnapshot) {
+          for (const snap of origMainSnapshot) {
+            snap.layer.startFrame = snap.startFrame;
+            snap.layer.endFrame = snap.endFrame;
+            snap.layer.mediaOffsetFrames = snap.mediaOffsetFrames;
+            snap.layer.keyframes = JSON.parse(JSON.stringify(snap.keyframes));
+          }
+        }
+        this.cb.onDropClipInTimeline?.(layer.id, d);
+        return;
+      }
+
+      if (mode === 'move' && isMainMagnetic && pushedUndo) {
+        if (pendingCenterFrame !== null) {
+          const moved = TimelineEngine.reorderMainTrackClipByFrame(project, layer.id, pendingCenterFrame);
+          if (moved) {
+            this.cb.onCommitTimelineChange();
+            mode = null;
+            return;
+          }
+        }
+        this.cb.onPinchZoom?.();
+        mode = null;
+        return;
+      }
+
       if (mode && pushedUndo) {
         this.cb.onCommitTimelineChange();
       }
