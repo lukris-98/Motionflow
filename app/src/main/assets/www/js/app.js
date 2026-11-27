@@ -451,11 +451,16 @@ class MotionFlowApp {
     this.onTimelineMutated();
   }
 
+  getPlayheadMaxFrame() {
+    return TimelineEngine.getPlayheadMaxFrame(this.project);
+  }
+
   onTimelineMutated() {
     TimelineEngine.normalizeTrackZOrder(this.project);
     if (this.project?.settings?.rippleMode !== false && this.project?.layers?.some((l) => l.trackRole === 'main')) {
       TimelineEngine.reflowMainTrack(this.project, 0);
     }
+    this.currentFrame = Math.max(0, Math.min(this.getPlayheadMaxFrame(), Math.round(this.currentFrame || 0)));
     this.scheduleAutosave();
     this.updateAllUI();
   }
@@ -836,8 +841,9 @@ class MotionFlowApp {
 
   updateTransportLabels() {
     const tc = formatTimecode(this.currentFrame, this.project.fps);
+    const maxPlayheadFrame = this.getPlayheadMaxFrame();
     document.getElementById('lblTimecode').textContent = tc;
-    document.getElementById('lblFrameCounter').textContent = `F ${this.currentFrame} / ${this.project.durationFrames}`;
+    document.getElementById('lblFrameCounter').textContent = `F ${this.currentFrame} / ${maxPlayheadFrame}`;
     const fvTime = document.getElementById('lblFullviewTime');
     if (fvTime) fvTime.textContent = tc;
     const fvIcon = document.getElementById('iconFullviewPlayPause');
@@ -1031,7 +1037,8 @@ class MotionFlowApp {
   async seekToFrame(frame) {
     this.stopTemplateLivePreview({ skipRender: true });
     const token = (this._seekVersion = (this._seekVersion || 0) + 1);
-    const clamped = Math.max(0, Math.min(this.project.durationFrames, Math.round(frame)));
+    const maxF = this.getPlayheadMaxFrame();
+    const clamped = Math.max(0, Math.min(maxF, Math.round(frame)));
     if ((this._pending3DLayerPose && this._pending3DLayerPose.frame !== clamped) ||
         (this._pending3DCamPose && this._pending3DCamPose.frame !== clamped)) {
       this.clearPending3DPose(false);
@@ -1059,7 +1066,7 @@ class MotionFlowApp {
     if (this.isPlaying) {
       this.pause();
     }
-    const maxF = Math.max(0, this.project?.durationFrames || 0);
+    const maxF = this.getPlayheadMaxFrame();
     const clamped = Math.max(0, Math.min(maxF, Math.round(frame)));
     if (clamped === this.currentFrame) return;
 
@@ -1096,6 +1103,14 @@ class MotionFlowApp {
     const absRate = Math.max(1, Math.min(4, Math.abs(Number(rate) || 1)));
     const dir = Number(rate) < 0 ? -1 : 1;
     this.shuttleRate = dir * absRate;
+    const maxPlayheadFrame = this.getPlayheadMaxFrame();
+    if (maxPlayheadFrame <= 0) {
+      this.currentFrame = 0;
+      this.timelineView.updatePlayhead(0);
+      this.updateTransportLabels();
+      this.showToast('Tambahkan item ke timeline terlebih dahulu');
+      return;
+    }
     if (this.isPlaying) {
       if (this.shuttleRate !== 1) this.audioEngine.stopAll();
       this.renderer.syncVideoPlayback(this.project, this.currentFrame, this.mediaMap, true, this.shuttleRate);
@@ -1103,10 +1118,10 @@ class MotionFlowApp {
     }
     this.stopTemplateLivePreview({ skipRender: true });
     this.clearPending3DPose(false);
-    if (dir > 0 && this.currentFrame >= this.project.durationFrames) {
+    if (dir > 0 && this.currentFrame >= maxPlayheadFrame) {
       this.currentFrame = 0;
     } else if (dir < 0 && this.currentFrame <= 0) {
-      this.currentFrame = this.project.durationFrames;
+      this.currentFrame = maxPlayheadFrame;
     }
     this.isPlaying = true;
     const token = ++this.playToken;
@@ -1139,7 +1154,16 @@ class MotionFlowApp {
           const advance = Math.floor(elapsed / frameIntervalMs) * this.shuttleRate;
           this.lastTickMs = now - (elapsed % frameIntervalMs);
           this.currentFrame += advance;
-          if (this.currentFrame >= this.project.durationFrames) {
+          const loopMaxF = this.getPlayheadMaxFrame();
+          if (loopMaxF <= 0) {
+            this.currentFrame = 0;
+            this.pause();
+            this.timelineView.updatePlayhead(0);
+            this.updateTransportLabels();
+            this.renderPreview();
+            return;
+          }
+          if (this.currentFrame >= loopMaxF) {
             this.currentFrame = 0;
             if (this.shuttleRate === 1) {
               this.audioEngine.startPlayback(this.project, 0, this.mediaMap);
@@ -1800,7 +1824,7 @@ class MotionFlowApp {
       );
     }
     this.selectedLayerId = res.selectedId;
-    const nextFrame = Math.max(0, Math.min(this.project.durationFrames, res.playheadFrame));
+    const nextFrame = Math.max(0, Math.min(this.getPlayheadMaxFrame(), res.playheadFrame));
     this.currentFrame = nextFrame;
     this.onTimelineMutated();
     this.seekToFrame(nextFrame);
@@ -2993,8 +3017,10 @@ class MotionFlowApp {
     container.appendChild(backBtn);
 
     const commonTransform = ['bi-bounding-box', 'Transform', () => this.openSheet('sheetInspector')];
-    const commonAnim = ['bi-diamond-half text-info', 'Anim', () => this.openSheet('sheetKeyframes')];
-    const commonTransition = ['bi-intersect text-info', 'Transition', () => this.openTransitionsSheet({ layerId: layer.id })];
+    const clipItemAnim = ['bi-film text-info', 'Anim Item', () => this.openSheet('sheetKeyframes')];
+    const textItemAnim = ['bi-type text-primary', 'Anim Teks', () => this.openSheet('sheetKeyframes')];
+    const commonAnim = ['bi-diamond-half text-info', 'Animasi', () => this.openSheet('sheetKeyframes')];
+    const clipTransition = ['bi-intersect text-info', 'Transisi', () => this.openTransitionsSheet({ layerId: layer.id })];
     const commonSplit = ['bi-scissors', 'Split', () => this.splitSelectedAtPlayhead()];
     const commonDelLeft = ['bi-arrow-bar-left text-warning', 'Del Left', () => this.deleteSplitSideAtPlayhead('left')];
     const commonDelRight = ['bi-arrow-bar-right text-warning', 'Del Right', () => this.deleteSplitSideAtPlayhead('right')];
@@ -3025,8 +3051,8 @@ class MotionFlowApp {
         commonDelRight,
         ['bi-speedometer2 text-info', 'Speed', () => this.openSheet('sheetEdit')],
         ['bi-volume-up', 'Volume/FX', () => this.openSheet('sheetEdit')],
-        commonAnim,
-        commonTransition,
+        clipItemAnim,
+        clipTransition,
         trackToggleBtn,
         ...reorderBtns,
         ['bi-stars text-info', 'Effects', () => this.openSheet('sheetEffects')],
@@ -3039,7 +3065,7 @@ class MotionFlowApp {
         ['bi-camera-reels text-info', 'Stabilize', () => this.openStabilizerUI(layer.id)],
         ['bi-snow text-info', 'Freeze', () => this.freezeSelectedFrame()],
         ['bi-crosshair text-warning', 'Track 3D', () => this.openTrackerUI(layer.id)],
-        ['bi-circle-half', 'Mask/Tr', () => this.openSheet('sheetMask')],
+        ['bi-circle-half', 'Mask/Crop', () => this.openSheet('sheetMask')],
         commonTransform,
         commonCopyStyle,
         ...(commonPasteStyle ? [commonPasteStyle] : []),
@@ -3058,8 +3084,8 @@ class MotionFlowApp {
         commonSplit,
         commonDelLeft,
         commonDelRight,
-        commonAnim,
-        commonTransition,
+        clipItemAnim,
+        clipTransition,
         trackToggleBtn,
         ...reorderBtns,
         ['bi-stars text-info', 'Effects', () => this.openSheet('sheetEffects')],
@@ -3070,7 +3096,7 @@ class MotionFlowApp {
         ['bi-pip text-info', 'PIP/Split', () => this.openSheet('sheetMask')],
         ['bi-crop text-warning', 'Crop/Rot', () => this.openSheet('sheetMask')],
         ['bi-snow text-info', 'Freeze', () => this.freezeSelectedFrame()],
-        ['bi-circle-half', 'Mask/Tr', () => this.openSheet('sheetMask')],
+        ['bi-circle-half', 'Mask/Crop', () => this.openSheet('sheetMask')],
         commonTransform,
         commonCopyStyle,
         ...(commonPasteStyle ? [commonPasteStyle] : []),
@@ -3083,18 +3109,17 @@ class MotionFlowApp {
       ctxItems = [
         ['bi-pencil-square text-info', 'Edit Text', () => this.openSheet('sheetEdit', null, 'edit')],
         ['bi-card-heading text-warning', 'Templates', () => this.openSheet('sheetEdit', null, 'templates')],
+        textItemAnim,
         ['bi-megaphone text-info', 'TTS/Caps', () => this.openSheet('sheetEdit', null, 'voice')],
         commonSplit,
         commonDelLeft,
         commonDelRight,
         ['bi-chat-square-text', 'Bubble', () => this.openSheet('sheetEdit', null, 'bubble')],
-        commonAnim,
-        commonTransition,
         ['bi-stars text-info', 'Effects', () => this.openSheet('sheetEffects')],
         ['bi-crosshair text-warning', 'Track 3D', () => this.openTrackerUI()],
         commonTransform,
         ['bi-sliders2', 'Adjust/FX', () => this.openSheet('sheetAdjust', null, 'adjust')],
-        ['bi-circle-half', 'Mask/Tr', () => this.openSheet('sheetMask')],
+        ['bi-circle-half', 'Mask/Crop', () => this.openSheet('sheetMask')],
         commonDup,
         commonDel
       ];
@@ -3105,12 +3130,11 @@ class MotionFlowApp {
         commonDelRight,
         ['bi-palette2 text-warning', 'Style', () => this.openSheet('sheetEdit')],
         commonAnim,
-        commonTransition,
         ['bi-stars text-info', 'Effects', () => this.openSheet('sheetEffects')],
         ['bi-crosshair text-warning', 'Track 3D', () => this.openTrackerUI()],
         commonTransform,
         ['bi-sliders2', 'Adjust/FX', () => this.openSheet('sheetAdjust', null, 'adjust')],
-        ['bi-circle-half', 'Mask/Tr', () => this.openSheet('sheetMask')],
+        ['bi-circle-half', 'Mask/Crop', () => this.openSheet('sheetMask')],
         commonDup,
         commonDel
       ];
@@ -3142,7 +3166,7 @@ class MotionFlowApp {
         ['bi-stars text-info', 'Effects', () => this.openSheet('sheetEffects')],
         ['bi-palette-fill text-success', 'Filters', () => this.openSheet('sheetFilters')],
         ['bi-sliders2 text-warning', 'Adjust/HSL', () => this.openSheet('sheetAdjust', null, 'adjust')],
-        ['bi-circle-half', 'Mask/Tr', () => this.openSheet('sheetMask')],
+        ['bi-circle-half', 'Mask/Crop', () => this.openSheet('sheetMask')],
         commonAnim,
         commonTransform,
         commonCopyStyle,
@@ -4350,7 +4374,7 @@ class MotionFlowApp {
       if (prev) {
         this.clearPending3DPose(false);
         this.project = prev;
-        this.currentFrame = Math.min(this.currentFrame, this.project.durationFrames);
+        this.currentFrame = Math.min(this.currentFrame, this.getPlayheadMaxFrame());
         if (this.selectedLayerId && !this.project.layers.some((l) => l.id === this.selectedLayerId)) {
           this.selectedLayerId = this.project.layers[0]?.id || null;
         }
@@ -4364,7 +4388,7 @@ class MotionFlowApp {
       if (next) {
         this.clearPending3DPose(false);
         this.project = next;
-        this.currentFrame = Math.min(this.currentFrame, this.project.durationFrames);
+        this.currentFrame = Math.min(this.currentFrame, this.getPlayheadMaxFrame());
         if (this.selectedLayerId && !this.project.layers.some((l) => l.id === this.selectedLayerId)) {
           this.selectedLayerId = this.project.layers[0]?.id || null;
         }
@@ -4435,7 +4459,7 @@ class MotionFlowApp {
         if (rippleMode) {
           TimelineEngine.reflowMainTrack(this.project, 0);
         }
-        this.currentFrame = Math.min(this.currentFrame, this.project.durationFrames);
+        this.currentFrame = Math.min(this.currentFrame, this.getPlayheadMaxFrame());
       });
       bootstrap.Modal.getInstance(modalSettingsEl)?.hide();
     };
@@ -4534,7 +4558,7 @@ class MotionFlowApp {
         this.seekToFrame(0);
       } else if (key === 'end') {
         e.preventDefault();
-        this.seekToFrame(this.project.durationFrames);
+        this.seekToFrame(this.getPlayheadMaxFrame());
       } else if (key === 'm') {
         e.preventDefault();
         this.toggleMarkerAtPlayhead();

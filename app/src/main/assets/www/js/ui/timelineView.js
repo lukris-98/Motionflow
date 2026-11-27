@@ -16,8 +16,12 @@ const LAYER_ICONS = {
   camera: 'bi-camera-video-fill text-info'
 };
 
-export function computeCenterPadLeft(viewportWidth) {
-  return Math.max(0, Math.round((Number(viewportWidth) || 0) * 0.5));
+export const TIMELINE_LEFT_PAD = 12;
+
+export function computeCenterPadLeft(viewportWidth = TIMELINE_LEFT_PAD) {
+  const w = Number(viewportWidth);
+  if (!Number.isFinite(w) || w <= 0) return TIMELINE_LEFT_PAD;
+  return Math.min(TIMELINE_LEFT_PAD, Math.max(0, Math.round(w)));
 }
 
 export function frameToTimelineX(frame, pxPerFrame, padLeft = 0) {
@@ -282,6 +286,75 @@ export function computeEdgeAutoScrollDelta(
   return 0;
 }
 
+export function shouldActivateClipHold({
+  mode = 'move',
+  pointerType = 'touch',
+  wasSelected = false,
+  distPx = 0,
+  dx = 0,
+  elapsedMs = 0
+} = {}) {
+  if (mode === 'left' || mode === 'right') {
+    return elapsedMs >= 110 || Math.abs(dx) >= 4;
+  }
+  if (mode === 'move') {
+    if (pointerType !== 'touch') {
+      return elapsedMs >= 110 || distPx >= 4;
+    }
+    if (wasSelected) {
+      return elapsedMs >= 110 || distPx >= 6;
+    }
+    return elapsedMs >= 140 || distPx >= 10;
+  }
+  return false;
+}
+
+export function computeRulerWindow({
+  totalWidth = 360,
+  viewportW = 360,
+  scrollLeft = 0,
+  dpr = 1,
+  currentStart = 0,
+  currentWidth = 0
+} = {}) {
+  const safeDpr = Math.max(1, Math.min(2, Number(dpr) || 1));
+  const safeViewportW = Math.max(200, Math.ceil(Number(viewportW) || 360));
+  const safeTotalW = Math.max(safeViewportW, Math.ceil(Number(totalWidth) || safeViewportW));
+  const safeScroll = Math.max(0, Number(scrollLeft) || 0);
+  const maxCssW = Math.max(safeViewportW + 320, Math.floor(3840 / safeDpr));
+
+  if (safeTotalW <= maxCssW) {
+    return {
+      windowStart: 0,
+      windowWidth: safeTotalW,
+      needsRedraw: currentStart !== 0 || currentWidth !== safeTotalW
+    };
+  }
+
+  const windowWidth = Math.min(safeTotalW, maxCssW);
+  const curEnd = currentStart + currentWidth;
+  if (currentWidth === windowWidth && currentStart >= 0 && curEnd <= safeTotalW) {
+    const margin = Math.min(240, Math.round(safeViewportW * 0.4));
+    const leftOk = currentStart === 0 || safeScroll >= currentStart + margin;
+    const rightOk = curEnd >= safeTotalW || (safeScroll + safeViewportW) <= (curEnd - margin);
+    if (leftOk && rightOk) {
+      return {
+        windowStart: currentStart,
+        windowWidth,
+        needsRedraw: false
+      };
+    }
+  }
+
+  const idealStart = Math.round((safeScroll + safeViewportW * 0.5) - windowWidth * 0.5);
+  const windowStart = Math.max(0, Math.min(safeTotalW - windowWidth, idealStart));
+  return {
+    windowStart,
+    windowWidth,
+    needsRedraw: true
+  };
+}
+
 export class TimelineView {
   constructor(callbacks) {
     this.cb = callbacks;
@@ -289,10 +362,12 @@ export class TimelineView {
     this.scrollEl = document.getElementById('timelineScroll');
     this.viewportEl = document.getElementById('timelineViewport');
     this.contentEl = document.getElementById('timelineContent');
+    this.rulerTrackEl = document.getElementById('rulerTrack');
     this.rulerCanvas = document.getElementById('rulerCanvas');
     this.headersList = document.getElementById('trackHeadersList');
     this.lanesList = document.getElementById('trackLanesList');
     this.playheadEl = document.getElementById('playheadLine');
+    this.playheadHeadEl = this.playheadEl?.querySelector('.mf-playhead-head') || this.playheadEl;
     this.snapGuideEl = document.getElementById('timelineSnapGuide');
     this.snapGuideTagEl = this.snapGuideEl?.querySelector('.mf-snap-guide-tag') || null;
     this.layerCountEl = document.getElementById('lblLayerCount');
@@ -312,14 +387,19 @@ export class TimelineView {
     this.pinchTargetPx = this.pxPerFrame;
     this.pinchPivotFrame = 0;
     this.pinchPivotScreenX = 0;
+    this._currentFrame = 0;
     this._suppressBgTapUntil = 0;
     this._suppressScrollSeekUntil = 0;
     this._pendingScrollLeft = null;
-    this._padLeft = computeCenterPadLeft(this.scrollEl?.clientWidth || this.viewportEl?.clientWidth || 360);
+    this._padLeft = TIMELINE_LEFT_PAD;
     this._lastRulerParams = null;
     this._lastTimelineMarkers = [];
     this._lastBeatMarkers = [];
     this._lastDrawnScrollLeft = -1;
+    this._rulerWindowStart = 0;
+    this._rulerWindowWidth = 0;
+    this._rulerContentWidth = 0;
+    this._lastClipSliceScrollLeft = -9999;
     this.isScrubbing = false;
     this.filmstripCache = new Map(); // mediaId -> HTMLCanvasElement[] | 'loading'
     this._filmstripQueue = [];
@@ -328,6 +408,9 @@ export class TimelineView {
     this._filmstripEntries = [];
     this._lastRenderContext = null;
     this._isPinching = false;
+    this._isClipGestureActive = false;
+    this._isClipHoldLocked = false;
+    this._deferredRenderArgs = null;
     this._zoomRafId = null;
     this._pinchEndTimer = null;
     this._activeClipAbort = null;
@@ -347,21 +430,23 @@ export class TimelineView {
   }
 
   _getPadLeft() {
-    const w = this.scrollEl?.clientWidth || this.viewportEl?.clientWidth || 360;
-    this._padLeft = computeCenterPadLeft(w);
+    this._padLeft = computeCenterPadLeft(this.scrollEl?.clientWidth || this.viewportEl?.clientWidth || TIMELINE_LEFT_PAD);
     return this._padLeft;
   }
 
-  _syncPlayheadOverlayPosition() {
+  _syncPlayheadOverlayPosition(frame = this._currentFrame) {
     const padLeft = this._getPadLeft();
+    const f = Number.isFinite(Number(frame)) ? Number(frame) : (this._currentFrame || 0);
+    const phX = frameToTimelineX(f, this.pxPerFrame, padLeft);
     if (this.playheadEl) {
-      this.playheadEl.style.left = `${padLeft}px`;
+      this.playheadEl.style.left = `${phX}px`;
+      this.playheadEl.style.visibility = 'visible';
     }
     return padLeft;
   }
 
   _computeTimelineContentWidth(totalFrames, pxPerFrame, viewportW, padLeft) {
-    const trailPad = Math.max(120, (viewportW - padLeft) + 24);
+    const trailPad = Math.max(160, Math.round(viewportW * 0.4));
     return Math.max(viewportW, Math.ceil(padLeft + totalFrames * pxPerFrame + trailPad));
   }
 
@@ -617,7 +702,7 @@ export class TimelineView {
     const oldPx = Math.max(MIN_PX_PER_FRAME, this.pxPerFrame);
     const clamped = Math.max(MIN_PX_PER_FRAME, Math.min(MAX_PX_PER_FRAME, Number(nextPx.toFixed(3))));
     const vw = Math.max(200, this.scrollEl?.clientWidth || 360);
-    const padLeft = computeCenterPadLeft(vw);
+    const padLeft = this._getPadLeft();
     const curScroll = this.scrollEl?.scrollLeft || 0;
 
     let pivotFrame;
@@ -626,10 +711,11 @@ export class TimelineView {
       pivotFrame = anchorFrame;
       pivotScreenX = explicitScreenX;
     } else {
-      const playheadX = frameToTimelineX(anchorFrame ?? 0, oldPx, padLeft);
-      const inView = anchorFrame !== null && playheadX >= curScroll && playheadX <= curScroll + vw;
-      pivotScreenX = inView ? (playheadX - curScroll) : padLeft;
-      pivotFrame = inView ? anchorFrame : Math.max(0, timelineXToFrame(curScroll + pivotScreenX, oldPx, padLeft));
+      const refFrame = anchorFrame ?? this._currentFrame ?? 0;
+      const playheadX = frameToTimelineX(refFrame, oldPx, padLeft);
+      const inView = playheadX >= curScroll && playheadX <= curScroll + vw;
+      pivotScreenX = inView ? (playheadX - curScroll) : Math.min(vw * 0.35, padLeft + 48);
+      pivotFrame = inView ? refFrame : Math.max(0, timelineXToFrame(curScroll + pivotScreenX, oldPx, padLeft));
     }
 
     this.pxPerFrame = clamped;
@@ -693,7 +779,8 @@ export class TimelineView {
     const project = ctx?.project;
     if (!project) return;
     const fps = Math.max(1, project.fps || 30);
-    const totalFrames = Math.max(project.durationFrames, fps * 5);
+    const maxPlayheadFrame = TimelineEngine.getPlayheadMaxFrame(project);
+    const totalFrames = Math.max(project.durationFrames, maxPlayheadFrame, fps * 5);
     const vw = Math.max(200, this.scrollEl?.clientWidth || 360);
     const padLeft = this._syncPlayheadOverlayPosition();
     const totalWidth = this._computeTimelineContentWidth(totalFrames, this.pxPerFrame, vw, padLeft);
@@ -708,10 +795,9 @@ export class TimelineView {
     }
 
     const px = this.pxPerFrame;
-    if (!opts.preservePendingScroll && !appliedPendingScroll && !this._isPinching) {
-      this.updatePlayhead(this.cb.getPlayheadFrame?.() ?? 0);
-    }
-    this.drawRuler(totalWidth, fps, totalFrames);
+    const rawCur = this.cb.getPlayheadFrame?.() ?? this._currentFrame ?? 0;
+    this._syncPlayheadOverlayPosition(Math.max(0, Math.min(maxPlayheadFrame, rawCur)));
+    this.drawRuler(totalWidth, fps, totalFrames, maxPlayheadFrame);
     this._syncOverlayLineHeights();
 
     for (const ref of this._zoomRefs.clips) {
@@ -789,6 +875,7 @@ export class TimelineView {
   }
 
   _beginPinchSession(x1, y1, x2, y2) {
+    if (this._isClipHoldLocked) return;
     this._isPinching = true;
     clearTimeout(this._pinchEndTimer);
     if (this._activeClipAbort) {
@@ -830,9 +917,7 @@ export class TimelineView {
         this._setZoomAnchored(this.pinchTargetPx, this.pinchPivotFrame, this.pinchPivotScreenX);
         this._applyFastZoomLayout({ preservePendingScroll: true });
       }
-      const maxF = this._lastRulerParams?.totalFrames ?? Infinity;
-      const centerFrame = scrollLeftToCenterFrame(this.scrollEl?.scrollLeft || 0, this.pxPerFrame, maxF);
-      this.cb.onScrollSeekFrame?.(centerFrame);
+      this._syncPlayheadOverlayPosition(this._currentFrame);
       this._scheduleCrispRedraw(70);
     }
   }
@@ -840,6 +925,7 @@ export class TimelineView {
   bindPinchZoom() {
     // Primary multi-touch handler on Android WebView (prevents scroll/pan steal when 2nd finger lands)
     this.scrollEl.addEventListener('touchstart', (e) => {
+      if (this._isClipHoldLocked) return;
       if (e.touches && e.touches.length >= 2) {
         e.preventDefault();
         const t0 = e.touches[0];
@@ -849,6 +935,7 @@ export class TimelineView {
     }, { passive: false, capture: true });
 
     this.scrollEl.addEventListener('touchmove', (e) => {
+      if (this._isClipHoldLocked) return;
       if (e.touches && e.touches.length >= 2) {
         e.preventDefault();
         const t0 = e.touches[0];
@@ -862,6 +949,11 @@ export class TimelineView {
     }, { passive: false, capture: true });
 
     const onTouchEnd = (e) => {
+      if (!e.touches || e.touches.length === 0) {
+        for (const [pid, info] of this.activePointers.entries()) {
+          if (info?.pointerType === 'touch') this.activePointers.delete(pid);
+        }
+      }
       if (this._isPinching && (!e.touches || e.touches.length < 2)) {
         this._endPinchSession();
       }
@@ -871,21 +963,21 @@ export class TimelineView {
 
     // Secondary multi-pointer fallback (desktop/trackpad/stylus)
     this.scrollEl.addEventListener('pointerdown', (e) => {
-      this.activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
-      if (this.activePointers.size >= 2 && !this._isPinching) {
+      this.activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY, pointerType: e.pointerType || 'touch' });
+      if (!this._isClipHoldLocked && this.activePointers.size >= 2 && !this._isPinching) {
         const pts = [...this.activePointers.values()];
         this._beginPinchSession(pts[0].x, pts[0].y, pts[1].x, pts[1].y);
       }
     }, { capture: true });
 
-    this.scrollEl.addEventListener('pointermove', (e) => {
+    const onWinPinchPtrMove = (e) => {
       if (!this.activePointers.has(e.pointerId)) return;
-      this.activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
-      if (this.activePointers.size >= 2 && this._isPinching && e.pointerType !== 'touch') {
+      this.activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY, pointerType: e.pointerType || 'touch' });
+      if (!this._isClipHoldLocked && this.activePointers.size >= 2 && this._isPinching && e.pointerType !== 'touch') {
         const pts = [...this.activePointers.values()];
         this._updatePinchSession(pts[0].x, pts[0].y, pts[1].x, pts[1].y);
       }
-    }, { capture: true });
+    };
 
     const endPtr = (e) => {
       this.activePointers.delete(e.pointerId);
@@ -893,8 +985,21 @@ export class TimelineView {
         this._endPinchSession();
       }
     };
-    this.scrollEl.addEventListener('pointerup', endPtr, { capture: true });
-    this.scrollEl.addEventListener('pointercancel', endPtr, { capture: true });
+    if (typeof window !== 'undefined') {
+      window.addEventListener('pointermove', onWinPinchPtrMove, { capture: true });
+      window.addEventListener('pointerup', endPtr, { capture: true });
+      window.addEventListener('pointercancel', endPtr, { capture: true });
+      window.addEventListener('touchend', onTouchEnd, { capture: true });
+      window.addEventListener('touchcancel', onTouchEnd, { capture: true });
+      window.addEventListener('blur', () => {
+        this.activePointers.clear();
+        if (this._isPinching) this._endPinchSession();
+      });
+    } else {
+      this.scrollEl.addEventListener('pointermove', onWinPinchPtrMove, { capture: true });
+      this.scrollEl.addEventListener('pointerup', endPtr, { capture: true });
+      this.scrollEl.addEventListener('pointercancel', endPtr, { capture: true });
+    }
   }
 
   bindRulerAndScroll() {
@@ -908,18 +1013,11 @@ export class TimelineView {
     this.scrollEl.addEventListener('scroll', () => {
       this._cancelHoverTooltip();
       this.headersList.scrollTop = this.scrollEl.scrollTop;
-      if (this._lastRulerParams && Math.abs(this.scrollEl.scrollLeft - this._lastDrawnScrollLeft) >= 0.5) {
-        this.redrawRulerOnly();
+      const curScrollLeft = Math.max(0, this.scrollEl.scrollLeft || 0);
+      this._ensureRulerCoversViewport();
+      if (Math.abs(curScrollLeft - this._lastClipSliceScrollLeft) >= 12) {
+        this._lastClipSliceScrollLeft = curScrollLeft;
         this.redrawVisibleClipCanvases();
-      }
-      if (
-        performance.now() >= (this._suppressScrollSeekUntil || 0) &&
-        !this._isPinching &&
-        !this.isScrubbing
-      ) {
-        const maxF = this._lastRulerParams?.totalFrames ?? Infinity;
-        const centerFrame = scrollLeftToCenterFrame(this.scrollEl.scrollLeft, this.pxPerFrame, maxF);
-        this.cb.onScrollSeekFrame?.(centerFrame);
       }
     });
     this.headersList.addEventListener('scroll', () => {
@@ -937,7 +1035,7 @@ export class TimelineView {
           this._applyFastZoomLayout();
           this.redrawVisibleClipCanvases();
         } else if (this._lastRulerParams) {
-          this.redrawRulerOnly();
+          this._ensureRulerCoversViewport();
           this.redrawVisibleClipCanvases();
         }
       });
@@ -946,13 +1044,20 @@ export class TimelineView {
     }
 
     let scrubbing = false;
+    let scrubPointerId = null;
+    let scrubTargetEl = null;
     let lastScrubX = 0;
     let lastScrubShowTip = false;
+    let scrubDownX = 0;
+    let scrubDownMarker = null;
+
     const seekFromPointer = (clientX, showTip = false) => {
       const rect = this.scrollEl.getBoundingClientRect();
       const padLeft = this._getPadLeft();
       const x = (clientX - rect.left) + this.scrollEl.scrollLeft;
-      const maxFrame = this._lastRulerParams?.totalFrames ?? 99999;
+      const maxFrame = Number.isFinite(this._lastRulerParams?.maxPlayheadFrame)
+        ? this._lastRulerParams.maxPlayheadFrame
+        : TimelineEngine.getPlayheadMaxFrame(this._lastRenderContext?.project);
       const frame = Math.max(0, Math.min(maxFrame, Math.round(timelineXToFrame(x, this.pxPerFrame, padLeft))));
       if (showTip && this.dragTooltipEl) {
         const fps = Math.max(1, this._lastRulerParams?.fps || 30);
@@ -960,6 +1065,8 @@ export class TimelineView {
         this.dragTooltipEl.textContent = `Playhead · ${sec}s (F${frame})`;
         this.dragTooltipEl.classList.remove('d-none');
       }
+      this._currentFrame = frame;
+      this._syncPlayheadOverlayPosition(frame);
       this.cb.onSeekFrame(frame);
     };
 
@@ -971,11 +1078,32 @@ export class TimelineView {
       const maxScroll = Math.max(0, this.scrollEl.scrollWidth - this.scrollEl.clientWidth);
       const nextScroll = Math.max(0, Math.min(maxScroll, this.scrollEl.scrollLeft + step));
       if (nextScroll === this.scrollEl.scrollLeft) return;
-      this._suppressScrollSeekUntil = performance.now() + 90;
       this.scrollEl.scrollLeft = nextScroll;
-      this.redrawRulerOnly();
+      this._ensureRulerCoversViewport();
       this.redrawVisibleClipCanvases();
       seekFromPointer(lastScrubX, lastScrubShowTip);
+    };
+
+    const onWinScrubMove = (e) => {
+      if (!scrubbing || (scrubPointerId !== null && e.pointerId !== scrubPointerId)) return;
+      if (this._isPinching || this.activePointers.size >= 2) {
+        endScrub(e);
+        return;
+      }
+      lastScrubX = e.clientX;
+      seekFromPointer(e.clientX, lastScrubShowTip);
+    };
+
+    const onWinScrubEnd = (e) => {
+      if (!scrubbing || (scrubPointerId !== null && e.pointerId !== scrubPointerId)) return;
+      endScrub(e);
+    };
+
+    const detachScrubWin = () => {
+      if (typeof window === 'undefined') return;
+      window.removeEventListener('pointermove', onWinScrubMove, true);
+      window.removeEventListener('pointerup', onWinScrubEnd, true);
+      window.removeEventListener('pointercancel', onWinScrubEnd, true);
     };
 
     const startScrub = (targetEl, e, showTip) => {
@@ -983,113 +1111,79 @@ export class TimelineView {
       e.stopPropagation();
       e.preventDefault();
       scrubbing = true;
+      scrubPointerId = e.pointerId;
+      scrubTargetEl = targetEl;
       lastScrubX = e.clientX;
       lastScrubShowTip = showTip;
       this.isScrubbing = true;
       this.playheadEl?.classList.add('dragging');
       this._activeScrubAbort = () => endScrub();
       try { targetEl.setPointerCapture(e.pointerId); } catch {}
+      if (typeof window !== 'undefined') {
+        window.addEventListener('pointermove', onWinScrubMove, true);
+        window.addEventListener('pointerup', onWinScrubEnd, true);
+        window.addEventListener('pointercancel', onWinScrubEnd, true);
+      }
       this.cb.onScrubStart?.();
       seekFromPointer(e.clientX, showTip);
       this._startEdgeAutoScroll(scrubAutoScrollTick);
     };
 
-    const moveScrub = (e, showTip) => {
+    const endScrub = (e = null) => {
       if (!scrubbing) return;
-      if (this._isPinching) {
-        endScrub();
-        return;
-      }
-      lastScrubX = e.clientX;
-      lastScrubShowTip = showTip;
-      seekFromPointer(e.clientX, showTip);
-    };
-
-    const endScrub = () => {
-      if (!scrubbing) return;
+      const wasRuler = scrubTargetEl === this.rulerCanvas;
+      const clickedMarker = (
+        wasRuler &&
+        scrubDownMarker &&
+        e?.type === 'pointerup' &&
+        Math.abs((e.clientX ?? scrubDownX) - scrubDownX) <= 5
+      ) ? scrubDownMarker : null;
+      scrubDownMarker = null;
       scrubbing = false;
+      detachScrubWin();
+      if (scrubTargetEl && scrubPointerId !== null) {
+        try {
+          if (scrubTargetEl.hasPointerCapture?.(scrubPointerId)) {
+            scrubTargetEl.releasePointerCapture(scrubPointerId);
+          }
+        } catch {}
+      }
+      scrubPointerId = null;
+      scrubTargetEl = null;
       this._activeScrubAbort = null;
       this._stopEdgeAutoScroll();
       this.isScrubbing = false;
       this.playheadEl?.classList.remove('dragging');
       this.dragTooltipEl?.classList.add('d-none');
       this.cb.onScrubEnd?.();
+      if (clickedMarker && typeof clickedMarker === 'object') {
+        this.cb.onClickMarker?.(clickedMarker, e.clientX, e.clientY);
+      }
     };
 
-    let rulerDownX = 0;
-    let rulerDownMarker = null;
     this.rulerCanvas.addEventListener('pointerdown', (e) => {
-      rulerDownX = e.clientX;
+      scrubDownX = e.clientX;
       const rect = this.scrollEl.getBoundingClientRect();
       const padLeft = this._getPadLeft();
       const x = (e.clientX - rect.left) + this.scrollEl.scrollLeft;
-      rulerDownMarker = null;
+      scrubDownMarker = null;
       for (const m of (this._lastTimelineMarkers || [])) {
         const mf = typeof m === 'number' ? m : Number(m?.frame);
         if (!Number.isFinite(mf)) continue;
         if (Math.abs(frameToTimelineX(mf, this.pxPerFrame, padLeft) - x) <= 10) {
-          rulerDownMarker = m;
+          scrubDownMarker = m;
           break;
         }
       }
       startScrub(this.rulerCanvas, e, false);
     });
-    this.rulerCanvas.addEventListener('pointermove', (e) => moveScrub(e, false));
-    this.rulerCanvas.addEventListener('pointerup', (e) => {
-      const clickedMarker = rulerDownMarker && Math.abs(e.clientX - rulerDownX) <= 5 ? rulerDownMarker : null;
-      rulerDownMarker = null;
-      endScrub();
-      if (clickedMarker && typeof clickedMarker === 'object') {
-        this.cb.onClickMarker?.(clickedMarker, e.clientX, e.clientY);
-      }
-    });
-    this.rulerCanvas.addEventListener('pointercancel', () => {
-      rulerDownMarker = null;
-      endScrub();
-    });
 
-    if (this.playheadEl) {
-      let phDragging = false;
-      let phLastX = 0;
-      const onPhMove = (e) => {
-        if (!phDragging || !this.scrollEl) return;
-        const dx = phLastX - e.clientX;
-        phLastX = e.clientX;
-        const maxScroll = Math.max(0, this.scrollEl.scrollWidth - this.scrollEl.clientWidth);
-        const nextScroll = Math.max(0, Math.min(maxScroll, this.scrollEl.scrollLeft + dx));
-        this._suppressScrollSeekUntil = performance.now() + 90;
-        this.scrollEl.scrollLeft = nextScroll;
-        const maxF = this._lastRulerParams?.totalFrames ?? 99999;
-        const frame = scrollLeftToCenterFrame(nextScroll, this.pxPerFrame, maxF);
-        if (this.dragTooltipEl) {
-          const fps = Math.max(1, this._lastRulerParams?.fps || 30);
-          this.dragTooltipEl.textContent = `Playhead · ${(frame / fps).toFixed(2)}s (F${frame})`;
-          this.dragTooltipEl.classList.remove('d-none');
-        }
-        this.cb.onScrollSeekFrame?.(frame);
-      };
-      const endPh = () => {
-        if (!phDragging) return;
-        phDragging = false;
-        this.isScrubbing = false;
-        this.playheadEl?.classList.remove('dragging');
-        this.dragTooltipEl?.classList.add('d-none');
-        this.cb.onScrubEnd?.();
-      };
-      this.playheadEl.addEventListener('pointerdown', (e) => {
-        if (this._isPinching || this.activePointers.size >= 2) return;
-        e.stopPropagation();
-        e.preventDefault();
-        phDragging = true;
-        phLastX = e.clientX;
-        this.isScrubbing = true;
-        this.playheadEl.classList.add('dragging');
-        try { this.playheadEl.setPointerCapture(e.pointerId); } catch {}
-        this.cb.onScrubStart?.();
+    const phDragTarget = this.playheadHeadEl || this.playheadEl;
+    if (phDragTarget) {
+      phDragTarget.addEventListener('pointerdown', (e) => {
+        scrubDownMarker = null;
+        startScrub(phDragTarget, e, true);
       });
-      this.playheadEl.addEventListener('pointermove', onPhMove);
-      this.playheadEl.addEventListener('pointerup', endPh);
-      this.playheadEl.addEventListener('pointercancel', endPh);
     }
 
     // Ctrl/Cmd + Wheel zoom anchored under cursor
@@ -1104,8 +1198,7 @@ export class TimelineView {
       this._setZoomAnchored(this.pxPerFrame * factor, cursorFrame, cursorX);
       this.pinchTargetPx = this.pxPerFrame;
       this._applyFastZoomLayout({ preservePendingScroll: true });
-      const maxF = this._lastRulerParams?.totalFrames ?? Infinity;
-      this.cb.onScrollSeekFrame?.(scrollLeftToCenterFrame(this.scrollEl.scrollLeft, this.pxPerFrame, maxF));
+      this._syncPlayheadOverlayPosition(this._currentFrame);
       this._scheduleCrispRedraw(70);
     }, { passive: false });
 
@@ -1204,10 +1297,19 @@ export class TimelineView {
   }
 
   render(project, currentFrame, selectedLayerId, audioEngine, mediaMap = null) {
+    if (this._isClipGestureActive) {
+      this._deferredRenderArgs = { project, currentFrame, selectedLayerId, audioEngine, mediaMap };
+      return;
+    }
+    this._deferredRenderArgs = null;
+    const maxPlayheadFrame = TimelineEngine.getPlayheadMaxFrame(project);
+    const rawCur = Number.isFinite(Number(currentFrame)) ? Number(currentFrame) : 0;
+    this._currentFrame = Math.max(0, Math.min(maxPlayheadFrame, rawCur));
+
     const fps = Math.max(1, project.fps || 30);
-    const totalFrames = Math.max(project.durationFrames, fps * 5);
+    const totalFrames = Math.max(project.durationFrames, maxPlayheadFrame, fps * 5);
     const vw = Math.max(200, this.scrollEl.clientWidth || 360);
-    const padLeft = this._syncPlayheadOverlayPosition();
+    const padLeft = this._getPadLeft();
     const totalWidth = this._computeTimelineContentWidth(totalFrames, this.pxPerFrame, vw, padLeft);
 
     this.contentEl.style.width = `${totalWidth}px`;
@@ -1232,10 +1334,12 @@ export class TimelineView {
     this._lastTimelineMarkers = Array.isArray(project.markers) ? project.markers : [];
     this._lastBeatMarkers = Array.isArray(project.beatMarkers) ? project.beatMarkers : [];
 
-    if (!hasPendingScroll) {
-      this.updatePlayhead(currentFrame);
+    if (hasPendingScroll) {
+      this._syncPlayheadOverlayPosition(this._currentFrame);
+    } else {
+      this.updatePlayhead(this._currentFrame);
     }
-    this.drawRuler(totalWidth, fps, totalFrames);
+    this.drawRuler(totalWidth, fps, totalFrames, maxPlayheadFrame);
     this.renderHeadersAndLanes(project, selectedLayerId, audioEngine, mediaMap);
     this._syncOverlayLineHeights();
     this._renderKfFloatingBar(project);
@@ -1243,7 +1347,7 @@ export class TimelineView {
 
   _syncOverlayLineHeights() {
     const viewportH = this.scrollEl?.clientHeight || 0;
-    const rulerH = this.rulerCanvas?.offsetHeight || 28;
+    const rulerH = this.rulerTrackEl?.offsetHeight || this.rulerCanvas?.offsetHeight || 28;
     const lanesH = Math.max(this.lanesList?.scrollHeight || 0, this.lanesList?.offsetHeight || 0);
     const targetH = Math.max(viewportH, rulerH + lanesH);
     if (targetH > 0) {
@@ -1252,62 +1356,113 @@ export class TimelineView {
     }
   }
 
-  redrawRulerOnly() {
+  _ensureRulerCoversViewport(expandedWidth = null) {
     if (!this._lastRulerParams) return;
-    const { totalWidth, fps, totalFrames } = this._lastRulerParams;
-    this.drawRuler(totalWidth, fps, totalFrames);
+    const viewportW = Math.max(200, Math.ceil(this.scrollEl?.clientWidth || 360));
+    const scrollLeft = Math.max(0, this.scrollEl?.scrollLeft || 0);
+    const domW = parseFloat(this.contentEl?.style.width || '0') || 0;
+    const effectiveTotalW = Math.max(
+      this._lastRulerParams.totalWidth || 0,
+      Number(expandedWidth) || 0,
+      domW,
+      viewportW
+    );
+    const dpr = Math.min(2, window.devicePixelRatio || 1);
+    const win = computeRulerWindow({
+      totalWidth: effectiveTotalW,
+      viewportW,
+      scrollLeft,
+      dpr,
+      currentStart: this._rulerWindowStart,
+      currentWidth: this._rulerWindowWidth
+    });
+    if (win.needsRedraw || effectiveTotalW > this._rulerContentWidth + 1) {
+      this._lastRulerParams.totalWidth = effectiveTotalW;
+      this.drawRuler(
+        effectiveTotalW,
+        this._lastRulerParams.fps,
+        this._lastRulerParams.totalFrames,
+        this._lastRulerParams.maxPlayheadFrame
+      );
+    }
   }
 
-  drawRuler(totalWidth, fps, totalFrames) {
+  redrawRulerOnly() {
+    if (!this._lastRulerParams) return;
+    const { totalWidth, fps, totalFrames, maxPlayheadFrame } = this._lastRulerParams;
+    this.drawRuler(totalWidth, fps, totalFrames, maxPlayheadFrame);
+  }
+
+  drawRuler(totalWidth, fps, totalFrames, maxPlayheadFrame = null) {
     const safeFps = Math.max(1, Math.round(fps || 30));
-    this._lastRulerParams = { totalWidth, fps: safeFps, totalFrames };
+    const safeMaxPh = Number.isFinite(Number(maxPlayheadFrame))
+      ? Math.max(0, Math.round(Number(maxPlayheadFrame)))
+      : TimelineEngine.getPlayheadMaxFrame(this._lastRenderContext?.project);
+    const viewportW = Math.max(200, Math.ceil(this.scrollEl?.clientWidth || totalWidth || 360));
+    const domW = parseFloat(this.contentEl?.style.width || '0') || 0;
+    const effectiveTotalW = Math.max(totalWidth || 0, domW, viewportW);
+    this._lastRulerParams = { totalWidth: effectiveTotalW, fps: safeFps, totalFrames, maxPlayheadFrame: safeMaxPh };
 
     const canvas = this.rulerCanvas;
-    const viewportW = Math.max(200, Math.ceil(this.scrollEl?.clientWidth || totalWidth || 360));
     const padLeft = this._getPadLeft();
     const scrollLeft = Math.max(0, this.scrollEl?.scrollLeft || 0);
     this._lastDrawnScrollLeft = scrollLeft;
 
     const dpr = Math.min(2, window.devicePixelRatio || 1);
-    const targetPxW = Math.round(viewportW * dpr);
+    const win = computeRulerWindow({
+      totalWidth: effectiveTotalW,
+      viewportW,
+      scrollLeft,
+      dpr,
+      currentStart: 0,
+      currentWidth: 0
+    });
+    const windowStart = win.windowStart;
+    const windowW = win.windowWidth;
+    this._rulerWindowStart = windowStart;
+    this._rulerWindowWidth = windowW;
+    this._rulerContentWidth = effectiveTotalW;
+
+    const targetPxW = Math.round(windowW * dpr);
     const targetPxH = Math.round(28 * dpr);
 
     if (canvas.width !== targetPxW || canvas.height !== targetPxH) {
       canvas.width = targetPxW;
       canvas.height = targetPxH;
     }
-    canvas.style.width = `${viewportW}px`;
+    canvas.style.left = `${windowStart}px`;
+    canvas.style.width = `${windowW}px`;
     canvas.style.height = '28px';
 
     const ctx = canvas.getContext('2d');
     const isLight = typeof document !== 'undefined' && document.documentElement.classList.contains('mf-theme-light');
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.clearRect(0, 0, viewportW, 28);
+    ctx.clearRect(0, 0, windowW, 28);
     ctx.fillStyle = isLight ? '#f8fafc' : '#131822';
-    ctx.fillRect(0, 0, viewportW, 28);
+    ctx.fillRect(0, 0, windowW, 28);
 
-    // Subtle pre-0s lead-in area to the left of frame 0 when scrolled near the start
-    const zeroLocalX = frameToTimelineX(0, this.pxPerFrame, padLeft) - scrollLeft;
+    // Subtle pre-0s lead-in area to the left of frame 0 in content coordinates
+    const zeroLocalX = frameToTimelineX(0, this.pxPerFrame, padLeft) - windowStart;
     if (zeroLocalX > 0) {
       ctx.fillStyle = isLight ? 'rgba(15, 23, 42, 0.05)' : 'rgba(4, 7, 13, 0.45)';
-      ctx.fillRect(0, 0, Math.min(viewportW, zeroLocalX), 28);
+      ctx.fillRect(0, 0, Math.min(windowW, zeroLocalX), 28);
     }
 
     const spec = computeDynamicRulerTicks(this.pxPerFrame, safeFps);
     const minorStep = Math.max(1, spec.minorFrames);
-    const startFrame = Math.max(0, Math.floor(Math.max(0, (scrollLeft - padLeft - 90) / this.pxPerFrame) / minorStep) * minorStep);
-    const endFrame = Math.max(0, Math.ceil((scrollLeft - padLeft + viewportW + 90) / Math.max(MIN_PX_PER_FRAME, this.pxPerFrame)));
+    const startFrame = Math.max(0, Math.floor(Math.max(0, (windowStart - padLeft - 90) / this.pxPerFrame) / minorStep) * minorStep);
+    const endFrame = Math.max(0, Math.ceil((windowStart - padLeft + windowW + 90) / Math.max(MIN_PX_PER_FRAME, this.pxPerFrame)));
 
     ctx.font = '10px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
     ctx.textBaseline = 'top';
     let lastLabelRight = -100;
 
     for (let f = startFrame; f <= endFrame; f += minorStep) {
-      const localX = frameToTimelineX(f, this.pxPerFrame, padLeft) - scrollLeft;
-      if (localX < -80 || localX > viewportW + 80) continue;
+      const localX = frameToTimelineX(f, this.pxPerFrame, padLeft) - windowStart;
+      if (localX < -80 || localX > windowW + 80) continue;
       const x = Math.round(localX) + 0.5;
 
-      const beyondEnd = f > totalFrames;
+      const beyondEnd = f > safeMaxPh;
       const isMajor = f % spec.majorFrames === 0;
       const isSecond = f % safeFps === 0;
       const isLabelTick = f % spec.labelFrames === 0 || f === 0;
@@ -1326,7 +1481,7 @@ export class TimelineView {
       ctx.lineTo(x, 28);
       ctx.stroke();
 
-      if (isLabelTick && x >= -12 && x <= viewportW - 6 && x > lastLabelRight + 6) {
+      if (isLabelTick && x >= -12 && x <= windowW - 6 && x > lastLabelRight + 6) {
         const label = formatRulerLabel(f, safeFps);
         const tw = ctx.measureText(label).width;
         const isMinute = isSecond && ((f / safeFps) % 60 === 0) && f > 0;
@@ -1344,17 +1499,19 @@ export class TimelineView {
       }
     }
 
-    // Subtle marker showing project content duration boundary along the continuous ruler
-    const durX = Math.round(frameToTimelineX(totalFrames, this.pxPerFrame, padLeft) - scrollLeft) + 0.5;
-    if (durX >= 0 && durX <= viewportW) {
-      ctx.save();
-      ctx.strokeStyle = isLight ? 'rgba(2, 132, 199, 0.55)' : 'rgba(0, 229, 255, 0.45)';
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      ctx.moveTo(durX, 0);
-      ctx.lineTo(durX, 28);
-      ctx.stroke();
-      ctx.restore();
+    // Marker showing the exact end of the last item (playhead max limit) along the continuous ruler
+    if (safeMaxPh > 0) {
+      const durX = Math.round(frameToTimelineX(safeMaxPh, this.pxPerFrame, padLeft) - windowStart) + 0.5;
+      if (durX >= 0 && durX <= windowW) {
+        ctx.save();
+        ctx.strokeStyle = isLight ? 'rgba(2, 132, 199, 0.7)' : 'rgba(0, 229, 255, 0.65)';
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(durX, 0);
+        ctx.lineTo(durX, 28);
+        ctx.stroke();
+        ctx.restore();
+      }
     }
 
     // Draw Timeline Markers along upper/mid ruler (emerald bookmark pins)
@@ -1363,8 +1520,8 @@ export class TimelineView {
       for (const m of this._lastTimelineMarkers) {
         const mf = typeof m === 'number' ? m : Number(m?.frame);
         if (!Number.isFinite(mf)) continue;
-        const mx = frameToTimelineX(mf, this.pxPerFrame, padLeft) - scrollLeft;
-        if (mx < -12 || mx > viewportW + 12) continue;
+        const mx = frameToTimelineX(mf, this.pxPerFrame, padLeft) - windowStart;
+        if (mx < -12 || mx > windowW + 12) continue;
         const color = (typeof m === 'object' && m?.color) ? m.color : '#34d399';
         ctx.strokeStyle = color;
         ctx.fillStyle = color;
@@ -1390,8 +1547,8 @@ export class TimelineView {
     if (this._lastBeatMarkers.length > 0) {
       ctx.save();
       for (const bf of this._lastBeatMarkers) {
-        const bx = frameToTimelineX(bf, this.pxPerFrame, padLeft) - scrollLeft;
-        if (bx < -10 || bx > viewportW + 10) continue;
+        const bx = frameToTimelineX(bf, this.pxPerFrame, padLeft) - windowStart;
+        if (bx < -10 || bx > windowW + 10) continue;
         ctx.fillStyle = '#ffab40';
         ctx.strokeStyle = '#071018';
         ctx.lineWidth = 1;
@@ -1409,18 +1566,31 @@ export class TimelineView {
   }
 
   updatePlayhead(currentFrame) {
-    this._syncPlayheadOverlayPosition();
-    if (!this.scrollEl) return;
-    const maxScroll = Math.max(0, this.scrollEl.scrollWidth - this.scrollEl.clientWidth);
-    const targetScroll = frameToCenterScrollLeft(currentFrame, this.pxPerFrame, maxScroll);
-    if (Math.abs(this.scrollEl.scrollLeft - targetScroll) >= 0.5) {
-      this._suppressScrollSeekUntil = performance.now() + 90;
-      this.scrollEl.scrollLeft = targetScroll;
-      if (this._lastRulerParams && Math.abs(this.scrollEl.scrollLeft - this._lastDrawnScrollLeft) >= 0.5) {
-        this.redrawRulerOnly();
+    const rawF = Number.isFinite(Number(currentFrame)) ? Number(currentFrame) : 0;
+    const maxF = this._lastRenderContext?.project
+      ? TimelineEngine.getPlayheadMaxFrame(this._lastRenderContext.project)
+      : (Number.isFinite(this._lastRulerParams?.maxPlayheadFrame) ? this._lastRulerParams.maxPlayheadFrame : rawF);
+    const f = Math.max(0, Math.min(maxF, rawF));
+    this._currentFrame = f;
+    const padLeft = this._getPadLeft();
+    if (this.scrollEl && !this.isScrubbing && !this._isPinching && !this._isClipGestureActive) {
+      const vw = Math.max(200, this.scrollEl.clientWidth || 360);
+      const targetX = frameToTimelineX(f, this.pxPerFrame, padLeft);
+      const curScroll = this.scrollEl.scrollLeft || 0;
+      const maxScroll = Math.max(0, this.scrollEl.scrollWidth - vw);
+      let nextScroll = null;
+      if (targetX > curScroll + vw - 24) {
+        nextScroll = Math.min(maxScroll, Math.max(0, targetX - Math.round(vw * 0.25)));
+      } else if (targetX < curScroll + (f === 0 ? 0 : 12)) {
+        nextScroll = Math.max(0, targetX - 24);
+      }
+      if (nextScroll !== null && Math.abs(nextScroll - curScroll) >= 0.5) {
+        this.scrollEl.scrollLeft = nextScroll;
+        this._ensureRulerCoversViewport();
         this.redrawVisibleClipCanvases();
       }
     }
+    this._syncPlayheadOverlayPosition(f);
   }
 
   _buildClipElement(project, layer, isSelected, audioEngine, mediaMap) {
@@ -2822,15 +2992,21 @@ export class TimelineView {
   }
 
   bindClipGestures(clip, leftTrim, rightTrim, project, layer, waveEntry = null, filmEntry = null, laneEl = null, mainCtx = null) {
-    const HOLD_DELAY_MS = 250;
-    const HOLD_MOVE_TOL_PX = 8;
+    const MOVE_HOLD_DELAY_MS = 140;
+    const MOVE_SELECTED_HOLD_MS = 110;
+    const TRIM_HOLD_DELAY_MS = 110;
+    const TAP_MOVE_TOL_PX = 10;
 
     let mode = null;
+    let downPointerType = 'touch';
+    let downTimeMs = 0;
+    let wasAlreadySelected = false;
     let startX = 0;
     let startY = 0;
     let lastClientX = 0;
     let lastClientY = 0;
     let startScrollLeft = 0;
+    let startScrollTop = 0;
     let origStart = 0;
     let origEnd = 0;
     let origMediaOffset = 0;
@@ -2845,6 +3021,8 @@ export class TimelineView {
     let holdTimer = null;
     let holdActivated = false;
     let activePointerId = null;
+    let captureEl = null;
+    let winBound = false;
     let lastTapTime = 0;
     let lastTapX = 0;
     let lastTapY = 0;
@@ -2986,10 +3164,12 @@ export class TimelineView {
     const applyDragStep = (clientX, clientY, fromAutoScroll = false) => {
       if (!mode || !holdActivated) return;
       const padLeft = this._getPadLeft();
-      const scrollDx = this.scrollEl.scrollLeft - startScrollLeft;
+      const scrollDx = (this.scrollEl?.scrollLeft || 0) - startScrollLeft;
+      const scrollDy = (this.scrollEl?.scrollTop || 0) - startScrollTop;
       const rawDx = (clientX - startX) + scrollDx;
-      const dy = clientY - startY;
-      if (Math.hypot(rawDx, dy) < 2 && !pushedUndo) return;
+      const dy = (clientY - startY) + scrollDy;
+      const undoThreshold = mode === 'move' ? 4 : 3;
+      if (Math.hypot(rawDx, dy) < undoThreshold && !pushedUndo) return;
       if (!pushedUndo) {
         this.cb.onPushUndo();
         pushedUndo = true;
@@ -3023,6 +3203,10 @@ export class TimelineView {
           slowAccumMs = Math.max(0, slowAccumMs - dt * 0.5);
         }
         effectiveScaledDx += fineSlideActive ? stepDx * 0.25 : stepDx;
+      } else if (fineSlideActive) {
+        fineSlideActive = false;
+        slowAccumMs = 0;
+        clip.classList.remove('is-fine-slide');
       }
 
       const activeDx = fineSlideActive ? effectiveScaledDx : rawDx;
@@ -3070,14 +3254,33 @@ export class TimelineView {
       }
 
       // 2D Drag & Drop target detection across lanes when moving vertically >= 24px
+      const lanes = mode === 'move' ? [...this.lanesList.querySelectorAll('.mf-track-lane')] : [];
       let hoveredLane = null;
-      if (mode === 'move' && Math.abs(dy) >= 24) {
-        const lanes = [...this.lanesList.querySelectorAll('.mf-track-lane')];
+      if (mode === 'move' && Math.abs(dy) >= 24 && lanes.length > 0) {
         for (const ln of lanes) {
           const r = ln.getBoundingClientRect();
           if (clientY >= r.top && clientY <= r.bottom) {
             hoveredLane = ln;
             break;
+          }
+        }
+        if (!hoveredLane) {
+          const firstRect = lanes[0].getBoundingClientRect();
+          const lastRect = lanes[lanes.length - 1].getBoundingClientRect();
+          if (clientY < firstRect.top) hoveredLane = lanes[0];
+          else if (clientY > lastRect.bottom) hoveredLane = lanes[lanes.length - 1];
+          else {
+            let bestLn = null;
+            let bestDist = Infinity;
+            for (const ln of lanes) {
+              const r = ln.getBoundingClientRect();
+              const d = Math.abs(clientY - (r.top + r.height * 0.5));
+              if (d < bestDist) {
+                bestDist = d;
+                bestLn = ln;
+              }
+            }
+            hoveredLane = bestLn;
           }
         }
       }
@@ -3112,32 +3315,40 @@ export class TimelineView {
       }
 
       // Case 2: Main Track clip dragged vertically off Main Track into Overlay zone ONLY (never Audio zone)
-      if (mode === 'move' && layer.trackRole === 'main' && Math.abs(dy) >= 26 && (!hoveredLane || (hoveredLane.dataset.laneType !== 'main' && hoveredLane.dataset.zone !== 'audio'))) {
-        if (hoveredLane && hoveredLane.dataset.zone === 'overlay') {
-          clearDropHighlights();
-          hoveredLane.classList.add('drop-target');
-          const len = Math.max(5, origEnd - origStart);
-          const rawDragStart = Math.max(0, origStart + deltaFrames);
-          const snapMeta = TimelineEngine.snapFrameWithMeta(
-            project,
-            layer.id,
-            rawDragStart,
-            len,
-            this.cb.getPlayheadFrame(),
-            snapThreshold,
-            snapActive
-          );
-          const dragStart = snapMeta.startFrame;
-          this._showSnapGuide(snapActive ? snapMeta : null);
-          clip.classList.add('mf-clip-dragging-reorder');
-          clip.style.left = `${frameToTimelineX(dragStart, this.pxPerFrame, padLeft)}px`;
-          clip.style.transform = `translateY(${dy}px) scale(1.03)`;
-          const tgtIdx = hoveredLane?.dataset?.layerIndex ? Number(hoveredLane.dataset.layerIndex) : null;
-          pendingDrop = { targetRole: 'overlay', targetLayerIndex: Number.isInteger(tgtIdx) ? tgtIdx : null, targetStartFrame: dragStart };
-          const snapTag = snapMeta.snapped && snapActive ? ` · Snap: ${snapMeta.label}` : bypassSuffix;
-          this._showTooltip(`${finePrefix}Overlay @ ${formatDurationShort(dragStart, fps)}${snapTag}`, clip, 'drag');
-          return;
-        }
+      const mainLaneEl = lanes.find((ln) => ln.dataset.laneType === 'main') || laneEl;
+      const mainRect = mainLaneEl?.getBoundingClientRect();
+      const overlayLanes = lanes.filter((ln) => ln.dataset.zone === 'overlay');
+      const draggedAboveMain = Boolean(mainRect && clientY < mainRect.top);
+      if (
+        mode === 'move' &&
+        layer.trackRole === 'main' &&
+        Math.abs(dy) >= 26 &&
+        ((hoveredLane && hoveredLane.dataset.zone === 'overlay') || (draggedAboveMain && hoveredLane?.dataset?.zone !== 'audio'))
+      ) {
+        clearDropHighlights();
+        const targetOverlayLane = hoveredLane?.dataset?.zone === 'overlay' ? hoveredLane : (overlayLanes[0] || null);
+        if (targetOverlayLane) targetOverlayLane.classList.add('drop-target');
+        const len = Math.max(5, origEnd - origStart);
+        const rawDragStart = Math.max(0, origStart + deltaFrames);
+        const snapMeta = TimelineEngine.snapFrameWithMeta(
+          project,
+          layer.id,
+          rawDragStart,
+          len,
+          this.cb.getPlayheadFrame(),
+          snapThreshold,
+          snapActive
+        );
+        const dragStart = snapMeta.startFrame;
+        this._showSnapGuide(snapActive ? snapMeta : null);
+        clip.classList.add('mf-clip-dragging-reorder');
+        clip.style.left = `${frameToTimelineX(dragStart, this.pxPerFrame, padLeft)}px`;
+        clip.style.transform = `translateY(${dy}px) scale(1.03)`;
+        const tgtIdx = targetOverlayLane?.dataset?.layerIndex !== undefined ? Number(targetOverlayLane.dataset.layerIndex) : null;
+        pendingDrop = { targetRole: 'overlay', targetLayerIndex: Number.isInteger(tgtIdx) ? tgtIdx : null, targetStartFrame: dragStart };
+        const snapTag = snapMeta.snapped && snapActive ? ` · Snap: ${snapMeta.label}` : bypassSuffix;
+        this._showTooltip(`${finePrefix}Overlay @ ${formatDurationShort(dragStart, fps)}${snapTag}`, clip, 'drag');
+        return;
       }
 
       // Case 3: CapCut Main Track Horizontal Drag-to-Reorder with live sibling preview slide
@@ -3150,8 +3361,15 @@ export class TimelineView {
         const dragStart = Math.max(0, origStart + deltaFrames);
         const centerFrame = dragStart + len * 0.5;
         pendingCenterFrame = centerFrame;
+        const dragLeftPx = frameToTimelineX(dragStart, this.pxPerFrame, padLeft);
+        const dragWidthPx = Math.max(4, len * this.pxPerFrame);
+        const curContentW = parseFloat(this.contentEl.style.width || '0') || 0;
+        const trailPad = Math.max(120, ((this.scrollEl?.clientWidth || 360) - padLeft) + 24);
+        if (dragLeftPx + dragWidthPx + trailPad > curContentW) {
+          this.contentEl.style.width = `${Math.ceil(dragLeftPx + dragWidthPx + trailPad + 60)}px`;
+        }
         clip.classList.add('mf-clip-dragging-reorder');
-        clip.style.left = `${frameToTimelineX(dragStart, this.pxPerFrame, padLeft)}px`;
+        clip.style.left = `${dragLeftPx}px`;
 
         const others = TimelineEngine.getMainTrackClips(project).filter((c) => c.id !== layer.id);
         const targetSlot = TimelineEngine.computeMainTrackTargetSlot(project, layer.id, centerFrame);
@@ -3255,7 +3473,9 @@ export class TimelineView {
       const curContentW = parseFloat(this.contentEl.style.width || '0') || 0;
       const trailPad = Math.max(120, ((this.scrollEl?.clientWidth || 360) - padLeft) + 24);
       if (nextLeftPx + nextWidthPx + trailPad > curContentW) {
-        this.contentEl.style.width = `${Math.ceil(nextLeftPx + nextWidthPx + trailPad + 60)}px`;
+        const nextContentW = Math.ceil(nextLeftPx + nextWidthPx + trailPad + 60);
+        this.contentEl.style.width = `${nextContentW}px`;
+        this._ensureRulerCoversViewport(nextContentW);
       }
       clip.style.left = `${nextLeftPx}px`;
       clip.style.width = `${nextWidthPx}px`;
@@ -3301,32 +3521,129 @@ export class TimelineView {
     };
 
     const edgeAutoScrollTick = () => {
-      if (!mode || !holdActivated || !pushedUndo || this._isPinching || this.activePointers.size >= 2) return;
+      if (!mode || !holdActivated) return;
+      if (this._isPinching && !this._isClipHoldLocked) return;
       const sRect = this.scrollEl.getBoundingClientRect();
-      const step = computeEdgeAutoScrollDelta(lastClientX, sRect.left, sRect.right, this.scrollEl.scrollLeft, 36, 16);
-      if (step === 0) return;
-      if (step > 0) {
-        const curW = parseFloat(this.contentEl.style.width || '0') || this.contentEl.clientWidth;
-        const neededW = this.scrollEl.scrollLeft + sRect.width + step + 180;
-        if (neededW > curW) {
-          this.contentEl.style.width = `${Math.ceil(neededW)}px`;
+      const stepX = computeEdgeAutoScrollDelta(lastClientX, sRect.left, sRect.right, this.scrollEl.scrollLeft, 36, 16);
+      const stepY = mode === 'move'
+        ? computeEdgeAutoScrollDelta(lastClientY, sRect.top + 28, sRect.bottom, this.scrollEl.scrollTop, 28, 10)
+        : 0;
+      if (stepX === 0 && stepY === 0) return;
+
+      let changed = false;
+      let extendedW = null;
+      if (stepX !== 0) {
+        if (stepX > 0) {
+          const curW = parseFloat(this.contentEl.style.width || '0') || this.contentEl.clientWidth;
+          const neededW = this.scrollEl.scrollLeft + sRect.width + stepX + 240;
+          if (neededW > curW) {
+            extendedW = Math.ceil(neededW);
+            this.contentEl.style.width = `${extendedW}px`;
+          }
+        }
+        const nextScrollX = Math.max(0, this.scrollEl.scrollLeft + stepX);
+        if (nextScrollX !== this.scrollEl.scrollLeft) {
+          this.scrollEl.scrollLeft = nextScrollX;
+          changed = true;
         }
       }
-      const nextScroll = Math.max(0, this.scrollEl.scrollLeft + step);
-      if (nextScroll === this.scrollEl.scrollLeft) return;
-      this.scrollEl.scrollLeft = nextScroll;
-      this.redrawRulerOnly();
+      if (stepY !== 0) {
+        const maxScrollY = Math.max(0, this.scrollEl.scrollHeight - this.scrollEl.clientHeight);
+        const nextScrollY = Math.max(0, Math.min(maxScrollY, this.scrollEl.scrollTop + stepY));
+        if (nextScrollY !== this.scrollEl.scrollTop) {
+          this.scrollEl.scrollTop = nextScrollY;
+          if (this.headersList) this.headersList.scrollTop = nextScrollY;
+          changed = true;
+        }
+      }
+      if (!changed) return;
+      this._ensureRulerCoversViewport(extendedW);
       this.redrawVisibleClipCanvases();
       applyDragStep(lastClientX, lastClientY, true);
+    };
+
+    const flushDeferredRenderIfAny = () => {
+      if (this._deferredRenderArgs && !this._isClipGestureActive) {
+        const args = this._deferredRenderArgs;
+        this._deferredRenderArgs = null;
+        this.render(args.project, args.currentFrame, args.selectedLayerId, args.audioEngine, args.mediaMap);
+      }
+    };
+
+    const releaseClipPointerCapture = () => {
+      if (captureEl && activePointerId !== null) {
+        try {
+          if (captureEl.hasPointerCapture?.(activePointerId)) {
+            captureEl.releasePointerCapture(activePointerId);
+          }
+        } catch {}
+      }
+      captureEl = null;
+    };
+
+    const onWinTouchMove = (e) => {
+      if (!mode || activePointerId === null) return;
+      if (!e.touches || e.touches.length <= 1) {
+        if (e.cancelable) e.preventDefault();
+      }
+    };
+
+    const onWinBlur = () => {
+      if (mode) onWinEnd({ type: 'blur', pointerId: activePointerId });
+    };
+
+    const detachWindowListeners = () => {
+      if (!winBound || typeof window === 'undefined') return;
+      winBound = false;
+      window.removeEventListener('pointermove', onWinMove, true);
+      window.removeEventListener('pointerup', onWinEnd, true);
+      window.removeEventListener('pointercancel', onWinEnd, true);
+      window.removeEventListener('touchmove', onWinTouchMove, true);
+      window.removeEventListener('blur', onWinBlur);
+    };
+
+    const attachWindowListeners = () => {
+      if (winBound || typeof window === 'undefined') return;
+      winBound = true;
+      window.addEventListener('pointermove', onWinMove, true);
+      window.addEventListener('pointerup', onWinEnd, true);
+      window.addEventListener('pointercancel', onWinEnd, true);
+      window.addEventListener('touchmove', onWinTouchMove, { passive: false, capture: true });
+      window.addEventListener('blur', onWinBlur);
+    };
+
+    const activateHold = () => {
+      if (!mode || holdActivated || this._isPinching) return;
+      if (holdTimer) {
+        clearTimeout(holdTimer);
+        holdTimer = null;
+      }
+      holdActivated = true;
+      this._isClipGestureActive = true;
+      this._isClipHoldLocked = true;
+      this.scrollEl?.classList.add('is-clip-dragging');
+      clip.classList.add('is-hold-active');
+      if (mode === 'left') leftTrim.classList.add('is-hold-active');
+      else if (mode === 'right') rightTrim.classList.add('is-hold-active');
+      try { navigator.vibrate?.(18); } catch {}
+      this._startEdgeAutoScroll(edgeAutoScrollTick);
+      const tipAnchor = mode === 'left' ? leftTrim : mode === 'right' ? rightTrim : clip;
+      const tipMsg = mode === 'move'
+        ? 'Tahan aktif · Geser pindah item'
+        : 'Tahan aktif · Geser perpanjang/potong';
+      this._showTooltip(tipMsg, tipAnchor, 'drag');
     };
 
     const onDown = (e, hitMode) => {
       if (e.target.classList.contains('mf-kf-diamond')) return;
       if (e.button !== undefined && e.button !== 0 && e.pointerType === 'mouse') return;
-      if (this._isPinching || this.activePointers.size >= 2) return;
+      if (this._isPinching) return;
+      if (mode && activePointerId !== null && activePointerId !== e.pointerId) return;
       e.stopPropagation();
       this._cancelHoverTooltip();
       cancelHold();
+      detachWindowListeners();
+      releaseClipPointerCapture();
 
       const isToggleMulti = Boolean(e.ctrlKey || e.metaKey);
       this._updateModifierHeld(Boolean(e.altKey || e.shiftKey), true);
@@ -3336,6 +3653,7 @@ export class TimelineView {
         return;
       }
 
+      wasAlreadySelected = clip.classList.contains('selected') || this.selectedLayerIds.has(layer.id);
       if (this.selectedLayerIds.has(layer.id) && this.selectedLayerIds.size > 1) {
         this.setSelectionInPlace(layer.id, this.selectedLayerIds);
         this.cb.onSelectLayer(layer.id, { skipTimelineRender: true, keepMulti: true });
@@ -3345,14 +3663,18 @@ export class TimelineView {
       }
 
       if (layer.locked) return;
-      // Strict zone rule: top-left/top-right corners trim/extend, clip middle moves (both require hold)
+      // Strict zone rule: top-left/top-right corners trim/extend, clip middle moves persistently until release
       mode = hitMode;
+      downPointerType = e.pointerType || 'touch';
+      downTimeMs = performance.now();
       activePointerId = e.pointerId;
+      captureEl = hitMode === 'left' ? leftTrim : hitMode === 'right' ? rightTrim : clip;
       startX = e.clientX;
       startY = e.clientY;
       lastClientX = e.clientX;
       lastClientY = e.clientY;
-      startScrollLeft = this.scrollEl.scrollLeft;
+      startScrollLeft = this.scrollEl?.scrollLeft || 0;
+      startScrollTop = this.scrollEl?.scrollTop || 0;
       origStart = layer.startFrame;
       origEnd = layer.endFrame;
       origMediaOffset = layer.mediaOffsetFrames || 0;
@@ -3363,7 +3685,7 @@ export class TimelineView {
       fineSlideActive = false;
       effectiveScaledDx = 0;
       prevStepX = 0;
-      prevStepMs = performance.now();
+      prevStepMs = downTimeMs;
 
       if (hitMode === 'move' && this.selectedLayerIds.size > 1 && this.selectedLayerIds.has(layer.id)) {
         multiGroupSnapshot = [...this.selectedLayerIds]
@@ -3395,9 +3717,18 @@ export class TimelineView {
         origMainSnapshot = null;
       }
       pushedUndo = false;
+      this._isClipGestureActive = true;
+      this._isClipHoldLocked = false;
+      this.scrollEl?.classList.add('is-clip-dragging');
+      try { captureEl.setPointerCapture(e.pointerId); } catch {}
       this._activeDragReapply = reapplyCurrentDrag;
       this._activeClipAbort = () => {
+        detachWindowListeners();
+        releaseClipPointerCapture();
         stopActiveGestureLoops();
+        this._isClipGestureActive = false;
+        this._isClipHoldLocked = false;
+        this.scrollEl?.classList.remove('is-clip-dragging');
         if (!pushedUndo && mode) {
           restoreOrigState();
         } else if (mode) {
@@ -3406,26 +3737,169 @@ export class TimelineView {
           clearDropHighlights();
           this._hideTooltip('drag');
         }
+        flushDeferredRenderIfAny();
       };
 
-      // Activate drag/extend ONLY after holding still for HOLD_DELAY_MS; quick swipes scroll cleanly
+      attachWindowListeners();
+
+      const delayMs = hitMode === 'move'
+        ? (wasAlreadySelected ? MOVE_SELECTED_HOLD_MS : MOVE_HOLD_DELAY_MS)
+        : TRIM_HOLD_DELAY_MS;
       holdTimer = setTimeout(() => {
-        if (mode !== hitMode || holdActivated || this._isPinching || this.activePointers.size >= 2) return;
-        holdActivated = true;
-        clip.classList.add('is-hold-active');
-        if (hitMode === 'left') leftTrim.classList.add('is-hold-active');
-        else if (hitMode === 'right') rightTrim.classList.add('is-hold-active');
-        try { navigator.vibrate?.(18); } catch {}
-        try {
-          if (activePointerId !== null) clip.setPointerCapture(activePointerId);
-        } catch {}
-        const tipAnchor = hitMode === 'left' ? leftTrim : hitMode === 'right' ? rightTrim : clip;
-        const tipMsg = hitMode === 'move'
-          ? 'Tahan aktif · Geser pindah item'
-          : 'Tahan aktif · Geser perpanjang/potong';
-        this._showTooltip(tipMsg, tipAnchor, 'drag');
-      }, HOLD_DELAY_MS);
+        if (mode !== hitMode || holdActivated || this._isPinching) return;
+        activateHold();
+      }, delayMs);
     };
+
+    const onWinMove = (e) => {
+      if (!mode || activePointerId === null || e.pointerId !== activePointerId) return;
+      if (!holdActivated && (this._isPinching || (!this._isClipHoldLocked && this.activePointers.size >= 2))) {
+        this._activeClipAbort?.();
+        return;
+      }
+
+      if (!holdActivated) {
+        const dx = e.clientX - startX;
+        const dy = e.clientY - startY;
+        const distPx = Math.hypot(dx, dy);
+        const elapsedMs = performance.now() - downTimeMs;
+        if (shouldActivateClipHold({
+          mode,
+          pointerType: downPointerType,
+          wasSelected: wasAlreadySelected,
+          distPx,
+          dx,
+          elapsedMs
+        })) {
+          activateHold();
+        } else {
+          return;
+        }
+      }
+
+      this._cancelHoverTooltip();
+      lastClientX = e.clientX;
+      lastClientY = e.clientY;
+      this._updateModifierHeld(Boolean(e.altKey || e.shiftKey), true);
+      pendingDragDirty = true;
+      if (pendingDragRaf === null) {
+        pendingDragRaf = requestAnimationFrame(() => {
+          pendingDragRaf = null;
+          if (!mode || !holdActivated || !pendingDragDirty) return;
+          pendingDragDirty = false;
+          applyDragStep(lastClientX, lastClientY, false);
+        });
+      }
+    };
+
+    const onWinEnd = (e) => {
+      if (!mode || activePointerId === null) return;
+      if (e?.pointerId !== undefined && e.pointerId !== null && e.pointerId !== activePointerId) return;
+      detachWindowListeners();
+      releaseClipPointerCapture();
+
+      const wasHoldActive = holdActivated;
+      const prevMode = mode;
+      const hadPendingMove = pendingDragDirty && wasHoldActive && Boolean(prevMode);
+      cancelDragRaf();
+      if (hadPendingMove) {
+        applyDragStep(lastClientX, lastClientY, false);
+      }
+      cancelHold();
+      this._activeClipAbort = null;
+      stopActiveGestureLoops();
+      this._hideTooltip('drag');
+      this.scrollEl?.classList.remove('is-clip-dragging');
+      clip.classList.remove('mf-clip-dragging-reorder', 'is-fine-slide', 'is-hold-active');
+      leftTrim.classList.remove('is-hold-active');
+      rightTrim.classList.remove('is-hold-active');
+      clearDropHighlights();
+
+      activePointerId = null;
+      this._isClipHoldLocked = false;
+
+      if (!wasHoldActive || !prevMode) {
+        this._isClipGestureActive = false;
+        // Double-tap on clip middle opens context menu without disturbing drag-and-drop hold
+        if (!wasHoldActive && !pushedUndo && prevMode === 'move' && e?.type === 'pointerup') {
+          const tapDist = Math.hypot((e.clientX || startX) - startX, (e.clientY || startY) - startY);
+          if (tapDist < TAP_MOVE_TOL_PX) {
+            const now = Date.now();
+            if (now - lastTapTime < 340 && Math.hypot(e.clientX - lastTapX, e.clientY - lastTapY) < 20) {
+              lastTapTime = 0;
+              this.cb.onOpenClipContextMenu?.(layer.id, e.clientX, e.clientY);
+            } else {
+              lastTapTime = now;
+              lastTapX = e.clientX;
+              lastTapY = e.clientY;
+            }
+          }
+        }
+        mode = null;
+        flushDeferredRenderIfAny();
+        return;
+      }
+
+      this._isClipGestureActive = false;
+      if (!pushedUndo) {
+        mode = null;
+        flushDeferredRenderIfAny();
+        return;
+      }
+      this._deferredRenderArgs = null;
+
+      if (prevMode === 'move' && pendingDrop) {
+        const d = pendingDrop;
+        pendingDrop = null;
+        mode = null;
+        if (origMainSnapshot) {
+          for (const snap of origMainSnapshot) {
+            snap.layer.startFrame = snap.startFrame;
+            snap.layer.endFrame = snap.endFrame;
+            snap.layer.mediaOffsetFrames = snap.mediaOffsetFrames;
+            snap.layer.keyframes = cloneKeyframesMap(snap.keyframes);
+          }
+        }
+        this.cb.onDropClipInTimeline?.(layer.id, d);
+        return;
+      }
+
+      if (prevMode === 'move' && isMainMagnetic && (!multiGroupSnapshot || multiGroupSnapshot.length <= 1)) {
+        if (pendingCenterFrame !== null) {
+          const moved = TimelineEngine.reorderMainTrackClipByFrame(project, layer.id, pendingCenterFrame);
+          if (moved) {
+            this.cb.onCommitTimelineChange();
+            mode = null;
+            return;
+          }
+        }
+        this.cb.onPinchZoom?.();
+        mode = null;
+        return;
+      }
+
+      if (prevMode) {
+        this.cb.onCommitTimelineChange();
+      }
+      mode = null;
+    };
+
+    const preventNativeTouchOnHandle = (e) => {
+      if (e.touches && e.touches.length === 1) {
+        e.preventDefault();
+      }
+    };
+    const preventNativeTouchMoveOnClip = (e) => {
+      if (mode && (!e.touches || e.touches.length <= 1) && e.cancelable) {
+        e.preventDefault();
+      }
+    };
+    leftTrim.addEventListener('touchstart', preventNativeTouchOnHandle, { passive: false });
+    rightTrim.addEventListener('touchstart', preventNativeTouchOnHandle, { passive: false });
+    leftTrim.addEventListener('touchmove', preventNativeTouchOnHandle, { passive: false });
+    rightTrim.addEventListener('touchmove', preventNativeTouchOnHandle, { passive: false });
+    clip.addEventListener('touchmove', preventNativeTouchMoveOnClip, { passive: false });
+    clip.addEventListener('dragstart', (e) => e.preventDefault());
 
     clip.addEventListener('contextmenu', (e) => e.preventDefault());
     leftTrim.addEventListener('pointerdown', (e) => onDown(e, 'left'));
@@ -3451,137 +3925,19 @@ export class TimelineView {
     });
 
     clip.addEventListener('pointermove', (e) => {
-      if (!mode) {
-        if (this._isPinching || e.pointerType === 'touch') return;
-        const edge = detectHandleHover(e);
-        clip.classList.toggle('hover-trim-left', edge === 'left');
-        clip.classList.toggle('hover-trim-right', edge === 'right');
-        clip.style.cursor = layer.locked ? 'not-allowed' : (edge ? 'ew-resize' : 'grab');
-        const movedDist = Math.hypot(e.clientX - lastHoverX, e.clientY - lastHoverY);
-        if (movedDist > 4) {
-          lastHoverX = e.clientX;
-          lastHoverY = e.clientY;
-          this._hideTooltip('hover');
-          scheduleHoverTooltip(edge);
-        }
-        return;
-      }
-
-      if (this._isPinching || this.activePointers.size >= 2) {
-        cancelHold();
-        return;
-      }
-
-      // If pointer moves before the hold delay completes, cancel hold so scroll/tap never misfires
-      if (!holdActivated) {
-        const moveDist = Math.hypot(e.clientX - startX, e.clientY - startY);
-        if (moveDist >= HOLD_MOVE_TOL_PX) {
-          cancelHold();
-          mode = null;
-          activePointerId = null;
-          this._activeDragReapply = null;
-          this._activeClipAbort = null;
-        }
-        return;
-      }
-
-      this._cancelHoverTooltip();
-      lastClientX = e.clientX;
-      lastClientY = e.clientY;
-      this._updateModifierHeld(Boolean(e.altKey || e.shiftKey), true);
-      pendingDragDirty = true;
-      if (pendingDragRaf === null) {
-        pendingDragRaf = requestAnimationFrame(() => {
-          pendingDragRaf = null;
-          if (!mode || !holdActivated || !pendingDragDirty) return;
-          pendingDragDirty = false;
-          applyDragStep(lastClientX, lastClientY, false);
-        });
+      if (mode || this._isPinching || e.pointerType === 'touch') return;
+      const edge = detectHandleHover(e);
+      clip.classList.toggle('hover-trim-left', edge === 'left');
+      clip.classList.toggle('hover-trim-right', edge === 'right');
+      clip.style.cursor = layer.locked ? 'not-allowed' : (edge ? 'ew-resize' : 'grab');
+      const movedDist = Math.hypot(e.clientX - lastHoverX, e.clientY - lastHoverY);
+      if (movedDist > 4) {
+        lastHoverX = e.clientX;
+        lastHoverY = e.clientY;
+        this._hideTooltip('hover');
+        scheduleHoverTooltip(edge);
       }
     });
-
-    const onEnd = (e) => {
-      const wasHoldActive = holdActivated;
-      const prevMode = mode;
-      const hadPendingMove = pendingDragDirty && wasHoldActive && Boolean(prevMode);
-      cancelDragRaf();
-      if (hadPendingMove) {
-        applyDragStep(lastClientX, lastClientY, false);
-      }
-      cancelHold();
-      this._activeClipAbort = null;
-      stopActiveGestureLoops();
-      this._hideTooltip('drag');
-      clip.classList.remove('mf-clip-dragging-reorder', 'is-fine-slide', 'is-hold-active');
-      leftTrim.classList.remove('is-hold-active');
-      rightTrim.classList.remove('is-hold-active');
-      clearDropHighlights();
-
-      const pid = e?.pointerId !== undefined ? e.pointerId : activePointerId;
-      activePointerId = null;
-      if (pid !== undefined && pid !== null) {
-        try {
-          if (clip.hasPointerCapture?.(pid)) clip.releasePointerCapture(pid);
-        } catch {}
-      }
-
-      if (!wasHoldActive || !prevMode) {
-        // Double-tap on clip middle opens context menu without disturbing drag-and-drop hold
-        if (!wasHoldActive && !pushedUndo && prevMode === 'move' && e?.type === 'pointerup') {
-          const tapDist = Math.hypot((e.clientX || startX) - startX, (e.clientY || startY) - startY);
-          if (tapDist < HOLD_MOVE_TOL_PX) {
-            const now = Date.now();
-            if (now - lastTapTime < 340 && Math.hypot(e.clientX - lastTapX, e.clientY - lastTapY) < 20) {
-              lastTapTime = 0;
-              this.cb.onOpenClipContextMenu?.(layer.id, e.clientX, e.clientY);
-            } else {
-              lastTapTime = now;
-              lastTapX = e.clientX;
-              lastTapY = e.clientY;
-            }
-          }
-        }
-        mode = null;
-        return;
-      }
-
-      if (prevMode === 'move' && pendingDrop && pushedUndo) {
-        const d = pendingDrop;
-        pendingDrop = null;
-        mode = null;
-        if (origMainSnapshot) {
-          for (const snap of origMainSnapshot) {
-            snap.layer.startFrame = snap.startFrame;
-            snap.layer.endFrame = snap.endFrame;
-            snap.layer.mediaOffsetFrames = snap.mediaOffsetFrames;
-            snap.layer.keyframes = cloneKeyframesMap(snap.keyframes);
-          }
-        }
-        this.cb.onDropClipInTimeline?.(layer.id, d);
-        return;
-      }
-
-      if (prevMode === 'move' && isMainMagnetic && pushedUndo && (!multiGroupSnapshot || multiGroupSnapshot.length <= 1)) {
-        if (pendingCenterFrame !== null) {
-          const moved = TimelineEngine.reorderMainTrackClipByFrame(project, layer.id, pendingCenterFrame);
-          if (moved) {
-            this.cb.onCommitTimelineChange();
-            mode = null;
-            return;
-          }
-        }
-        this.cb.onPinchZoom?.();
-        mode = null;
-        return;
-      }
-
-      if (prevMode && pushedUndo) {
-        this.cb.onCommitTimelineChange();
-      }
-      mode = null;
-    };
-    clip.addEventListener('pointerup', onEnd);
-    clip.addEventListener('pointercancel', onEnd);
   }
 
   _computeClipViewportSlice(leftPx, widthPx) {

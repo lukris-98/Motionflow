@@ -139,6 +139,15 @@ export const CUBIC_BEZIER_PRESETS = [
 ];
 
 export const ANIMATION_PRESETS = [
+  { id: 'textPopBounce', cat: 'in', target: 'text', label: 'Pop Teks', icon: 'bi-type' },
+  { id: 'textSlideUpFade', cat: 'in', target: 'text', label: 'Muncul Bawah', icon: 'bi-arrow-up-short' },
+  { id: 'textZoomFocus', cat: 'in', target: 'text', label: 'Fokus Teks', icon: 'bi-zoom-in' },
+  { id: 'textTypeReveal', cat: 'in', target: 'text', label: 'Kilap Masuk', icon: 'bi-stars' },
+  { id: 'textFadeDown', cat: 'out', target: 'text', label: 'Turun Pudar', icon: 'bi-arrow-down-short' },
+  { id: 'textZoomFadeOut', cat: 'out', target: 'text', label: 'Kecil Pudar', icon: 'bi-zoom-out' },
+  { id: 'textPulseGlow', cat: 'combo', target: 'text', label: 'Denyut Teks', icon: 'bi-heart-pulse' },
+  { id: 'textWaveFloat', cat: 'combo', target: 'text', label: 'Ayun Teks', icon: 'bi-stopwatch' },
+  { id: 'textWiggle', cat: 'combo', target: 'text', label: 'Getar Teks', icon: 'bi-vibrate' },
   { id: 'fadeIn', cat: 'in', label: 'Fade In', icon: 'bi-brightness-high' },
   { id: 'fadeOut', cat: 'out', label: 'Fade Out', icon: 'bi-brightness-low' },
   { id: 'slideInLeft', cat: 'in', label: 'Slide In Left', icon: 'bi-box-arrow-in-right' },
@@ -858,6 +867,93 @@ export const KeyframeEngine = {
         sk('y', start, base.y - 12, 'easeInOut');
         sk('y', mid, base.y + 12, 'easeInOut');
         sk('y', fullEnd, base.y - 12, 'linear');
+        break;
+      }
+      case 'textPopBounce': {
+        const mid1 = start + Math.round((end - start) * 0.55);
+        const mid2 = start + Math.round((end - start) * 0.8);
+        sk('opacity', start, 0, 'easeOut');
+        sk('opacity', Math.min(end, start + Math.max(4, Math.round((end - start) * 0.35))), base.opacity ?? 1, 'linear');
+        sk('scaleX', start, 0.25, 'easeOut');
+        sk('scaleY', start, 0.25, 'easeOut');
+        sk('scaleX', mid1, base.scaleX * 1.18, 'easeInOut');
+        sk('scaleY', mid1, base.scaleY * 1.18, 'easeInOut');
+        sk('scaleX', mid2, base.scaleX * 0.95, 'easeInOut');
+        sk('scaleY', mid2, base.scaleY * 0.95, 'easeInOut');
+        sk('scaleX', end, base.scaleX, 'linear');
+        sk('scaleY', end, base.scaleY, 'linear');
+        break;
+      }
+      case 'textSlideUpFade':
+        sk('y', start, base.y + Math.round(projectHeight * 0.14), 'easeOut');
+        sk('y', end, base.y, 'linear');
+        sk('opacity', start, 0, 'easeOut');
+        sk('opacity', Math.min(end, start + Math.max(6, Math.round((end - start) * 0.65))), base.opacity ?? 1, 'linear');
+        break;
+      case 'textZoomFocus':
+        sk('scaleX', start, base.scaleX * 1.45, 'easeOut');
+        sk('scaleY', start, base.scaleY * 1.45, 'easeOut');
+        sk('scaleX', end, base.scaleX, 'linear');
+        sk('scaleY', end, base.scaleY, 'linear');
+        sk('opacity', start, 0, 'easeOut');
+        sk('opacity', Math.min(end, start + Math.max(6, Math.round((end - start) * 0.6))), base.opacity ?? 1, 'linear');
+        break;
+      case 'textTypeReveal':
+        sk('opacity', start, 0, 'easeOut');
+        sk('opacity', end, base.opacity ?? 1, 'linear');
+        sk('x', start, base.x - Math.round(projectWidth * 0.06), 'easeOut');
+        sk('x', end, base.x, 'linear');
+        break;
+      case 'textFadeDown':
+        sk('y', outStart, base.y, 'easeIn');
+        sk('y', outEnd, base.y + Math.round(projectHeight * 0.14), 'linear');
+        sk('opacity', outStart, base.opacity ?? 1, 'easeIn');
+        sk('opacity', outEnd, 0, 'linear');
+        break;
+      case 'textZoomFadeOut':
+        sk('scaleX', outStart, base.scaleX, 'easeIn');
+        sk('scaleY', outStart, base.scaleY, 'easeIn');
+        sk('scaleX', outEnd, Math.max(0.1, base.scaleX * 0.55), 'linear');
+        sk('scaleY', outEnd, Math.max(0.1, base.scaleY * 0.55), 'linear');
+        sk('opacity', outStart, base.opacity ?? 1, 'easeIn');
+        sk('opacity', outEnd, 0, 'linear');
+        break;
+      case 'textPulseGlow': {
+        const half = Math.max(4, Math.round((fullEnd - start) / 2));
+        const q1 = start + Math.round(half / 2);
+        sk('scaleX', start, base.scaleX, 'easeInOut');
+        sk('scaleY', start, base.scaleY, 'easeInOut');
+        sk('scaleX', q1, base.scaleX * 1.1, 'easeInOut');
+        sk('scaleY', q1, base.scaleY * 1.1, 'easeInOut');
+        sk('scaleX', start + half, base.scaleX, 'easeInOut');
+        sk('scaleY', start + half, base.scaleY, 'easeInOut');
+        sk('scaleX', fullEnd, base.scaleX, 'linear');
+        sk('scaleY', fullEnd, base.scaleY, 'linear');
+        break;
+      }
+      case 'textWaveFloat': {
+        const t1 = start + Math.round((fullEnd - start) * 0.25);
+        const t2 = start + Math.round((fullEnd - start) * 0.5);
+        const t3 = start + Math.round((fullEnd - start) * 0.75);
+        sk('rotation', start, base.rotation - 6, 'easeInOut');
+        sk('rotation', t1, base.rotation + 6, 'easeInOut');
+        sk('rotation', t2, base.rotation - 5, 'easeInOut');
+        sk('rotation', t3, base.rotation + 5, 'easeInOut');
+        sk('rotation', fullEnd, base.rotation, 'linear');
+        break;
+      }
+      case 'textWiggle': {
+        const offsets = [0, -10, 10, -8, 8, -3, 0];
+        const span = Math.max(6, end - start);
+        let prevF = -1;
+        offsets.forEach((dx, i) => {
+          let f = Math.min(layer.endFrame, start + Math.round((i / (offsets.length - 1)) * span));
+          if (f <= prevF) f = Math.min(layer.endFrame, prevF + 1);
+          if (f > prevF) {
+            sk('x', f, base.x + dx, 'linear');
+            prevF = f;
+          }
+        });
         break;
       }
     }

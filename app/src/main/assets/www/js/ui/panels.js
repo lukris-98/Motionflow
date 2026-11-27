@@ -12,7 +12,8 @@ import {
   TEXT_TEMPLATES,
   TRANSITION_CATEGORIES,
   TRANSITION_PRESETS,
-  VIDEO_EFFECT_PRESETS
+  VIDEO_EFFECT_PRESETS,
+  getAnimationCatalogForLayerType
 } from '../engine/capcutCatalog.js';
 import { SPEED_CURVE_PRESETS, TimelineEngine } from '../engine/timelineEngine.js';
 import { STABILIZE_PRESETS } from '../engine/stabilizerEngine.js';
@@ -225,10 +226,10 @@ export class PanelsUI {
     }
     const step = () => {
       this._filterThumbBatchRaf = null;
-      if (!this.isSheetOpen('sheetFilters')) return;
-      const pending = [...document.querySelectorAll('#filtersBody img[data-filter-thumb]')].filter(
-        (imgEl) => imgEl.dataset.filterGraded !== '1'
-      );
+      if (!this.isSheetOpen('sheetFilters') && !this.isSheetOpen('sheetAdjust') && !this.isSheetOpen('sheetStyle')) return;
+      const pending = [
+        ...document.querySelectorAll('#filtersBody img[data-filter-thumb], #adjustBody img[data-filter-thumb], #styleBody img[data-filter-thumb]')
+      ].filter((imgEl) => imgEl.dataset.filterGraded !== '1');
       if (pending.length === 0) return;
       const batch = pending.slice(0, 3);
       for (const imgEl of batch) {
@@ -686,6 +687,19 @@ export class PanelsUI {
     if (!body) return;
     const layer = this.app.getSelectedLayer();
     const canApplyToLayer = Boolean(layer && layer.type !== 'audio' && layer.type !== 'group' && layer.type !== 'camera');
+    const isTextLayer = layer?.type === 'text';
+    const isMediaLayer = layer?.type === 'video' || layer?.type === 'image';
+
+    const sheetTitleEl = document.querySelector('#sheetKeyframes .offcanvas-title');
+    if (sheetTitleEl) {
+      if (isTextLayer) {
+        sheetTitleEl.innerHTML = `<i class="bi bi-type me-2 text-primary"></i>Animasi Teks &amp; Keyframes`;
+      } else if (isMediaLayer) {
+        sheetTitleEl.innerHTML = `<i class="bi bi-film me-2 text-info"></i>Animasi Item (Video / Gambar)`;
+      } else {
+        sheetTitleEl.innerHTML = `<i class="bi bi-diamond-half me-2 text-info"></i>Animations &amp; Keyframes`;
+      }
+    }
 
     const frame = Math.round(this.app.currentFrame);
     const selectedKfs = this.app.timelineView?.selectedKfs || [];
@@ -713,7 +727,7 @@ export class PanelsUI {
     const hasNextPropKf = KeyframeEngine.getNextKeyframeFrame(propFrames, frame) !== null;
     const activeEasing = kfAtCur?.easing || 'easeInOut';
     const bez = this.getBezierForEasingMode(activeEasing, kfAtCur?.bezier || [0.42, 0, 0.58, 1]);
-    const animItems = ANIMATION_CATALOG.filter((a) => a.cat === this.activeAnimTab);
+    const animItems = getAnimationCatalogForLayerType(layer?.type, this.activeAnimTab);
     const isPresetActive = (id) => Boolean(layer && (
       layer.presetInId === id || layer.presetOutId === id || layer.presetComboId === id || layer.activePresetId === id
     ));
@@ -731,17 +745,28 @@ export class PanelsUI {
           <button type="button" class="btn ${this.activeAnimTab === 'out' ? 'btn-info text-dark fw-semibold' : 'btn-dark border-secondary-subtle'}" data-anim-tab="out">Out</button>
           <button type="button" class="btn ${this.activeAnimTab === 'combo' ? 'btn-info text-dark fw-semibold' : 'btn-dark border-secondary-subtle'}" data-anim-tab="combo">Combo</button>
         </div>
-        <div class="d-flex align-items-center gap-1">
-          <span class="small text-secondary">Dur(f)</span>
-          <input id="presetDurFrames" type="number" min="6" max="180" value="24" class="form-control form-control-sm" style="width:62px;" />
+        <div class="d-flex align-items-center gap-2">
+          ${isMediaLayer ? `
+            <button type="button" id="btnJumpToTransitions" class="btn btn-xs btn-outline-info py-1 px-2" title="Buka Transisi antar klip Video/Gambar">
+              <i class="bi bi-intersect me-1"></i>Transisi Antar Klip
+            </button>
+          ` : ''}
+          <div class="d-flex align-items-center gap-1">
+            <span class="small text-secondary">Dur(f)</span>
+            <input id="presetDurFrames" type="number" min="6" max="180" value="24" class="form-control form-control-sm" style="width:62px;" />
+          </div>
         </div>
       </div>
 
       <div class="small text-secondary mb-2" style="font-size:0.7rem;">
-        <i class="bi bi-play-circle text-info me-1"></i>${
-          canApplyToLayer
-            ? `Tap kartu untuk <strong>preview</strong> animasi, tekan tombol <strong class="text-info">+</strong> di pojok kanan bawah untuk menerapkan ke <strong>${this.esc(layer.name)}</strong>.`
-            : 'Tap kartu untuk <strong>preview</strong> animasi. Pilih item video, gambar, teks, atau shape di timeline lalu tekan <strong class="text-info">+</strong> untuk menerapkan.'
+        <i class="bi ${isTextLayer ? 'bi-type text-primary' : 'bi-play-circle text-info'} me-1"></i>${
+          isTextLayer
+            ? `<strong>Animasi Teks</strong> — khusus teks &amp; tipografi. Tap untuk <strong>preview</strong>, tekan <strong class="text-info">+</strong> untuk menerapkan ke <strong>${this.esc(layer.name)}</strong>.`
+            : isMediaLayer
+              ? `<strong>Animasi Per Item (Video &amp; Gambar)</strong> — menganimasikan item <strong>${this.esc(layer.name)}</strong> sendiri. Tap untuk <strong>preview</strong>, tekan <strong class="text-info">+</strong> untuk menerapkan.`
+              : canApplyToLayer
+                ? `Tap kartu untuk <strong>preview</strong> animasi, tekan tombol <strong class="text-info">+</strong> di pojok kanan bawah untuk menerapkan ke <strong>${this.esc(layer.name)}</strong>.`
+                : 'Tap kartu untuk <strong>preview</strong> animasi. Pilih item video, gambar, teks, atau shape di timeline lalu tekan <strong class="text-info">+</strong> untuk menerapkan.'
         }
       </div>
 
@@ -749,7 +774,10 @@ export class PanelsUI {
         ${animItems.map((a) => `
           <div role="button" tabindex="0" class="mf-preview-tile has-add-btn ${isPresetActive(a.id) ? 'active' : ''}" data-anim-preview="${a.id}" aria-label="Preview ${a.label}">
             <div class="mf-tile-stage">
-              <div class="mf-anim-chip ${a.animClass}" style="background:linear-gradient(135deg, ${a.color}, #7c4dff);">Aa</div>
+              ${isTextLayer
+                ? `<div class="mf-anim-chip mf-anim-text-chip ${a.animClass}" style="background:linear-gradient(135deg, ${a.color}, #7c4dff);">Teks</div>`
+                : `<div class="mf-anim-clip-chip ${a.animClass}" style="background:linear-gradient(135deg, ${a.color}, #2563eb);"><i class="bi bi-image-fill"></i></div>`
+              }
             </div>
             <div class="mf-tile-label">${a.label}</div>
             <button type="button" class="mf-tile-add-btn" data-preset="${a.id}" title="Apply ${a.label}" aria-label="Apply ${a.label}">
@@ -888,6 +916,12 @@ export class PanelsUI {
     if (layer) {
       this.drawBezierGraph(body.querySelector('#svgBezier'), bez, kfAtCur, body, layer, prop, frame, curVal, activeEasing);
     }
+
+    body.querySelector('#btnJumpToTransitions')?.addEventListener('click', () => {
+      this.app.stopTemplateLivePreview();
+      this.app.hideOpenSheets();
+      this.app.openTransitionsSheet({ layerId: layer.id });
+    });
 
     body.querySelectorAll('[data-anim-tab]').forEach((btn) => {
       btn.onclick = () => {
@@ -3573,7 +3607,7 @@ export class PanelsUI {
             return `
             <button type="button" class="mf-preview-tile ${(target.filterId || 'normal') === fp.id ? 'active' : ''}" data-fx-preset="${fp.id}">
               <div class="mf-tile-stage">
-                <img src="${pInfo.src}" data-filter-thumb="${fp.id}" class="mf-tile-thumb" style="filter:${pInfo.cssFilter};" alt="${this.esc(fp.label)}" />
+                <img src="${pInfo.src}" data-filter-thumb="${fp.id}" data-filter-graded="${pInfo.graded ? '1' : '0'}" class="mf-tile-thumb" style="filter:${pInfo.cssFilter};" alt="${this.esc(fp.label)}" loading="lazy" decoding="async" />
               </div>
               <div class="mf-tile-label">${fp.label}</div>
             </button>
@@ -3887,6 +3921,7 @@ export class PanelsUI {
         }
       };
     });
+    this._scheduleFilterThumbBatch();
 
     if (!layer) return;
 
@@ -4142,45 +4177,48 @@ export class PanelsUI {
 
   buildMaskTransTabHtml(layer) {
     if (layer.type === 'audio' || layer.type === 'group') {
-      return `<div class="text-center text-secondary py-4 small">Crop, Masking &amp; Clip Transitions apply to visual layers (Video, Image, Text, Shape).</div>`;
+      return `<div class="text-center text-secondary py-4 small">Crop, Masking &amp; PIP apply to visual layers (Video, Image, Text, Shape).</div>`;
     }
     const mask = this.ensureLayerMask(layer);
     const tr = this.ensureLayerTransitions(layer);
     const crop = this.ensureLayerCrop(layer);
     const curTrId = this.activeTransSide === 'in' ? tr.inType : tr.outType;
     const curTrFrames = this.activeTransSide === 'in' ? (tr.inFrames || 15) : (tr.outFrames || 15);
+    const isMediaLayer = layer.type === 'video' || layer.type === 'image';
 
     return `
-      <div class="p-2 rounded bg-dark border border-secondary-subtle mb-2">
-        <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-2">
-          <div class="btn-group btn-group-sm">
-            <button type="button" class="btn ${this.activeTransSide === 'in' ? 'btn-info text-dark fw-semibold' : 'btn-dark border-secondary-subtle'}" data-tr-side="in">In</button>
-            <button type="button" class="btn ${this.activeTransSide === 'out' ? 'btn-info text-dark fw-semibold' : 'btn-dark border-secondary-subtle'}" data-tr-side="out">Out</button>
-          </div>
-          <div class="d-flex align-items-center gap-1 flex-shrink-0">
-            <button id="btnOpenFullTransitions" type="button" class="btn btn-xs btn-outline-info py-1 px-2"><i class="bi bi-intersect me-1"></i>Between Clips</button>
-            <span class="small text-secondary">F</span>
-            <input id="trCurFrames" type="number" min="2" max="120" class="form-control form-control-sm" style="width:56px;" value="${curTrFrames}" />
-          </div>
-        </div>
-        <div class="mf-tile-grid">
-          ${TRANSITION_PRESETS.map((tp) => `
-            <div role="button" tabindex="0" class="mf-preview-tile has-add-btn ${(curTrId || 'none') === tp.id ? 'active' : ''}" data-tr-preview="${tp.id}" aria-label="Preview ${tp.label}">
-              <div class="mf-tile-stage">
-                <div class="mf-tr-stage ${tp.animClass || 'mf-tr-none'}">
-                  <div class="mf-tr-clip-a">A</div>
-                  <div class="mf-tr-clip-b">B</div>
-                  <div class="mf-tr-flash-ov"></div>
-                </div>
-              </div>
-              <div class="mf-tile-label">${tp.label}</div>
-              <button type="button" class="mf-tile-add-btn" data-tr-pick="${tp.id}" title="Apply ${tp.label}" aria-label="Apply ${tp.label}">
-                <i class="bi bi-plus-lg"></i>
-              </button>
+      ${isMediaLayer ? `
+        <div class="p-2 rounded bg-dark border border-secondary-subtle mb-2">
+          <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-2">
+            <div class="btn-group btn-group-sm">
+              <button type="button" class="btn ${this.activeTransSide === 'in' ? 'btn-info text-dark fw-semibold' : 'btn-dark border-secondary-subtle'}" data-tr-side="in">In</button>
+              <button type="button" class="btn ${this.activeTransSide === 'out' ? 'btn-info text-dark fw-semibold' : 'btn-dark border-secondary-subtle'}" data-tr-side="out">Out</button>
             </div>
-          `).join('')}
+            <div class="d-flex align-items-center gap-1 flex-shrink-0">
+              <button id="btnOpenFullTransitions" type="button" class="btn btn-xs btn-outline-info py-1 px-2"><i class="bi bi-intersect me-1"></i>Antar Klip</button>
+              <span class="small text-secondary">F</span>
+              <input id="trCurFrames" type="number" min="2" max="120" class="form-control form-control-sm" style="width:56px;" value="${curTrFrames}" />
+            </div>
+          </div>
+          <div class="mf-tile-grid">
+            ${TRANSITION_PRESETS.map((tp) => `
+              <div role="button" tabindex="0" class="mf-preview-tile has-add-btn ${(curTrId || 'none') === tp.id ? 'active' : ''}" data-tr-preview="${tp.id}" aria-label="Preview ${tp.label}">
+                <div class="mf-tile-stage">
+                  <div class="mf-tr-stage ${tp.animClass || 'mf-tr-none'}">
+                    <div class="mf-tr-clip-a">A</div>
+                    <div class="mf-tr-clip-b">B</div>
+                    <div class="mf-tr-flash-ov"></div>
+                  </div>
+                </div>
+                <div class="mf-tile-label">${tp.label}</div>
+                <button type="button" class="mf-tile-add-btn" data-tr-pick="${tp.id}" title="Apply ${tp.label}" aria-label="Apply ${tp.label}">
+                  <i class="bi bi-plus-lg"></i>
+                </button>
+              </div>
+            `).join('')}
+          </div>
         </div>
-      </div>
+      ` : ''}
 
       <div class="p-2 rounded bg-dark border border-secondary-subtle mb-2">
         <div class="d-flex justify-content-between align-items-center mb-1">
@@ -4613,8 +4651,16 @@ export class PanelsUI {
 
     const project = this.app.project;
     const fps = Math.max(1, project.fps || 30);
-    const junctions = TimelineEngine.findTransitionJunctions(project);
-    const visualLayers = project.layers.filter((l) => l.type !== 'audio' && l.type !== 'group');
+    const allJunctions = TimelineEngine.findTransitionJunctions(project);
+    const mediaJunctions = allJunctions.filter((j) =>
+      (j.left?.type === 'video' || j.left?.type === 'image') &&
+      (j.right?.type === 'video' || j.right?.type === 'image')
+    );
+    const junctions = mediaJunctions.length > 0 ? mediaJunctions : allJunctions;
+    const mediaLayers = project.layers.filter((l) => l.type === 'video' || l.type === 'image');
+    const visualLayers = mediaLayers.length > 0
+      ? mediaLayers
+      : project.layers.filter((l) => l.type !== 'audio' && l.type !== 'group');
 
     let tgt = this.transitionTarget || { mode: 'junction', leftId: null, rightId: null, layerId: null };
     let activeJunction = null;
@@ -4662,10 +4708,10 @@ export class PanelsUI {
       <div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mb-2">
         <div class="btn-group btn-group-sm">
           <button type="button" class="btn ${tgt.mode === 'junction' ? 'btn-info text-dark fw-semibold' : 'btn-dark border-secondary-subtle'}" data-tr-mode="junction" ${junctions.length === 0 ? 'disabled' : ''}>
-            <i class="bi bi-intersect me-1"></i>Cut Seam (${junctions.length})
+            <i class="bi bi-intersect me-1"></i>Antar Klip (${junctions.length})
           </button>
-          <button type="button" class="btn ${tgt.mode === 'in' ? 'btn-info text-dark fw-semibold' : 'btn-dark border-secondary-subtle'}" data-tr-mode="in" ${!activeLayer ? 'disabled' : ''}>Clip In</button>
-          <button type="button" class="btn ${tgt.mode === 'out' ? 'btn-info text-dark fw-semibold' : 'btn-dark border-secondary-subtle'}" data-tr-mode="out" ${!activeLayer ? 'disabled' : ''}>Clip Out</button>
+          <button type="button" class="btn ${tgt.mode === 'in' ? 'btn-info text-dark fw-semibold' : 'btn-dark border-secondary-subtle'}" data-tr-mode="in" ${!activeLayer ? 'disabled' : ''}>Masuk Klip</button>
+          <button type="button" class="btn ${tgt.mode === 'out' ? 'btn-info text-dark fw-semibold' : 'btn-dark border-secondary-subtle'}" data-tr-mode="out" ${!activeLayer ? 'disabled' : ''}>Keluar Klip</button>
         </div>
 
         ${tgt.mode === 'junction' && activeJunction ? `
@@ -4681,11 +4727,13 @@ export class PanelsUI {
         ` : ''}
       </div>
 
-      ${junctions.length === 0 ? `
-        <div class="alert alert-dark border-secondary-subtle py-1 px-2 mb-2 small text-secondary">
-          <i class="bi bi-info-circle text-info me-1"></i>Split a clip or import sequential clips to unlock Cut Seam transitions — or apply Clip In/Out below.
-        </div>
-      ` : ''}
+      <div class="small text-secondary mb-2" style="font-size:0.7rem;">
+        <i class="bi bi-intersect text-info me-1"></i>${
+          junctions.length === 0
+            ? '<strong>Transisi perpindahan Video/Gambar</strong> — potong klip atau susun 2 item Video/Gambar berurutan untuk transisi antar klip, atau gunakan Masuk/Keluar Klip di atas.'
+            : '<strong>Transisi perpindahan</strong> antar item Video/Gambar (klip A → klip B). Untuk gerak satu item gunakan <strong>Anim Item</strong>; untuk teks gunakan <strong>Anim Teks</strong>.'
+        }
+      </div>
 
       <div class="mf-cat-scroll mb-2">
         ${TRANSITION_CATEGORIES.map((c) => `

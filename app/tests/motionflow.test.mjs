@@ -12,7 +12,7 @@ import {
 } from '../src/main/assets/www/js/engine/stabilizerEngine.js';
 import { TimelineEngine } from '../src/main/assets/www/js/engine/timelineEngine.js';
 import { AudioEngine, detectBeatsFromPcm } from '../src/main/assets/www/js/engine/audioEngine.js';
-import { parseSrtOrLyrics, FILTER_PRESETS, VIDEO_EFFECT_PRESETS, TRANSITION_PRESETS, TRANSITION_CATEGORIES } from '../src/main/assets/www/js/engine/capcutCatalog.js';
+import { parseSrtOrLyrics, FILTER_PRESETS, VIDEO_EFFECT_PRESETS, TRANSITION_PRESETS, TRANSITION_CATEGORIES, getAnimationCatalogForLayerType } from '../src/main/assets/www/js/engine/capcutCatalog.js';
 import { ExportEngine } from '../src/main/assets/www/js/export/exportEngine.js';
 import { createEmptyProject, deserializeProject, serializeProject } from '../src/main/assets/www/js/storage/projectStorage.js';
 import { RendererEngine } from '../src/main/assets/www/js/engine/rendererEngine.js';
@@ -40,11 +40,14 @@ import {
   toggleLayerColorMatch
 } from '../src/main/assets/www/js/engine/colorMatchEngine.js';
 import {
+  TIMELINE_LEFT_PAD,
   computeCenterPadLeft,
   frameToTimelineX,
   timelineXToFrame,
   frameToCenterScrollLeft,
-  scrollLeftToCenterFrame
+  scrollLeftToCenterFrame,
+  shouldActivateClipHold,
+  computeRulerWindow
 } from '../src/main/assets/www/js/ui/timelineView.js';
 
 test('KeyframeEngine smooth Catmull-Rom spline & smoothCameraKeyframes', () => {
@@ -1942,34 +1945,34 @@ test('TrackerEngine smoothTrackedPoints & passBy 3D roadside text fade-out', () 
   assert.equal(textLayer.pinnedSourceLayerId, 'vid-src');
 });
 
-test('Timeline center-locked playhead & pixel-locked ruler/clip alignment across scroll, zoom, and viewport widths', () => {
+test('Timeline left-anchored ruler beside wheel column & dynamic playhead/clip alignment across scroll and zoom', () => {
   const fps = 30;
   // Exact scenario: 2s 20f (F80) to 5s 13f (F163)
   const itemStartFrame = 2 * fps + 20; // 80
   const itemEndFrame = 5 * fps + 13;   // 163
 
   const viewports = [292, 360, 412, 768];
-  const zooms = [0.5, 1.5, 2.5, 6.0, 14.0];
+  const zooms = [0.5, 0.72, 1.5, 2.5, 6.0, 14.0];
 
   for (const vw of viewports) {
     const padLeft = computeCenterPadLeft(vw);
-    assert.equal(padLeft, Math.round(vw * 0.5));
+    assert.equal(padLeft, TIMELINE_LEFT_PAD);
+    assert.equal(frameToTimelineX(0, 0.72, padLeft), TIMELINE_LEFT_PAD);
 
     for (const pxPerFrame of zooms) {
       const clipLeftContentX = frameToTimelineX(itemStartFrame, pxPerFrame, padLeft);
       const clipWidthPx = Math.max(4, (itemEndFrame - itemStartFrame) * pxPerFrame);
       const clipRightContentX = clipLeftContentX + clipWidthPx;
 
-      // Test at various scrolled frames (including start=0, itemStart=80, midpoint=121, itemEnd=163)
-      for (const playheadFrame of [0, 45, itemStartFrame, 121, itemEndFrame, 240]) {
-        const scrollLeft = frameToCenterScrollLeft(playheadFrame, pxPerFrame);
-        assert.equal(scrollLeftToCenterFrame(scrollLeft, pxPerFrame), playheadFrame);
+      for (const scrollLeft of [0, 32, 140]) {
+        // Playhead tracks frame 1:1 with ruler and clips regardless of scroll offset
+        for (const playheadFrame of [0, 45, itemStartFrame, 121, itemEndFrame]) {
+          const playheadViewportX = frameToTimelineX(playheadFrame, pxPerFrame, padLeft) - scrollLeft;
+          const expectedAtFrame = padLeft + playheadFrame * pxPerFrame - scrollLeft;
+          assert.ok(Math.abs(playheadViewportX - expectedAtFrame) < 1e-6);
+        }
 
-        // Viewport-local X of playhead frame must coincide identically with fixed center line padLeft
-        const playheadViewportX = frameToTimelineX(playheadFrame, pxPerFrame, padLeft) - scrollLeft;
-        assert.ok(Math.abs(playheadViewportX - padLeft) < 1e-6, `Playhead drifted: ${playheadViewportX} vs ${padLeft}`);
-
-        // Ruler tick X and clip start/end X must stay 100% locked across scroll & zoom
+        // Ruler tick X and clip start/end X stay 100% locked across scroll & zoom
         const rulerStartViewportX = frameToTimelineX(itemStartFrame, pxPerFrame, padLeft) - scrollLeft;
         const rulerEndViewportX = frameToTimelineX(itemEndFrame, pxPerFrame, padLeft) - scrollLeft;
         const clipStartViewportX = clipLeftContentX - scrollLeft;
@@ -1982,6 +1985,12 @@ test('Timeline center-locked playhead & pixel-locked ruler/clip alignment across
       }
     }
   }
+
+  // Verify pinch zoom smoothly transitions ruler ticks from 5s/10s overview to 1s steps (1,2,3,4,5s...)
+  const overviewTicks = computeDynamicRulerTicks(0.72, fps); // 21.6 px/s
+  assert.ok(overviewTicks.labelFrames >= fps * 2, `Overview should use multi-second labels, got ${overviewTicks.labelFrames}f`);
+  const zoomedInTicks = computeDynamicRulerTicks(2.0, fps); // 60 px/s
+  assert.equal(zoomedInTicks.labelFrames, fps, 'Zoomed in should label every 1 second (1s, 2s, 3s, 4s, 5s...)');
 });
 
 test('ProjectStorage preserves normalized track zoneOrder across serialize/deserialize', () => {
@@ -1999,7 +2008,116 @@ test('ProjectStorage preserves normalized track zoneOrder across serialize/deser
   assert.deepEqual(sanitized.settings.zoneOrder, ['main', 'overlay', 'audio']);
 });
 
+test('TimelineEngine.getPlayheadMaxFrame clamps playhead strictly to the end of the last timeline item', () => {
+  const proj = createEmptyProject('PlayheadLimitProj', { fps: 30, durationSec: 10 }); // durationFrames = 300
+  assert.equal(TimelineEngine.getPlayheadMaxFrame(proj), 0, 'Empty timeline should limit playhead to frame 0');
 
+  const clipA = TimelineEngine.createMediaLayer(proj, { id: 'vid1', type: 'video', name: 'Clip A', durationMs: 3000 }, 0);
+  const clipB = TimelineEngine.createMediaLayer(proj, { id: 'img1', type: 'image', name: 'Clip B', durationMs: 2500 }, 90);
+  proj.layers.push(clipA, clipB);
+  assert.equal(TimelineEngine.getPlayheadMaxFrame(proj), 165);
+
+  // Even when project.durationFrames has extra trailing padding (e.g. 300), playhead max stops at 165
+  assert.equal(proj.durationFrames, 300);
+  const cuts = TimelineEngine.getCutPointFrames(proj);
+  assert.ok(!cuts.includes(300), 'Cut points must not jump past the last item end into padded duration');
+  assert.ok(cuts.includes(165));
+
+  // Trimming last item shorter shrinks playhead max immediately
+  clipB.endFrame = 132;
+  assert.equal(TimelineEngine.getPlayheadMaxFrame(proj), 132);
+
+  // Removing last item updates playhead max to remaining last item
+  proj.layers = proj.layers.filter((l) => l.id !== clipB.id);
+  assert.equal(TimelineEngine.getPlayheadMaxFrame(proj), 90);
+});
+
+test('Animation catalog separates Text animations from shared Video/Image per-item animations', () => {
+  const proj = createEmptyProject('AnimCatalogProj', { fps: 30, width: 1080, height: 1920 });
+  const videoAll = getAnimationCatalogForLayerType('video').map((p) => p.id);
+  const imageAll = getAnimationCatalogForLayerType('image').map((p) => p.id);
+  assert.deepEqual(videoAll, imageAll, 'Video and Image layers must share identical per-item animation presets');
+
+  const textAll = getAnimationCatalogForLayerType('text').map((p) => p.id);
+  assert.ok(textAll.includes('textPopBounce'), 'Text catalog includes textPopBounce');
+  assert.ok(textAll.includes('textSlideUpFade'), 'Text catalog includes textSlideUpFade');
+  assert.ok(textAll.includes('textPulseGlow'), 'Text catalog includes textPulseGlow');
+  assert.ok(!textAll.includes('shake'), 'Text catalog excludes visual-only camera shake preset');
+  assert.ok(!videoAll.includes('textTypeReveal'), 'Video/Image catalog excludes text-specific typewriter reveal');
+
+  // Verify text animation presets generate valid keyframes on a text layer
+  const textLayer = TimelineEngine.createTextLayer(proj, 0);
+  textLayer.endFrame = 90;
+  for (const presetId of ['textPopBounce', 'textSlideUpFade', 'textZoomFocus', 'textTypeReveal', 'textFadeDown', 'textZoomFadeOut', 'textPulseGlow', 'textWaveFloat', 'textWiggle']) {
+    KeyframeEngine.applyPreset(textLayer, presetId, proj.width, proj.height, 24);
+    const totalKfs = Object.values(textLayer.keyframes).reduce((sum, arr) => sum + arr.length, 0);
+    assert.ok(totalKfs >= 2, `Preset ${presetId} should generate keyframes`);
+  }
+});
+
+test('Persistent timeline item drag activation never drops into scroll-hijack and trims stay responsive', () => {
+  // Quick taps stay tap-to-select until threshold or hold timer fires
+  assert.equal(shouldActivateClipHold({ mode: 'move', pointerType: 'touch', wasSelected: false, distPx: 5, elapsedMs: 40 }), false);
+  assert.equal(shouldActivateClipHold({ mode: 'move', pointerType: 'touch', wasSelected: true, distPx: 4, elapsedMs: 40 }), false);
+
+  // Moving an already-selected or unselected item on touch immediately locks into drag without cancelling to scroll
+  assert.equal(shouldActivateClipHold({ mode: 'move', pointerType: 'touch', wasSelected: true, distPx: 7, elapsedMs: 35 }), true);
+  assert.equal(shouldActivateClipHold({ mode: 'move', pointerType: 'touch', wasSelected: false, distPx: 14, elapsedMs: 45 }), true);
+
+  // Long-press still activates hold even with zero pointer drift
+  assert.equal(shouldActivateClipHold({ mode: 'move', pointerType: 'touch', wasSelected: true, distPx: 0, elapsedMs: 115 }), true);
+  assert.equal(shouldActivateClipHold({ mode: 'move', pointerType: 'touch', wasSelected: false, distPx: 0, elapsedMs: 145 }), true);
+
+  // Mouse/pen drag activates crisply on minimal displacement
+  assert.equal(shouldActivateClipHold({ mode: 'move', pointerType: 'mouse', wasSelected: false, distPx: 4, elapsedMs: 20 }), true);
+
+  // Left/right corner trim handles activate reliably on drag or brief hold
+  assert.equal(shouldActivateClipHold({ mode: 'left', pointerType: 'touch', distPx: 4, dx: -4, elapsedMs: 25 }), true);
+  assert.equal(shouldActivateClipHold({ mode: 'right', pointerType: 'touch', distPx: 0, dx: 0, elapsedMs: 115 }), true);
+
+  // Vertical edge auto-scroll math works symmetrically with horizontal edge auto-scroll
+  assert.equal(computeEdgeAutoScrollDelta(200, 120, 360, 0, 26, 12), 0);
+  assert.ok(computeEdgeAutoScrollDelta(128, 120, 360, 50, 26, 12) < 0);
+  assert.ok(computeEdgeAutoScrollDelta(352, 120, 360, 50, 26, 12) > 0);
+});
+
+test('computeRulerWindow keeps ruler bitmap static inside buffered content window so scroll stays compositor-locked with clips', () => {
+  // Standard timelines fit inside a single content-space canvas: zero redraws during scroll
+  const small = computeRulerWindow({ totalWidth: 1600, viewportW: 360, scrollLeft: 420, dpr: 2, currentStart: 0, currentWidth: 1600 });
+  assert.equal(small.windowStart, 0);
+  assert.equal(small.windowWidth, 1600);
+  assert.equal(small.needsRedraw, false);
+
+  // Very long zoomed-in timelines use a 1920px (@dpr=2) sliding buffer window that stays locked without redrawing across normal swipes
+  const initLong = computeRulerWindow({ totalWidth: 8000, viewportW: 360, scrollLeft: 1200, dpr: 2, currentStart: 0, currentWidth: 0 });
+  assert.equal(initLong.windowWidth, 1920);
+  assert.equal(initLong.needsRedraw, true);
+  assert.ok(initLong.windowStart > 0 && initLong.windowStart < 1200);
+
+  // Scrolling within safe buffer margins requires zero canvas redraws (compositor moves ruler & clips together)
+  const midScroll = computeRulerWindow({
+    totalWidth: 8000,
+    viewportW: 360,
+    scrollLeft: 1320,
+    dpr: 2,
+    currentStart: initLong.windowStart,
+    currentWidth: initLong.windowWidth
+  });
+  assert.equal(midScroll.needsRedraw, false);
+  assert.equal(midScroll.windowStart, initLong.windowStart);
+
+  // Approaching buffer edge shifts window smoothly while maintaining exact content-coordinate alignment
+  const farScroll = computeRulerWindow({
+    totalWidth: 8000,
+    viewportW: 360,
+    scrollLeft: initLong.windowStart + initLong.windowWidth - 200,
+    dpr: 2,
+    currentStart: initLong.windowStart,
+    currentWidth: initLong.windowWidth
+  });
+  assert.equal(farScroll.needsRedraw, true);
+  assert.ok(farScroll.windowStart > initLong.windowStart);
+});
 
 
 

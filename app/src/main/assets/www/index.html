@@ -187,19 +187,21 @@
         <div id="trackHeadersList" class="mf-track-headers-list flex-grow-1 overflow-y-auto overflow-x-hidden"></div>
       </div>
 
-      <!-- Right Scrollable Ruler + Lanes with Fixed Center Playhead -->
+      <!-- Right Scrollable Ruler + Lanes with Compositor-Synced Playhead -->
       <div id="timelineViewport" class="mf-timeline-viewport flex-grow-1 position-relative overflow-hidden d-flex flex-column">
         <div id="timelineScroll" class="mf-timeline-scroll flex-grow-1 position-relative overflow-auto">
           <div id="timelineContent" class="mf-timeline-content position-relative">
-            <canvas id="rulerCanvas" class="mf-ruler-canvas d-block border-bottom border-secondary-subtle"></canvas>
+            <div id="rulerTrack" class="mf-ruler-track border-bottom border-secondary-subtle">
+              <canvas id="rulerCanvas" class="mf-ruler-canvas d-block"></canvas>
+            </div>
             <div id="trackLanesList" class="mf-track-lanes-list position-relative"></div>
             <div id="timelineSnapGuide" class="mf-snap-guide d-none">
               <span class="mf-snap-guide-tag"></span>
             </div>
+            <div id="playheadLine" class="mf-playhead-line" aria-hidden="true">
+              <div class="mf-playhead-head"></div>
+            </div>
           </div>
-        </div>
-        <div id="playheadLine" class="mf-playhead-line" aria-hidden="true">
-          <div class="mf-playhead-head"></div>
         </div>
       </div>
     </div>

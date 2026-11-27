@@ -1,31 +1,56 @@
 export const ANIMATION_CATALOG = [
-  // IN Animations
-  { id: 'fadeIn', cat: 'in', label: 'Fade In', animClass: 'mf-anim-fade-in', color: '#00e5ff' },
-  { id: 'slideInLeft', cat: 'in', label: 'Slide Left', animClass: 'mf-anim-slide-left', color: '#40c4ff' },
-  { id: 'slideInRight', cat: 'in', label: 'Slide Right', animClass: 'mf-anim-slide-right', color: '#40c4ff' },
-  { id: 'slideInUp', cat: 'in', label: 'Slide Up', animClass: 'mf-anim-slide-up', color: '#69f0ae' },
-  { id: 'slideInDown', cat: 'in', label: 'Slide Down', animClass: 'mf-anim-slide-down', color: '#69f0ae' },
-  { id: 'zoomIn', cat: 'in', label: 'Zoom In', animClass: 'mf-anim-zoom-in', color: '#ffab40' },
-  { id: 'bounceIn', cat: 'in', label: 'Bounce In', animClass: 'mf-anim-bounce-in', color: '#ff4081' },
-  { id: 'spinIn', cat: 'in', label: 'Spin In', animClass: 'mf-anim-spin-in', color: '#b388ff' },
-  { id: 'popUp', cat: 'in', label: 'Pop Up', animClass: 'mf-anim-pop-up', color: '#ffd740' },
+  // TEXT-SPECIFIC IN Animations
+  { id: 'textPopBounce', cat: 'in', target: 'text', label: 'Pop Teks', animClass: 'mf-anim-bounce-in', color: '#38bdf8' },
+  { id: 'textSlideUpFade', cat: 'in', target: 'text', label: 'Muncul Bawah', animClass: 'mf-anim-slide-up', color: '#69f0ae' },
+  { id: 'textZoomFocus', cat: 'in', target: 'text', label: 'Fokus Teks', animClass: 'mf-anim-zoom-in', color: '#ffab40' },
+  { id: 'textTypeReveal', cat: 'in', target: 'text', label: 'Kilap Masuk', animClass: 'mf-anim-fade-in', color: '#a78bfa' },
 
-  // OUT Animations
-  { id: 'fadeOut', cat: 'out', label: 'Fade Out', animClass: 'mf-anim-fade-out', color: '#00e5ff' },
-  { id: 'slideOutLeft', cat: 'out', label: 'Slide Out L', animClass: 'mf-anim-slide-out-l', color: '#40c4ff' },
-  { id: 'slideOutRight', cat: 'out', label: 'Slide Out R', animClass: 'mf-anim-slide-out-r', color: '#40c4ff' },
-  { id: 'slideOutDown', cat: 'out', label: 'Drop Out', animClass: 'mf-anim-slide-out-d', color: '#69f0ae' },
-  { id: 'zoomOut', cat: 'out', label: 'Zoom Out', animClass: 'mf-anim-zoom-out', color: '#ffab40' },
-  { id: 'spinOut', cat: 'out', label: 'Spin Out', animClass: 'mf-anim-spin-out', color: '#b388ff' },
+  // TEXT-SPECIFIC OUT Animations
+  { id: 'textFadeDown', cat: 'out', target: 'text', label: 'Turun Pudar', animClass: 'mf-anim-slide-out-d', color: '#69f0ae' },
+  { id: 'textZoomFadeOut', cat: 'out', target: 'text', label: 'Kecil Pudar', animClass: 'mf-anim-zoom-out', color: '#ffab40' },
 
-  // COMBO / LOOP Animations
-  { id: 'bounce', cat: 'combo', label: 'Bounce Pop', animClass: 'mf-anim-bounce', color: '#ff4081' },
-  { id: 'shake', cat: 'combo', label: 'Camera Shake', animClass: 'mf-anim-shake', color: '#ff5252' },
-  { id: 'pulseLoop', cat: 'combo', label: 'Heartbeat', animClass: 'mf-anim-pulse', color: '#00e5ff' },
-  { id: 'swing', cat: 'combo', label: 'Pendulum', animClass: 'mf-anim-swing', color: '#ffab40' },
-  { id: 'float3D', cat: 'combo', label: '3D Float', animClass: 'mf-anim-float3d', color: '#7c4dff' },
-  { id: 'rotate360', cat: 'combo', label: 'Spin 360°', animClass: 'mf-anim-spin-360', color: '#69f0ae' }
+  // TEXT-SPECIFIC COMBO Animations
+  { id: 'textPulseGlow', cat: 'combo', target: 'text', label: 'Denyut Teks', animClass: 'mf-anim-pulse', color: '#38bdf8' },
+  { id: 'textWaveFloat', cat: 'combo', target: 'text', label: 'Ayun Teks', animClass: 'mf-anim-swing', color: '#f472b6' },
+  { id: 'textWiggle', cat: 'combo', target: 'text', label: 'Getar Teks', animClass: 'mf-anim-shake', color: '#ff5252' },
+
+  // SHARED / VIDEO & IMAGE ITEM IN Animations
+  { id: 'fadeIn', cat: 'in', target: 'all', label: 'Fade In', animClass: 'mf-anim-fade-in', color: '#00e5ff' },
+  { id: 'slideInLeft', cat: 'in', target: 'all', label: 'Slide Left', animClass: 'mf-anim-slide-left', color: '#40c4ff' },
+  { id: 'slideInRight', cat: 'in', target: 'all', label: 'Slide Right', animClass: 'mf-anim-slide-right', color: '#40c4ff' },
+  { id: 'slideInUp', cat: 'in', target: 'visual', label: 'Slide Up', animClass: 'mf-anim-slide-up', color: '#69f0ae' },
+  { id: 'slideInDown', cat: 'in', target: 'all', label: 'Slide Down', animClass: 'mf-anim-slide-down', color: '#69f0ae' },
+  { id: 'zoomIn', cat: 'in', target: 'visual', label: 'Zoom In', animClass: 'mf-anim-zoom-in', color: '#ffab40' },
+  { id: 'bounceIn', cat: 'in', target: 'visual', label: 'Bounce In', animClass: 'mf-anim-bounce-in', color: '#ff4081' },
+  { id: 'spinIn', cat: 'in', target: 'all', label: 'Spin In', animClass: 'mf-anim-spin-in', color: '#b388ff' },
+  { id: 'popUp', cat: 'in', target: 'all', label: 'Pop Up', animClass: 'mf-anim-pop-up', color: '#ffd740' },
+
+  // SHARED / VIDEO & IMAGE ITEM OUT Animations
+  { id: 'fadeOut', cat: 'out', target: 'all', label: 'Fade Out', animClass: 'mf-anim-fade-out', color: '#00e5ff' },
+  { id: 'slideOutLeft', cat: 'out', target: 'all', label: 'Slide Out L', animClass: 'mf-anim-slide-out-l', color: '#40c4ff' },
+  { id: 'slideOutRight', cat: 'out', target: 'all', label: 'Slide Out R', animClass: 'mf-anim-slide-out-r', color: '#40c4ff' },
+  { id: 'slideOutDown', cat: 'out', target: 'visual', label: 'Drop Out', animClass: 'mf-anim-slide-out-d', color: '#69f0ae' },
+  { id: 'zoomOut', cat: 'out', target: 'visual', label: 'Zoom Out', animClass: 'mf-anim-zoom-out', color: '#ffab40' },
+  { id: 'spinOut', cat: 'out', target: 'all', label: 'Spin Out', animClass: 'mf-anim-spin-out', color: '#b388ff' },
+
+  // SHARED / VIDEO & IMAGE ITEM COMBO / LOOP Animations
+  { id: 'bounce', cat: 'combo', target: 'all', label: 'Bounce Pop', animClass: 'mf-anim-bounce', color: '#ff4081' },
+  { id: 'shake', cat: 'combo', target: 'visual', label: 'Camera Shake', animClass: 'mf-anim-shake', color: '#ff5252' },
+  { id: 'pulseLoop', cat: 'combo', target: 'visual', label: 'Heartbeat', animClass: 'mf-anim-pulse', color: '#00e5ff' },
+  { id: 'swing', cat: 'combo', target: 'visual', label: 'Pendulum', animClass: 'mf-anim-swing', color: '#ffab40' },
+  { id: 'float3D', cat: 'combo', target: 'all', label: '3D Float', animClass: 'mf-anim-float3d', color: '#7c4dff' },
+  { id: 'rotate360', cat: 'combo', target: 'all', label: 'Spin 360°', animClass: 'mf-anim-spin-360', color: '#69f0ae' }
 ];
+
+export function getAnimationCatalogForLayerType(layerType, category = null) {
+  const isText = layerType === 'text';
+  return ANIMATION_CATALOG.filter((item) => {
+    if (category && item.cat !== category) return false;
+    if (isText) return item.target === 'text' || item.target === 'all';
+    return item.target !== 'text';
+  });
+}
+
 
 export const TEXT_TEMPLATES = [
   {

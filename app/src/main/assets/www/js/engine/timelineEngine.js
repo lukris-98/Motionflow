@@ -290,7 +290,15 @@ export const TimelineEngine = {
   createCameraLayer(project, options = {}) {
     const fps = Math.max(1, project?.fps || 30);
     const maxCamKf = Math.max(0, ...KeyframeEngine.getAllCameraKeyframeFrames(project?.camera));
-    const endF = Math.max(project?.durationFrames || fps * 5, maxCamKf, fps * 5);
+    let contentEnd = 0;
+    if (Array.isArray(project?.layers)) {
+      for (const l of project.layers) {
+        if (!l || l.type === 'camera') continue;
+        const ef = Math.max(0, Math.round(Number(l.endFrame) || 0));
+        if (ef > contentEnd) contentEnd = ef;
+      }
+    }
+    const endF = Math.max(maxCamKf, contentEnd || (project?.durationFrames || fps * 4));
     return createBaseLayer('camera', options.name || '3D Camera Rec', project, {
       trackRole: 'overlay',
       startFrame: options.startFrame ?? 0,
@@ -1196,9 +1204,7 @@ export const TimelineEngine = {
   getCutPointFrames(project) {
     const set = new Set([0]);
     if (!project) return [0];
-    if (Number.isFinite(project.durationFrames)) {
-      set.add(Math.max(0, Math.round(project.durationFrames)));
-    }
+    const maxEnd = this.getPlayheadMaxFrame(project);
     if (Array.isArray(project.layers)) {
       for (const l of project.layers) {
         if (Number.isFinite(l.startFrame)) set.add(Math.max(0, Math.round(l.startFrame)));
@@ -1208,7 +1214,10 @@ export const TimelineEngine = {
     if (Array.isArray(project.markers)) {
       for (const m of project.markers) {
         const f = typeof m === 'number' ? m : Number(m?.frame);
-        if (Number.isFinite(f)) set.add(Math.max(0, Math.round(f)));
+        if (Number.isFinite(f)) {
+          const rf = Math.max(0, Math.round(f));
+          if (maxEnd <= 0 || rf <= maxEnd) set.add(rf);
+        }
       }
     }
     return Array.from(set).sort((a, b) => a - b);
@@ -2095,5 +2104,18 @@ export const TimelineEngine = {
     }
     const maxEnd = Math.max(0, ...project.layers.map((l) => Number(l.endFrame) || 0));
     return maxEnd > 0 ? maxEnd : (project.durationFrames || 150);
+  },
+
+  getPlayheadMaxFrame(project) {
+    if (!project || !Array.isArray(project.layers) || project.layers.length === 0) {
+      return 0;
+    }
+    let maxEnd = 0;
+    for (const l of project.layers) {
+      if (!l) continue;
+      const ef = Math.max(0, Math.round(Number(l.endFrame) || 0));
+      if (ef > maxEnd) maxEnd = ef;
+    }
+    return maxEnd;
   }
 };
