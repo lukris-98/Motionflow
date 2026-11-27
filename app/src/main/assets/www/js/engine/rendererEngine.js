@@ -1591,6 +1591,58 @@ export class RendererEngine {
     if (compositor.uColorTint) gl.uniform4f(compositor.uColorTint, 1, 1, 1, 0);
   }
 
+  hasLayerMotionVelocity(layer, frame, projectWidth, projectHeight, allowPending = false) {
+    if (!layer) return false;
+    const kf = layer.keyframes || {};
+    const hasMotionKf =
+      (kf.x?.length || 0) > 1 ||
+      (kf.y?.length || 0) > 1 ||
+      (kf.z?.length || 0) > 1 ||
+      (kf.scaleX?.length || 0) > 1 ||
+      (kf.scaleY?.length || 0) > 1 ||
+      (kf.rotation?.length || 0) > 1 ||
+      (kf.rotX?.length || 0) > 1 ||
+      (kf.rotY?.length || 0) > 1 ||
+      (kf.anchorX?.length || 0) > 1 ||
+      (kf.anchorY?.length || 0) > 1;
+    const tr = layer.transitions || {};
+    const hasTr = (tr.inType && tr.inType !== 'none') || (tr.outType && tr.outType !== 'none');
+    if (!hasMotionKf && !hasTr) return false;
+
+    const fA = Math.max(layer.startFrame, frame - 0.5);
+    const fB = Math.min(layer.endFrame, frame + 0.5);
+    if (Math.abs(fB - fA) < 0.01) return false;
+
+    const tfA = this.resolveEffectiveTransform(layer, fA, allowPending);
+    const tfB = this.resolveEffectiveTransform(layer, fB, allowPending);
+    if (
+      Math.abs(tfB.x - tfA.x) > 0.35 ||
+      Math.abs(tfB.y - tfA.y) > 0.35 ||
+      Math.abs((tfB.z || 0) - (tfA.z || 0)) > 0.45 ||
+      Math.abs(tfB.rotation - tfA.rotation) > 0.15 ||
+      Math.abs((tfB.rotX || 0) - (tfA.rotX || 0)) > 0.15 ||
+      Math.abs((tfB.rotY || 0) - (tfA.rotY || 0)) > 0.15 ||
+      Math.abs(tfB.scaleX - tfA.scaleX) > 0.004 ||
+      Math.abs(tfB.scaleY - tfA.scaleY) > 0.004
+    ) {
+      return true;
+    }
+
+    if (hasTr) {
+      const trA = this.computeTransitionState(layer, fA, projectWidth, projectHeight);
+      const trB = this.computeTransitionState(layer, fB, projectWidth, projectHeight);
+      if (
+        Math.abs(trB.dx - trA.dx) > 0.35 ||
+        Math.abs(trB.dy - trA.dy) > 0.35 ||
+        Math.abs((trB.rotDelta || 0) - (trA.rotDelta || 0)) > 0.15 ||
+        Math.abs(trB.scaleMul - trA.scaleMul) > 0.004
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   renderWebGL(compositor, project, frame, mediaMap, outW, outH, isFlat2DPreview = false, allowPending = false) {
     const {
       gl, prog, uMvp, uAlpha, uPremul,
@@ -1687,53 +1739,71 @@ export class RendererEngine {
         const isAdjustment = layer.type === 'adjustment';
         if (isAdjustment && s > 0) continue;
 
-        const drawable = isAdjustment ? null : this.resolveLayerDrawable(layer, subFrame, fps, mediaMap);
-        if (!isAdjustment && !drawable) continue;
+        const layerMb = layer.motionBlur || {};
+        const mbStrength = Math.max(0.1, Math.min(1.5, Number(layerMb.strength) || 0.7));
+        const layerMbActive = !isAdjustment && Boolean(layerMb.enabled) &&
+          this.hasLayerMotionVelocity(layer, frame, project.width, project.height, allowPending);
+        const layerSamples = (samples === 1 && layerMbActive) ? 6 : 1;
+        const mbWeights = [0.64, 0.45, 0.34, 0.26, 0.20, 0.15];
 
-        const tf = this.resolveEffectiveTransform(layer, subFrame, allowPending);
-        const trState = this.computeTransitionState(layer, subFrame, project.width, project.height);
-        let alpha = (isAdjustment ? 1.0 : masterAlpha) * Math.max(0, Math.min(1, tf.opacity)) * trState.alphaMul;
-        if (parentTf) alpha *= Math.max(0, Math.min(1, parentTf.opacity));
-        if (alpha <= 0.002) continue;
+        for (let ls = layerSamples - 1; ls >= 0; ls--) {
+          const effFrame = layerSamples > 1
+            ? Math.max(layer.startFrame, Math.min(layer.endFrame, frame - (ls / (layerSamples - 1)) * 0.9 * mbStrength))
+            : (layerMbActive && samples > 1 && s > 0
+                ? Math.max(layer.startFrame, Math.min(layer.endFrame, frame - (s / samples) * (0.65 + mbStrength * 0.45)))
+                : subFrame);
+          const layerParentTf = layerSamples > 1 && layer.parentId && layersById.get(layer.parentId)
+            ? this.resolveEffectiveTransform(layersById.get(layer.parentId), effFrame, allowPending)
+            : parentTf;
 
-        let mvp;
-        let texelW;
-        let texelH;
-        if (isAdjustment) {
-          this.copyFramebufferToAdjustmentTex(compositor, outW, outH);
-          this.bindCompositorQuadBuffer(compositor, compositor.fboPosBuf);
-          mvp = Mat4.scale(Mat4.identity(), 2, 2, 1);
-          texelW = Math.max(1, outW);
-          texelH = Math.max(1, outH);
-        } else {
-          let model = Mat4.identity();
-          if (parentTf) {
-            model = Mat4.translate(model, parentTf.x, -parentTf.y, isFlat2DPreview ? 0 : (parentTf.z || 0));
-            model = Mat4.rotateZ(model, (-parentTf.rotation * Math.PI) / 180);
-            if (!isFlat2DPreview) {
-              model = Mat4.rotateX(model, ((parentTf.rotX || 0) * Math.PI) / 180);
-              model = Mat4.rotateY(model, ((parentTf.rotY || 0) * Math.PI) / 180);
+          const drawable = isAdjustment ? null : this.resolveLayerDrawable(layer, effFrame, fps, mediaMap);
+          if (!isAdjustment && !drawable) continue;
+
+          const tf = this.resolveEffectiveTransform(layer, effFrame, allowPending);
+          const trState = this.computeTransitionState(layer, effFrame, project.width, project.height);
+          const lsAlpha = layerSamples > 1 ? mbWeights[ls] : 1.0;
+          let alpha = (isAdjustment ? 1.0 : masterAlpha * lsAlpha) * Math.max(0, Math.min(1, tf.opacity)) * trState.alphaMul;
+          if (layerParentTf) alpha *= Math.max(0, Math.min(1, layerParentTf.opacity));
+          if (alpha <= 0.002) continue;
+
+          let mvp;
+          let texelW;
+          let texelH;
+          if (isAdjustment) {
+            this.copyFramebufferToAdjustmentTex(compositor, outW, outH);
+            this.bindCompositorQuadBuffer(compositor, compositor.fboPosBuf);
+            mvp = Mat4.scale(Mat4.identity(), 2, 2, 1);
+            texelW = Math.max(1, outW);
+            texelH = Math.max(1, outH);
+          } else {
+            let model = Mat4.identity();
+            if (layerParentTf) {
+              model = Mat4.translate(model, layerParentTf.x, -layerParentTf.y, isFlat2DPreview ? 0 : (layerParentTf.z || 0));
+              model = Mat4.rotateZ(model, (-layerParentTf.rotation * Math.PI) / 180);
+              if (!isFlat2DPreview) {
+                model = Mat4.rotateX(model, ((layerParentTf.rotX || 0) * Math.PI) / 180);
+                model = Mat4.rotateY(model, ((layerParentTf.rotY || 0) * Math.PI) / 180);
+              }
+              model = Mat4.scale(model, layerParentTf.scaleX, layerParentTf.scaleY, 1);
             }
-            model = Mat4.scale(model, parentTf.scaleX, parentTf.scaleY, 1);
-          }
 
-          const flipSX = layer.flipX ? -1 : 1;
-          const flipSY = layer.flipY ? -1 : 1;
-          model = Mat4.translate(model, tf.x + trState.dx, -(tf.y + trState.dy), isFlat2DPreview ? 0 : (tf.z || 0));
-          model = Mat4.rotateZ(model, (-(tf.rotation + (trState.rotDelta || 0)) * Math.PI) / 180);
-          if (!isFlat2DPreview) {
-            model = Mat4.rotateX(model, ((tf.rotX || 0) * Math.PI) / 180);
-            model = Mat4.rotateY(model, ((tf.rotY || 0) * Math.PI) / 180);
-          }
-          model = Mat4.scale(model, tf.scaleX * trState.scaleMul * flipSX, tf.scaleY * trState.scaleMul * flipSY, 1);
-          model = Mat4.translate(model, -tf.anchorX, tf.anchorY, 0);
-          model = Mat4.scale(model, drawable.w, drawable.h, 1);
+            const flipSX = layer.flipX ? -1 : 1;
+            const flipSY = layer.flipY ? -1 : 1;
+            model = Mat4.translate(model, tf.x + trState.dx, -(tf.y + trState.dy), isFlat2DPreview ? 0 : (tf.z || 0));
+            model = Mat4.rotateZ(model, (-(tf.rotation + (trState.rotDelta || 0)) * Math.PI) / 180);
+            if (!isFlat2DPreview) {
+              model = Mat4.rotateX(model, ((tf.rotX || 0) * Math.PI) / 180);
+              model = Mat4.rotateY(model, ((tf.rotY || 0) * Math.PI) / 180);
+            }
+            model = Mat4.scale(model, tf.scaleX * trState.scaleMul * flipSX, tf.scaleY * trState.scaleMul * flipSY, 1);
+            model = Mat4.translate(model, -tf.anchorX, tf.anchorY, 0);
+            model = Mat4.scale(model, drawable.w, drawable.h, 1);
 
-          mvp = Mat4.multiply(projMat, Mat4.multiply(viewMat, model));
-          this.getOrCreateTexture(compositor, layer.mediaId || layer.id, drawable.el);
-          texelW = Math.max(1, drawable.w);
-          texelH = Math.max(1, drawable.h);
-        }
+            mvp = Mat4.multiply(projMat, Mat4.multiply(viewMat, model));
+            this.getOrCreateTexture(compositor, layer.mediaId || layer.id, drawable.el);
+            texelW = Math.max(1, drawable.w);
+            texelH = Math.max(1, drawable.h);
+          }
 
         const blend = layer.blendMode || 'normal';
         let premul = 0;
@@ -1893,6 +1963,7 @@ export class RendererEngine {
         if (isAdjustment) {
           this.bindCompositorQuadBuffer(compositor, compositor.posBuf);
         }
+        }
       }
     }
     gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
@@ -2007,93 +2078,110 @@ export class RendererEngine {
         continue;
       }
 
-      const drawable = this.resolveLayerDrawable(layer, frame, project.fps || 30, mediaMap);
-      if (!drawable) continue;
-      const tf = this.resolveEffectiveTransform(layer, frame, allowPending);
-      const trState = this.computeTransitionState(layer, frame, project.width, project.height);
-      let alpha = Math.max(0, Math.min(1, tf.opacity)) * trState.alphaMul;
-      if (parentTf) alpha *= Math.max(0, Math.min(1, parentTf.opacity));
-      if (alpha <= 0.002) continue;
+      const layerMb = layer.motionBlur || {};
+      const mbStrength = Math.max(0.1, Math.min(1.5, Number(layerMb.strength) || 0.7));
+      const layerMbActive = Boolean(layerMb.enabled) &&
+        this.hasLayerMotionVelocity(layer, frame, project.width, project.height, allowPending);
+      const layerSamples = layerMbActive ? 5 : 1;
+      const mbWeights = [0.66, 0.44, 0.32, 0.24, 0.18];
 
-      ctx.save();
-      const blendMap = { add: 'lighter', screen: 'screen', multiply: 'multiply' };
-      ctx.globalCompositeOperation = blendMap[layer.blendMode] || 'source-over';
-      ctx.translate(project.width / 2, project.height / 2);
-      if (cam.enabled) {
-        const camZScale = Math.max(0.25, 1 / Math.max(0.25, 1 + (cam.z || 0) / 1100));
-        ctx.scale(cam.zoom * camZScale, cam.zoom * camZScale);
-        ctx.rotate(((cam.rotZ || 0) * Math.PI) / 180);
-        ctx.translate(-(cam.x || 0), -(cam.y || 0));
-      }
-      if (parentTf) {
-        ctx.translate(parentTf.x, parentTf.y);
-        ctx.rotate((parentTf.rotation * Math.PI) / 180);
-        ctx.scale(parentTf.scaleX, parentTf.scaleY);
-      }
-      ctx.translate(tf.x + trState.dx, tf.y + trState.dy);
-      ctx.rotate(((tf.rotation + (trState.rotDelta || 0)) * Math.PI) / 180);
-      ctx.scale(
-        tf.scaleX * trState.scaleMul * (layer.flipX ? -1 : 1),
-        tf.scaleY * trState.scaleMul * (layer.flipY ? -1 : 1)
-      );
-      ctx.translate(-tf.anchorX, -tf.anchorY);
-      ctx.globalAlpha = alpha;
-      if (trState.wipeType > 0) {
-        const p = Math.max(0, Math.min(1, trState.wipeProgress));
-        ctx.beginPath();
-        if (trState.wipeType === 1) ctx.rect(-drawable.w / 2, -drawable.h / 2, drawable.w * p, drawable.h);
-        else if (trState.wipeType === 2) ctx.rect(drawable.w * (0.5 - p), -drawable.h / 2, drawable.w * p, drawable.h);
-        else if (trState.wipeType === 3) ctx.rect(-drawable.w / 2, drawable.h * (0.5 - p), drawable.w, drawable.h * p);
-        else if (trState.wipeType === 4) ctx.rect(-drawable.w / 2, -drawable.h / 2, drawable.w, drawable.h * p);
-        else ctx.arc(0, 0, Math.hypot(drawable.w, drawable.h) * 0.52 * p, 0, Math.PI * 2);
-        ctx.clip();
-      }
-      const crop = layer.crop;
-      if (crop && ((crop.left || 0) > 0 || (crop.right || 0) > 0 || (crop.top || 0) > 0 || (crop.bottom || 0) > 0)) {
-        const cL = Math.max(0, Math.min(0.49, Number(crop.left) || 0));
-        const cR = Math.max(0, Math.min(0.49, Number(crop.right) || 0));
-        const cT = Math.max(0, Math.min(0.49, Number(crop.top) || 0));
-        const cB = Math.max(0, Math.min(0.49, Number(crop.bottom) || 0));
-        const cw = Math.max(0, (1 - cL - cR) * drawable.w);
-        const ch = Math.max(0, (1 - cT - cB) * drawable.h);
-        ctx.beginPath();
-        ctx.rect(-drawable.w / 2 + cL * drawable.w, -drawable.h / 2 + cT * drawable.h, cw, ch);
-        ctx.clip();
-      }
-      const stab = getStabilizerAtFrame(layer, frame, project.fps || 30);
-      if (stab.cropScale > 1.0005 || Math.abs(stab.dx) > 0.05 || Math.abs(stab.dy) > 0.05 || Math.abs(stab.rot) > 0.0001) {
-        ctx.beginPath();
-        ctx.rect(-drawable.w / 2, -drawable.h / 2, drawable.w, drawable.h);
-        ctx.clip();
-        ctx.scale(stab.cropScale, stab.cropScale);
-        ctx.rotate(stab.rot);
-        ctx.translate(stab.dx, stab.dy);
-      }
-      if (layer.type !== 'text' && layer.type !== 'shape' && layer.keyframes?.color?.length > 0) {
-        const tintHex = KeyframeEngine.getColorAtFrame(layer, frame, layer.fx?.tintColor || '#FFFFFF');
-        const tw = Math.max(2, Math.min(1024, Math.round(drawable.w)));
-        const th = Math.max(2, Math.min(1024, Math.round(drawable.h)));
-        if (!this._tint2dCanvas) this._tint2dCanvas = document.createElement('canvas');
-        if (this._tint2dCanvas.width !== tw || this._tint2dCanvas.height !== th) {
-          this._tint2dCanvas.width = tw;
-          this._tint2dCanvas.height = th;
+      for (let ls = layerSamples - 1; ls >= 0; ls--) {
+        const effFrame = layerSamples > 1
+          ? Math.max(layer.startFrame, Math.min(layer.endFrame, frame - (ls / (layerSamples - 1)) * 0.9 * mbStrength))
+          : frame;
+        const layerParentTf = layerSamples > 1 && layer.parentId && layersById.get(layer.parentId)
+          ? this.resolveEffectiveTransform(layersById.get(layer.parentId), effFrame, allowPending)
+          : parentTf;
+
+        const drawable = this.resolveLayerDrawable(layer, effFrame, project.fps || 30, mediaMap);
+        if (!drawable) continue;
+        const tf = this.resolveEffectiveTransform(layer, effFrame, allowPending);
+        const trState = this.computeTransitionState(layer, effFrame, project.width, project.height);
+        const lsAlpha = layerSamples > 1 ? mbWeights[ls] : 1.0;
+        let alpha = lsAlpha * Math.max(0, Math.min(1, tf.opacity)) * trState.alphaMul;
+        if (layerParentTf) alpha *= Math.max(0, Math.min(1, layerParentTf.opacity));
+        if (alpha <= 0.002) continue;
+
+        ctx.save();
+        const blendMap = { add: 'lighter', screen: 'screen', multiply: 'multiply' };
+        ctx.globalCompositeOperation = blendMap[layer.blendMode] || 'source-over';
+        ctx.translate(project.width / 2, project.height / 2);
+        if (cam.enabled) {
+          const camZScale = Math.max(0.25, 1 / Math.max(0.25, 1 + (cam.z || 0) / 1100));
+          ctx.scale(cam.zoom * camZScale, cam.zoom * camZScale);
+          ctx.rotate(((cam.rotZ || 0) * Math.PI) / 180);
+          ctx.translate(-(cam.x || 0), -(cam.y || 0));
         }
-        const tctx = this._tint2dCanvas.getContext('2d');
-        tctx.clearRect(0, 0, tw, th);
-        tctx.globalCompositeOperation = 'source-over';
-        tctx.globalAlpha = 1;
-        tctx.drawImage(drawable.el, 0, 0, tw, th);
-        tctx.globalCompositeOperation = 'source-atop';
-        tctx.globalAlpha = 0.42;
-        tctx.fillStyle = tintHex;
-        tctx.fillRect(0, 0, tw, th);
-        tctx.globalCompositeOperation = 'source-over';
-        tctx.globalAlpha = 1;
-        ctx.drawImage(this._tint2dCanvas, -drawable.w / 2, -drawable.h / 2, drawable.w, drawable.h);
-      } else {
-        ctx.drawImage(drawable.el, -drawable.w / 2, -drawable.h / 2, drawable.w, drawable.h);
+        if (layerParentTf) {
+          ctx.translate(layerParentTf.x, layerParentTf.y);
+          ctx.rotate((layerParentTf.rotation * Math.PI) / 180);
+          ctx.scale(layerParentTf.scaleX, layerParentTf.scaleY);
+        }
+        ctx.translate(tf.x + trState.dx, tf.y + trState.dy);
+        ctx.rotate(((tf.rotation + (trState.rotDelta || 0)) * Math.PI) / 180);
+        ctx.scale(
+          tf.scaleX * trState.scaleMul * (layer.flipX ? -1 : 1),
+          tf.scaleY * trState.scaleMul * (layer.flipY ? -1 : 1)
+        );
+        ctx.translate(-tf.anchorX, -tf.anchorY);
+        ctx.globalAlpha = alpha;
+        if (trState.wipeType > 0) {
+          const p = Math.max(0, Math.min(1, trState.wipeProgress));
+          ctx.beginPath();
+          if (trState.wipeType === 1) ctx.rect(-drawable.w / 2, -drawable.h / 2, drawable.w * p, drawable.h);
+          else if (trState.wipeType === 2) ctx.rect(drawable.w * (0.5 - p), -drawable.h / 2, drawable.w * p, drawable.h);
+          else if (trState.wipeType === 3) ctx.rect(-drawable.w / 2, drawable.h * (0.5 - p), drawable.w, drawable.h * p);
+          else if (trState.wipeType === 4) ctx.rect(-drawable.w / 2, -drawable.h / 2, drawable.w, drawable.h * p);
+          else ctx.arc(0, 0, Math.hypot(drawable.w, drawable.h) * 0.52 * p, 0, Math.PI * 2);
+          ctx.clip();
+        }
+        const crop = layer.crop;
+        if (crop && ((crop.left || 0) > 0 || (crop.right || 0) > 0 || (crop.top || 0) > 0 || (crop.bottom || 0) > 0)) {
+          const cL = Math.max(0, Math.min(0.49, Number(crop.left) || 0));
+          const cR = Math.max(0, Math.min(0.49, Number(crop.right) || 0));
+          const cT = Math.max(0, Math.min(0.49, Number(crop.top) || 0));
+          const cB = Math.max(0, Math.min(0.49, Number(crop.bottom) || 0));
+          const cw = Math.max(0, (1 - cL - cR) * drawable.w);
+          const ch = Math.max(0, (1 - cT - cB) * drawable.h);
+          ctx.beginPath();
+          ctx.rect(-drawable.w / 2 + cL * drawable.w, -drawable.h / 2 + cT * drawable.h, cw, ch);
+          ctx.clip();
+        }
+        const stab = getStabilizerAtFrame(layer, effFrame, project.fps || 30);
+        if (stab.cropScale > 1.0005 || Math.abs(stab.dx) > 0.05 || Math.abs(stab.dy) > 0.05 || Math.abs(stab.rot) > 0.0001) {
+          ctx.beginPath();
+          ctx.rect(-drawable.w / 2, -drawable.h / 2, drawable.w, drawable.h);
+          ctx.clip();
+          ctx.scale(stab.cropScale, stab.cropScale);
+          ctx.rotate(stab.rot);
+          ctx.translate(stab.dx, stab.dy);
+        }
+        if (layer.type !== 'text' && layer.type !== 'shape' && layer.keyframes?.color?.length > 0) {
+          const tintHex = KeyframeEngine.getColorAtFrame(layer, effFrame, layer.fx?.tintColor || '#FFFFFF');
+          const tw = Math.max(2, Math.min(1024, Math.round(drawable.w)));
+          const th = Math.max(2, Math.min(1024, Math.round(drawable.h)));
+          if (!this._tint2dCanvas) this._tint2dCanvas = document.createElement('canvas');
+          if (this._tint2dCanvas.width !== tw || this._tint2dCanvas.height !== th) {
+            this._tint2dCanvas.width = tw;
+            this._tint2dCanvas.height = th;
+          }
+          const tctx = this._tint2dCanvas.getContext('2d');
+          tctx.clearRect(0, 0, tw, th);
+          tctx.globalCompositeOperation = 'source-over';
+          tctx.globalAlpha = 1;
+          tctx.drawImage(drawable.el, 0, 0, tw, th);
+          tctx.globalCompositeOperation = 'source-atop';
+          tctx.globalAlpha = 0.42;
+          tctx.fillStyle = tintHex;
+          tctx.fillRect(0, 0, tw, th);
+          tctx.globalCompositeOperation = 'source-over';
+          tctx.globalAlpha = 1;
+          ctx.drawImage(this._tint2dCanvas, -drawable.w / 2, -drawable.h / 2, drawable.w, drawable.h);
+        } else {
+          ctx.drawImage(drawable.el, -drawable.w / 2, -drawable.h / 2, drawable.w, drawable.h);
+        }
+        ctx.restore();
       }
-      ctx.restore();
     }
     ctx.restore();
   }

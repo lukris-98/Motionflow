@@ -122,6 +122,12 @@ export function createBaseLayer(type, name, project, overrides = {}) {
       outFrames: 15,
       ...(overrides.transitions || {})
     },
+    motionBlur: {
+      enabled: Boolean(overrides.motionBlur?.enabled),
+      strength: Number.isFinite(Number(overrides.motionBlur?.strength))
+        ? Math.max(0.1, Math.min(1.5, Number(overrides.motionBlur.strength)))
+        : 0.7
+    },
     textProps: overrides.textProps || null,
     shapeProps: overrides.shapeProps || null,
     audioProps: overrides.audioProps || null,

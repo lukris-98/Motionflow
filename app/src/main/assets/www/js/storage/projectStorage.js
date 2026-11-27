@@ -77,7 +77,8 @@ export function createEmptyProject(name = 'Untitled Project', options = {}) {
       showGrid: false,
       rippleMode: true,
       autoColorMatch: true,
-      mainTrackCompact: false
+      mainTrackCompact: false,
+      themeMode: options.themeMode === 'light' ? 'light' : 'dark'
     },
     coverDataUrl: options.coverDataUrl || null,
     createdAt: Date.now(),
@@ -113,7 +114,8 @@ export function deserializeProject(jsonString) {
       ...(raw.settings || {}),
       rippleMode: raw.settings?.rippleMode ?? true,
       autoColorMatch: raw.settings?.autoColorMatch ?? true,
-      mainTrackCompact: Boolean(raw.settings?.mainTrackCompact)
+      mainTrackCompact: Boolean(raw.settings?.mainTrackCompact),
+      themeMode: raw.settings?.themeMode === 'light' ? 'light' : 'dark'
     },
     exportPrefs: { ...base.exportPrefs, ...(raw.exportPrefs || {}) },
     backgroundMode: raw.backgroundMode || base.backgroundMode,

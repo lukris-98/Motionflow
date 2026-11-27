@@ -575,6 +575,7 @@ export class TimelineView {
     const px = this.pxPerFrame;
     this.drawRuler(totalWidth, fps, totalFrames);
     this.updatePlayhead(this.cb.getPlayheadFrame?.() ?? 0);
+    this._syncOverlayLineHeights();
 
     for (const ref of this._zoomRefs.clips) {
       const l = ref.layer;
@@ -768,12 +769,14 @@ export class TimelineView {
     });
     if (typeof ResizeObserver !== 'undefined' && this.scrollEl) {
       this._rulerResizeObs = new ResizeObserver(() => {
+        this._syncOverlayLineHeights();
         if (this._lastRulerParams) {
           this.redrawRulerOnly();
           this.redrawVisibleClipCanvases();
         }
       });
       this._rulerResizeObs.observe(this.scrollEl);
+      if (this.lanesList) this._rulerResizeObs.observe(this.lanesList);
     }
 
     let scrubbing = false;
@@ -1017,7 +1020,20 @@ export class TimelineView {
     this.drawRuler(totalWidth, fps, totalFrames);
     this.updatePlayhead(currentFrame);
     this.renderHeadersAndLanes(project, selectedLayerId, audioEngine, mediaMap);
+    this._syncOverlayLineHeights();
     this._renderKfFloatingBar(project);
+  }
+
+  _syncOverlayLineHeights() {
+    const viewportH = this.scrollEl?.clientHeight || 0;
+    const rulerH = this.rulerCanvas?.offsetHeight || 28;
+    const lanesH = Math.max(this.lanesList?.scrollHeight || 0, this.lanesList?.offsetHeight || 0);
+    const targetH = Math.max(viewportH, rulerH + lanesH);
+    if (targetH > 0) {
+      if (this.contentEl) this.contentEl.style.height = `${targetH}px`;
+      if (this.playheadEl) this.playheadEl.style.height = `${targetH}px`;
+      if (this.snapGuideEl) this.snapGuideEl.style.height = `${targetH}px`;
+    }
   }
 
   redrawRulerOnly() {
@@ -1047,9 +1063,10 @@ export class TimelineView {
     canvas.style.height = '28px';
 
     const ctx = canvas.getContext('2d');
+    const isLight = typeof document !== 'undefined' && document.documentElement.classList.contains('mf-theme-light');
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, viewportW, 28);
-    ctx.fillStyle = '#131822';
+    ctx.fillStyle = isLight ? '#f8fafc' : '#131822';
     ctx.fillRect(0, 0, viewportW, 28);
 
     const spec = computeDynamicRulerTicks(this.pxPerFrame, safeFps);
@@ -1071,9 +1088,15 @@ export class TimelineView {
       const isSecond = f % safeFps === 0;
       const isLabelTick = f % spec.labelFrames === 0 || f === 0;
 
-      ctx.strokeStyle = beyondEnd
-        ? (isMajor || isLabelTick ? '#33415c' : '#1d2536')
-        : (isMajor ? '#587099' : isSecond ? '#435370' : '#263147');
+      if (isLight) {
+        ctx.strokeStyle = beyondEnd
+          ? (isMajor || isLabelTick ? '#cbd5e1' : '#e2e8f0')
+          : (isMajor ? '#475569' : isSecond ? '#64748b' : '#cbd5e1');
+      } else {
+        ctx.strokeStyle = beyondEnd
+          ? (isMajor || isLabelTick ? '#33415c' : '#1d2536')
+          : (isMajor ? '#587099' : isSecond ? '#435370' : '#263147');
+      }
       ctx.beginPath();
       ctx.moveTo(x, isMajor ? 10 : isSecond ? 13 : isLabelTick ? 15 : 21);
       ctx.lineTo(x, 28);
@@ -1083,9 +1106,15 @@ export class TimelineView {
         const label = formatRulerLabel(f, safeFps);
         const tw = ctx.measureText(label).width;
         const isMinute = isSecond && ((f / safeFps) % 60 === 0) && f > 0;
-        ctx.fillStyle = beyondEnd
-          ? '#6f7e99'
-          : (isMinute ? '#00e5ff' : isMajor || isSecond ? '#d3dceb' : '#96a6c0');
+        if (isLight) {
+          ctx.fillStyle = beyondEnd
+            ? '#94a3b8'
+            : (isMinute ? '#0284c7' : isMajor || isSecond ? '#0f172a' : '#475569');
+        } else {
+          ctx.fillStyle = beyondEnd
+            ? '#6f7e99'
+            : (isMinute ? '#00e5ff' : isMajor || isSecond ? '#d3dceb' : '#96a6c0');
+        }
         ctx.fillText(label, x + 3, 2);
         lastLabelRight = x + 3 + tw;
       }
@@ -1095,7 +1124,7 @@ export class TimelineView {
     const durX = Math.round(totalFrames * this.pxPerFrame - scrollLeft) + 0.5;
     if (durX >= 0 && durX <= viewportW) {
       ctx.save();
-      ctx.strokeStyle = 'rgba(0, 229, 255, 0.45)';
+      ctx.strokeStyle = isLight ? 'rgba(2, 132, 199, 0.55)' : 'rgba(0, 229, 255, 0.45)';
       ctx.lineWidth = 1;
       ctx.beginPath();
       ctx.moveTo(durX, 0);

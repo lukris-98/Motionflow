@@ -295,6 +295,7 @@ class MotionFlowApp {
     this.bindOverlayGestures();
     this.bindNativeBridgeCallbacks();
 
+    this.applyThemeMode(this.project?.settings?.themeMode || this._getStoredThemeMode() || 'dark');
     this.panels.renderMediaLibrary(this.mediaItems);
     this.setSaveState(true);
     this.updateAllUI();
@@ -338,6 +339,46 @@ class MotionFlowApp {
     }
     this.scheduleAutosave();
     this.updateAllUI();
+  }
+
+  _getStoredThemeMode() {
+    try {
+      const saved = localStorage.getItem('mf_theme_mode');
+      return saved === 'light' ? 'light' : 'dark';
+    } catch {
+      return 'dark';
+    }
+  }
+
+  _syncThemeButtonsUI(theme) {
+    const isLight = theme === 'light';
+    const selInp = document.getElementById('selProjectTheme');
+    if (selInp) selInp.value = theme;
+    const btnDark = document.getElementById('btnThemeDark');
+    const btnLight = document.getElementById('btnThemeLight');
+    if (btnDark) {
+      btnDark.className = isLight
+        ? 'btn btn-dark border-secondary-subtle px-2 py-1'
+        : 'btn btn-info text-dark fw-semibold px-2 py-1';
+    }
+    if (btnLight) {
+      btnLight.className = isLight
+        ? 'btn btn-info text-dark fw-semibold px-2 py-1'
+        : 'btn btn-dark border-secondary-subtle px-2 py-1';
+    }
+  }
+
+  applyThemeMode(mode) {
+    const theme = mode === 'light' ? 'light' : 'dark';
+    const isLight = theme === 'light';
+    try { localStorage.setItem('mf_theme_mode', theme); } catch {}
+    if (typeof document !== 'undefined') {
+      document.documentElement.setAttribute('data-bs-theme', theme);
+      document.documentElement.classList.toggle('mf-theme-light', isLight);
+      document.body?.classList.toggle('mf-theme-light', isLight);
+    }
+    this._syncThemeButtonsUI(theme);
+    this.timelineView?.redrawRulerOnly();
   }
 
   setSaveState(isSaved) {
@@ -3338,6 +3379,7 @@ class MotionFlowApp {
     this.currentFrame = 0;
     this.selectedLayerId = this.project.layers[0]?.id || null;
     this.hideOpenSheets();
+    this.applyThemeMode(this.project?.settings?.themeMode || this._getStoredThemeMode());
     this.setSaveState(true);
     this.updateAllUI();
     this.showToast(`Opened "${this.project.name}"`);
@@ -3369,6 +3411,7 @@ class MotionFlowApp {
       this.history.clear();
       this.currentFrame = 0;
       this.selectedLayerId = this.project.layers[0]?.id || null;
+      this.applyThemeMode(this.project?.settings?.themeMode || this._getStoredThemeMode());
       this.setSaveState(true);
       this.updateAllUI();
     }
@@ -3922,6 +3965,7 @@ class MotionFlowApp {
           this.currentFrame = 0;
           this.selectedLayerId = this.project.layers[0]?.id || null;
           this.hideOpenSheets();
+          this.applyThemeMode(this.project?.settings?.themeMode || this._getStoredThemeMode());
           this.updateAllUI();
           this.showToast(`Imported "${imported.name}"`);
         } catch (err) {
@@ -4033,6 +4077,21 @@ class MotionFlowApp {
     document.getElementById('btnRedo').onclick = () => this.redoAction();
 
     // Project Settings
+    let pendingThemeBeforeSettings = null;
+    const modalSettingsEl = document.getElementById('modalSettings');
+    modalSettingsEl?.querySelectorAll('[data-theme-opt]').forEach((btn) => {
+      btn.onclick = () => {
+        const chosen = btn.dataset.themeOpt === 'light' ? 'light' : 'dark';
+        this.applyThemeMode(chosen);
+      };
+    });
+    modalSettingsEl?.addEventListener('hidden.bs.modal', () => {
+      if (pendingThemeBeforeSettings !== null) {
+        this.applyThemeMode(pendingThemeBeforeSettings);
+        pendingThemeBeforeSettings = null;
+      }
+    });
+
     document.getElementById('btnProjectSettings').onclick = () => {
       document.getElementById('inpProjectName').value = this.project.name;
       const resVal = `${this.project.width}x${this.project.height}`;
@@ -4045,7 +4104,10 @@ class MotionFlowApp {
       if (rippleChk) rippleChk.checked = this.project.settings?.rippleMode !== false;
       const cmChk = document.getElementById('chkSettingAutoColorMatch');
       if (cmChk) cmChk.checked = this.project.settings?.autoColorMatch !== false;
-      bootstrap.Modal.getOrCreateInstance(document.getElementById('modalSettings')).show();
+      const curTheme = this.project.settings?.themeMode || this._getStoredThemeMode();
+      pendingThemeBeforeSettings = curTheme;
+      this._syncThemeButtonsUI(curTheme);
+      bootstrap.Modal.getOrCreateInstance(modalSettingsEl).show();
     };
 
     document.getElementById('btnApplySettings').onclick = () => {
@@ -4056,6 +4118,9 @@ class MotionFlowApp {
       const name = document.getElementById('inpProjectName').value.trim() || this.project.name;
       const rippleMode = document.getElementById('chkSettingRipple')?.checked !== false;
       const autoColorMatch = document.getElementById('chkSettingAutoColorMatch')?.checked !== false;
+      const themeMode = document.getElementById('selProjectTheme')?.value === 'light' ? 'light' : 'dark';
+      pendingThemeBeforeSettings = null;
+      this.applyThemeMode(themeMode);
       this.mutateProject(() => {
         this.project.name = name;
         this.project.width = w;
@@ -4066,12 +4131,13 @@ class MotionFlowApp {
         if (!this.project.settings) this.project.settings = {};
         this.project.settings.rippleMode = rippleMode;
         this.project.settings.autoColorMatch = autoColorMatch;
+        this.project.settings.themeMode = themeMode;
         if (rippleMode) {
           TimelineEngine.reflowMainTrack(this.project, 0);
         }
         this.currentFrame = Math.min(this.currentFrame, this.project.durationFrames);
       });
-      bootstrap.Modal.getInstance(document.getElementById('modalSettings'))?.hide();
+      bootstrap.Modal.getInstance(modalSettingsEl)?.hide();
     };
 
     // HUD toggles

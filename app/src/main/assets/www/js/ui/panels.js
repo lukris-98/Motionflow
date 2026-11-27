@@ -18,7 +18,7 @@ import { SPEED_CURVE_PRESETS, TimelineEngine } from '../engine/timelineEngine.js
 import { STABILIZE_PRESETS } from '../engine/stabilizerEngine.js';
 import { TrackerEngine } from '../engine/trackerEngine.js';
 import { setLayerColorMatchIntensity, toggleLayerColorMatch } from '../engine/colorMatchEngine.js';
-import { formatBytes, formatDurationMs, normalizeHexColor } from '../utils/math.js';
+import { applyEasing, formatBytes, formatDurationMs, normalizeHexColor } from '../utils/math.js';
 
 const LANDSCAPE_FILTER_SRC = './img/filter_landscape.jpg';
 
@@ -57,6 +57,29 @@ export class PanelsUI {
     this.selectedVfxId = null;
     this.selectedSpeedPtIdx = 1;
     this.beatSensitivity = 0.55;
+    this._bezierAnimRafId = null;
+  }
+
+  getBezierForEasingMode(mode, curBez = [0.42, 0, 0.58, 1]) {
+    switch (mode) {
+      case 'linear': return [0, 0, 1, 1];
+      case 'easeIn': return [0.42, 0, 1, 1];
+      case 'easeOut': return [0, 0, 0.58, 1];
+      case 'easeInOut': return [0.42, 0, 0.58, 1];
+      case 'smooth': return [0.25, 0.1, 0.25, 1];
+      case 'easeOutBack': return [0.34, 1.45, 0.64, 1];
+      case 'anticipate': return [0.36, -0.35, 0.65, 1];
+      case 'cubicBezier':
+      default: {
+        const b = Array.isArray(curBez) && curBez.length >= 4 ? curBez : [0.42, 0, 0.58, 1];
+        return [
+          Math.max(0, Math.min(1, Number(b[0]) || 0.42)),
+          Math.max(-0.5, Math.min(1.5, Number(b[1]) || 0)),
+          Math.max(0, Math.min(1, Number(b[2]) || 0.58)),
+          Math.max(-0.5, Math.min(1.5, Number(b[3]) || 1))
+        ];
+      }
+    }
   }
 
   _ensureLandscapeImageLoaded() {
@@ -620,7 +643,7 @@ export class PanelsUI {
     const hasPrevPropKf = KeyframeEngine.getPrevKeyframeFrame(propFrames, frame) !== null;
     const hasNextPropKf = KeyframeEngine.getNextKeyframeFrame(propFrames, frame) !== null;
     const activeEasing = kfAtCur?.easing || 'easeInOut';
-    const bez = [...(kfAtCur?.bezier || [0.42, 0, 0.58, 1])];
+    const bez = this.getBezierForEasingMode(activeEasing, kfAtCur?.bezier || [0.42, 0, 0.58, 1]);
     const animItems = ANIMATION_CATALOG.filter((a) => a.cat === this.activeAnimTab);
     const isPresetActive = (id) => Boolean(layer && (
       layer.presetInId === id || layer.presetOutId === id || layer.presetComboId === id || layer.activePresetId === id
@@ -728,29 +751,51 @@ export class PanelsUI {
           </div>
         </div>
 
-        <div class="row g-2 mb-2 align-items-start">
-          <div class="col-6">
-            <label class="form-label small text-secondary mb-0">Interpolation Curve</label>
-            <select id="kfEasingSel" class="form-select form-select-sm mb-2">
-              ${EASING_TYPES.map((e) => `<option value="${e.key}" ${e.key === activeEasing ? 'selected' : ''}>${e.label}</option>`).join('')}
-            </select>
-            <div class="d-flex flex-wrap gap-1 mb-2">
-              ${CUBIC_BEZIER_PRESETS.map((bp) => `
-                <button type="button" class="btn btn-xs btn-dark border-secondary-subtle text-light" data-bezier-preset="${bp.id}" style="font-size:0.62rem;">${bp.label}</button>
-              `).join('')}
-            </div>
-            <div id="kfBezierWrap" class="${activeEasing === 'cubicBezier' ? '' : 'd-none'}">
-              <label class="form-label small text-secondary mb-0">Cubic Bezier (x1, y1, x2, y2)</label>
-              <div class="input-group input-group-sm">
-                <input id="bzX1" type="number" min="0" max="1" step="0.05" class="form-control" value="${bez[0]}" />
-                <input id="bzY1" type="number" min="-0.5" max="1.5" step="0.05" class="form-control" value="${bez[1]}" />
-                <input id="bzX2" type="number" min="0" max="1" step="0.05" class="form-control" value="${bez[2]}" />
-                <input id="bzY2" type="number" min="-0.5" max="1.5" step="0.05" class="form-control" value="${bez[3]}" />
+        <div class="mf-ease-editor-card mb-2">
+          <div class="d-flex flex-wrap align-items-center justify-content-between gap-1 mb-2">
+            <span class="small fw-semibold text-info"><i class="bi bi-bezier2 me-1"></i>Ease Curve Editor</span>
+            <span id="lblEaseReadout" class="badge text-bg-dark border border-info-subtle font-monospace" style="font-size:0.62rem;">
+              ${activeEasing === 'cubicBezier' ? `cubic-bezier(${bez.map((n) => Number(n).toFixed(2)).join(', ')})` : activeEasing}
+            </span>
+          </div>
+          <div class="row g-2 align-items-start">
+            <div class="col-6">
+              <label class="form-label small text-secondary mb-0">Curve Mode</label>
+              <select id="kfEasingSel" class="form-select form-select-sm mb-2">
+                ${EASING_TYPES.map((e) => `<option value="${e.key}" ${e.key === activeEasing ? 'selected' : ''}>${e.label}</option>`).join('')}
+              </select>
+              <div class="d-flex flex-wrap gap-1 mb-2">
+                ${[
+                  { id: 'linear', lbl: 'Linear' },
+                  { id: 'easeIn', lbl: 'In' },
+                  { id: 'easeOut', lbl: 'Out' },
+                  { id: 'easeInOut', lbl: 'I/O' },
+                  { id: 'spring', lbl: 'Spring' }
+                ].map((mc) => `
+                  <button type="button" class="mf-ease-chip ${activeEasing === mc.id ? 'active' : ''}" data-ease-mode-chip="${mc.id}">${mc.lbl}</button>
+                `).join('')}
+              </div>
+              <div class="d-flex flex-wrap gap-1 mb-2">
+                ${CUBIC_BEZIER_PRESETS.map((bp) => `
+                  <button type="button" class="btn btn-xs btn-dark border-secondary-subtle text-light" data-bezier-preset="${bp.id}" style="font-size:0.61rem;">${bp.label}</button>
+                `).join('')}
+              </div>
+              <div id="kfBezierWrap">
+                <label class="form-label small text-secondary mb-0" style="font-size:0.66rem;">Handles (x1, y1, x2, y2)</label>
+                <div class="input-group input-group-sm">
+                  <input id="bzX1" type="number" min="0" max="1" step="0.05" class="form-control px-1" value="${bez[0]}" />
+                  <input id="bzY1" type="number" min="-0.5" max="1.5" step="0.05" class="form-control px-1" value="${bez[1]}" />
+                  <input id="bzX2" type="number" min="0" max="1" step="0.05" class="form-control px-1" value="${bez[2]}" />
+                  <input id="bzY2" type="number" min="-0.5" max="1.5" step="0.05" class="form-control px-1" value="${bez[3]}" />
+                </div>
               </div>
             </div>
-          </div>
-          <div class="col-6" id="kfBezierGraphWrap">
-            <svg id="svgBezier" viewBox="0 0 120 100" class="mf-bezier-svg"></svg>
+            <div class="col-6" id="kfBezierGraphWrap">
+              <svg id="svgBezier" viewBox="0 0 180 140" class="mf-bezier-svg"></svg>
+              <div class="mf-ease-preview-track" title="Live Curve Motion Preview">
+                <div id="easePreviewBall" class="mf-ease-preview-ball"></div>
+              </div>
+            </div>
           </div>
         </div>
 
@@ -857,18 +902,38 @@ export class PanelsUI {
 
       body.querySelector('#kfEasingSel').onchange = (e) => {
         const easing = e.target.value;
-        body.querySelector('#kfBezierWrap').classList.toggle('d-none', easing !== 'cubicBezier');
+        const mappedBez = this.getBezierForEasingMode(easing, bez);
+        ['#bzX1', '#bzY1', '#bzX2', '#bzY2'].forEach((s, idx) => {
+          const inp = body.querySelector(s);
+          if (inp) inp.value = mappedBez[idx];
+        });
         if (selectedKfs.length > 1) {
-          this.app.setSelectedKeyframesEasingAction(selectedKfs, easing);
+          this.app.setSelectedKeyframesEasingAction(selectedKfs, easing, mappedBez);
         } else if (kfAtCur) {
           this.app.mutateProject(() => {
             kfAtCur.easing = easing;
+            if (easing === 'cubicBezier') kfAtCur.bezier = mappedBez;
             if (layer.type === 'camera') TimelineEngine.syncLayerToCamera(this.app.project, layer);
           });
         } else {
-          this.drawBezierGraph(body.querySelector('#svgBezier'), bez, kfAtCur, body, layer, prop, frame, curVal, easing);
+          this.drawBezierGraph(body.querySelector('#svgBezier'), mappedBez, kfAtCur, body, layer, prop, frame, curVal, easing);
         }
       };
+
+      body.querySelectorAll('[data-ease-mode-chip]').forEach((btn) => {
+        btn.onclick = () => {
+          const easing = btn.dataset.easeModeChip;
+          const mappedBez = this.getBezierForEasingMode(easing, bez);
+          if (selectedKfs.length > 1) {
+            this.app.setSelectedKeyframesEasingAction(selectedKfs, easing, mappedBez);
+          } else {
+            this.app.mutateProject(() => {
+              KeyframeEngine.setKeyframe(layer, prop, frame, curVal, easing, mappedBez);
+              if (layer.type === 'camera') TimelineEngine.syncLayerToCamera(this.app.project, layer);
+            });
+          }
+        };
+      });
 
       body.querySelectorAll('[data-bezier-preset]').forEach((btn) => {
         btn.onclick = () => {
@@ -887,11 +952,30 @@ export class PanelsUI {
       });
 
       ['#bzX1', '#bzY1', '#bzX2', '#bzY2'].forEach((sel, idx) => {
-        body.querySelector(sel).onchange = (e) => {
-          if (kfAtCur) {
+        const inp = body.querySelector(sel);
+        if (!inp) return;
+        inp.onchange = (e) => {
+          const val = idx % 2 === 0
+            ? Math.max(0, Math.min(1, Number(e.target.value) || 0))
+            : Math.max(-0.5, Math.min(1.5, Number(e.target.value) || 0));
+          e.target.value = val;
+          const nextBez = [
+            Number(body.querySelector('#bzX1')?.value) || 0,
+            Number(body.querySelector('#bzY1')?.value) || 0,
+            Number(body.querySelector('#bzX2')?.value) || 1,
+            Number(body.querySelector('#bzY2')?.value) || 1
+          ];
+          nextBez[idx] = val;
+          if (selectedKfs.length > 1) {
+            this.app.setSelectedKeyframesEasingAction(selectedKfs, 'cubicBezier', nextBez);
+          } else {
             this.app.mutateProject(() => {
-              if (!kfAtCur.bezier) kfAtCur.bezier = [0.42, 0, 0.58, 1];
-              kfAtCur.bezier[idx] = Number(e.target.value);
+              if (kfAtCur) {
+                kfAtCur.easing = 'cubicBezier';
+                kfAtCur.bezier = nextBez;
+              } else {
+                KeyframeEngine.setKeyframe(layer, prop, frame, curVal, 'cubicBezier', nextBez);
+              }
               if (layer.type === 'camera') TimelineEngine.syncLayerToCamera(this.app.project, layer);
             });
           }
@@ -979,105 +1063,153 @@ export class PanelsUI {
 
   drawBezierGraph(svg, bez, kfAtCur, rootEl, layer, prop, frame, curVal, easingMode = 'cubicBezier') {
     if (!svg) return;
-    const toSvgX = (x) => 15 + x * 90;
-    const toSvgY = (y) => 85 - y * 70;
-    const sampleCurvePath = (mode) => {
-      const pts = [];
-      const steps = 28;
-      for (let i = 0; i <= steps; i++) {
-        const t = i / steps;
-        let y;
-        if (mode === 'hold') {
-          y = t >= 1 ? 1 : 0;
-        } else if (mode === 'easeIn') {
-          y = t * t * t;
-        } else if (mode === 'easeOut') {
-          y = 1 - Math.pow(1 - t, 3);
-        } else if (mode === 'easeInOut' || mode === 'smooth') {
-          y = t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
-        } else if (mode === 'easeOutBack') {
-          const c1 = 1.70158;
-          y = 1 + (c1 + 1) * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2);
-        } else if (mode === 'anticipate') {
-          const c1 = 1.70158;
-          y = (c1 + 1) * t * t * t - c1 * t * t;
-        } else if (mode === 'spring') {
-          y = t >= 1 ? 1 : 1 - Math.exp(-6 * t) * Math.cos(Math.PI * 3.5 * t);
-        } else {
-          y = t;
-        }
-        pts.push(`${i === 0 ? 'M' : 'L'} ${toSvgX(t).toFixed(1)} ${toSvgY(y).toFixed(1)}`);
-      }
-      return pts.join(' ');
-    };
+    if (this._bezierAnimRafId) {
+      cancelAnimationFrame(this._bezierAnimRafId);
+      this._bezierAnimRafId = null;
+    }
+
+    const W = 180;
+    const H = 140;
+    const padX = 22;
+    const padTop = 24;
+    const boxW = W - padX * 2;
+    const boxH = H - padTop * 2;
+    const toSvgX = (x) => padX + x * boxW;
+    const toSvgY = (y) => (padTop + boxH) - y * boxH;
+    let curMode = easingMode;
 
     const render = () => {
-      if (easingMode !== 'cubicBezier') {
-        const d = sampleCurvePath(easingMode);
-        svg.innerHTML = `
-          <rect x="15" y="15" width="90" height="70" fill="none" stroke="#283246" stroke-width="1" />
-          <line x1="15" y1="85" x2="105" y2="15" stroke="#283246" stroke-width="0.8" stroke-dasharray="2,2" />
-          <path d="${d}" fill="none" stroke="#00E5FF" stroke-width="2.4" />
-          <text x="60" y="96" text-anchor="middle" fill="#94a3b8" font-size="8">${easingMode}</text>
-        `;
-        return;
-      }
       const p1x = toSvgX(bez[0]);
       const p1y = toSvgY(bez[1]);
       const p2x = toSvgX(bez[2]);
       const p2y = toSvgY(bez[3]);
+      const readout = rootEl?.querySelector('#lblEaseReadout');
+      if (readout) {
+        readout.textContent = curMode === 'cubicBezier'
+          ? `cubic-bezier(${bez.map((n) => Number(n).toFixed(2)).join(', ')})`
+          : curMode;
+      }
+
+      const gridLines = `
+        <rect x="${padX}" y="${padTop}" width="${boxW}" height="${boxH}" fill="none" stroke="rgba(148,163,184,0.28)" stroke-width="1" />
+        <line x1="${padX + boxW * 0.25}" y1="${padTop}" x2="${padX + boxW * 0.25}" y2="${padTop + boxH}" stroke="rgba(148,163,184,0.12)" stroke-width="0.8" />
+        <line x1="${padX + boxW * 0.5}" y1="${padTop}" x2="${padX + boxW * 0.5}" y2="${padTop + boxH}" stroke="rgba(148,163,184,0.22)" stroke-width="0.9" />
+        <line x1="${padX + boxW * 0.75}" y1="${padTop}" x2="${padX + boxW * 0.75}" y2="${padTop + boxH}" stroke="rgba(148,163,184,0.12)" stroke-width="0.8" />
+        <line x1="${padX}" y1="${padTop + boxH * 0.25}" x2="${padX + boxW}" y2="${padTop + boxH * 0.25}" stroke="rgba(148,163,184,0.12)" stroke-width="0.8" />
+        <line x1="${padX}" y1="${padTop + boxH * 0.5}" x2="${padX + boxW}" y2="${padTop + boxH * 0.5}" stroke="rgba(148,163,184,0.22)" stroke-width="0.9" />
+        <line x1="${padX}" y1="${padTop + boxH * 0.75}" x2="${padX + boxW}" y2="${padTop + boxH * 0.75}" stroke="rgba(148,163,184,0.12)" stroke-width="0.8" />
+        <line x1="${padX}" y1="${padTop + boxH}" x2="${padX + boxW}" y2="${padTop}" stroke="rgba(148,163,184,0.26)" stroke-width="1" stroke-dasharray="3,3" />
+      `;
+
+      const pts = [];
+      const steps = 40;
+      for (let i = 0; i <= steps; i++) {
+        const t = i / steps;
+        const y = applyEasing(t, curMode, bez);
+        pts.push(`${i === 0 ? 'M' : 'L'} ${toSvgX(t).toFixed(1)} ${toSvgY(y).toFixed(1)}`);
+      }
+      const curvePath = curMode === 'cubicBezier'
+        ? `M ${padX} ${padTop + boxH} C ${p1x.toFixed(1)} ${p1y.toFixed(1)}, ${p2x.toFixed(1)} ${p2y.toFixed(1)}, ${padX + boxW} ${padTop}`
+        : pts.join(' ');
+      const showHandles = curMode !== 'hold' && curMode !== 'spring';
+
       svg.innerHTML = `
-        <rect x="15" y="15" width="90" height="70" fill="none" stroke="#283246" stroke-width="1" />
-        <line x1="15" y1="85" x2="${p1x}" y2="${p1y}" stroke="#7C4DFF" stroke-width="1" stroke-dasharray="2,2" />
-        <line x1="105" y1="15" x2="${p2x}" y2="${p2y}" stroke="#7C4DFF" stroke-width="1" stroke-dasharray="2,2" />
-        <path d="M 15 85 C ${p1x} ${p1y}, ${p2x} ${p2y}, 105 15" fill="none" stroke="#00E5FF" stroke-width="2.5" />
-        <circle cx="${p1x}" cy="${p1y}" r="6" fill="#7C4DFF" stroke="#fff" stroke-width="1.5" data-handle="1" style="cursor:pointer;" />
-        <circle cx="${p2x}" cy="${p2y}" r="6" fill="#FFAB40" stroke="#fff" stroke-width="1.5" data-handle="2" style="cursor:pointer;" />
+        ${gridLines}
+        ${showHandles ? `
+          <line x1="${padX}" y1="${padTop + boxH}" x2="${p1x}" y2="${p1y}" stroke="#7C4DFF" stroke-width="1.3" stroke-dasharray="2,2" />
+          <line x1="${padX + boxW}" y1="${padTop}" x2="${p2x}" y2="${p2y}" stroke="#FFAB40" stroke-width="1.3" stroke-dasharray="2,2" />
+        ` : ''}
+        <path d="${curvePath}" fill="none" stroke="#00E5FF" stroke-width="2.8" stroke-linecap="round" />
+        <circle cx="${padX}" cy="${padTop + boxH}" r="3.2" fill="#00E5FF" />
+        <circle cx="${padX + boxW}" cy="${padTop}" r="3.2" fill="#00E5FF" />
+        ${showHandles ? `
+          <circle cx="${p1x}" cy="${p1y}" r="8" fill="#7C4DFF" stroke="#fff" stroke-width="1.8" data-handle="1" style="cursor:grab;" />
+          <circle cx="${p2x}" cy="${p2y}" r="8" fill="#FFAB40" stroke="#fff" stroke-width="1.8" data-handle="2" style="cursor:grab;" />
+        ` : `<text x="${W / 2}" y="${H - 6}" text-anchor="middle" fill="#94a3b8" font-size="9">${curMode} (switch preset or pick Custom to drag)</text>`}
       `;
     };
     render();
 
+    const ball = rootEl?.querySelector('#easePreviewBall');
+    if (ball && typeof requestAnimationFrame === 'function') {
+      const sheetEl = svg.closest('.offcanvas');
+      if (sheetEl && !sheetEl.dataset.bezierHideBound) {
+        sheetEl.dataset.bezierHideBound = '1';
+        sheetEl.addEventListener('hidden.bs.offcanvas', () => {
+          if (this._bezierAnimRafId) {
+            cancelAnimationFrame(this._bezierAnimRafId);
+            this._bezierAnimRafId = null;
+          }
+        });
+      }
+      const startMs = performance.now();
+      const tick = (now) => {
+        if (!document.body.contains(svg)) {
+          this._bezierAnimRafId = null;
+          return;
+        }
+        const cycle = ((now - startMs) % 1400) / 1400;
+        const t = cycle < 0.8 ? cycle / 0.8 : 1;
+        const eased = applyEasing(t, curMode, bez);
+        const pct = Math.max(2, Math.min(92, eased * 86 + 3));
+        ball.style.left = `${pct.toFixed(1)}%`;
+        this._bezierAnimRafId = requestAnimationFrame(tick);
+      };
+      this._bezierAnimRafId = requestAnimationFrame(tick);
+    }
+
     let activeHandle = null;
     const origBez = [...bez];
     svg.onpointerdown = (e) => {
-      if (easingMode !== 'cubicBezier') return;
       const h = e.target.getAttribute('data-handle');
       if (h) {
+        curMode = 'cubicBezier';
+        const sel = rootEl?.querySelector('#kfEasingSel');
+        if (sel) sel.value = 'cubicBezier';
         activeHandle = Number(h);
-        svg.setPointerCapture(e.pointerId);
+        try { svg.setPointerCapture(e.pointerId); } catch {}
       }
     };
     svg.onpointermove = (e) => {
       if (!activeHandle) return;
       const rect = svg.getBoundingClientRect();
-      const vx = ((e.clientX - rect.left) / rect.width) * 120;
-      const vy = ((e.clientY - rect.top) / rect.height) * 100;
-      const nx = Math.max(0, Math.min(1, Number(((vx - 15) / 90).toFixed(2))));
-      const ny = Math.max(-0.5, Math.min(1.5, Number(((85 - vy) / 70).toFixed(2))));
+      const vx = ((e.clientX - rect.left) / Math.max(1, rect.width)) * W;
+      const vy = ((e.clientY - rect.top) / Math.max(1, rect.height)) * H;
+      const nx = Math.max(0, Math.min(1, Number(((vx - padX) / boxW).toFixed(2))));
+      const ny = Math.max(-0.5, Math.min(1.5, Number((((padTop + boxH) - vy) / boxH).toFixed(2))));
       if (activeHandle === 1) {
         bez[0] = nx; bez[1] = ny;
-        rootEl.querySelector('#bzX1').value = nx;
-        rootEl.querySelector('#bzY1').value = ny;
+        const xEl = rootEl?.querySelector('#bzX1');
+        const yEl = rootEl?.querySelector('#bzY1');
+        if (xEl) xEl.value = nx;
+        if (yEl) yEl.value = ny;
       } else {
         bez[2] = nx; bez[3] = ny;
-        rootEl.querySelector('#bzX2').value = nx;
-        rootEl.querySelector('#bzY2').value = ny;
+        const xEl = rootEl?.querySelector('#bzX2');
+        const yEl = rootEl?.querySelector('#bzY2');
+        if (xEl) xEl.value = nx;
+        if (yEl) yEl.value = ny;
       }
       render();
     };
     const finishHandle = () => {
       if (activeHandle) {
         const nextBez = [...bez];
-        if (kfAtCur) kfAtCur.bezier = [...origBez];
-        this.app.mutateProject(() => {
-          if (kfAtCur) {
-            kfAtCur.bezier = nextBez;
-            kfAtCur.easing = 'cubicBezier';
-          } else if (layer) {
-            KeyframeEngine.setKeyframe(layer, prop, frame, curVal, 'cubicBezier', nextBez);
-          }
-          if (layer?.type === 'camera') TimelineEngine.syncLayerToCamera(this.app.project, layer);
-        });
+        const selectedKfs = this.app.timelineView?.selectedKfs || [];
+        if (selectedKfs.length > 1) {
+          this.app.setSelectedKeyframesEasingAction(selectedKfs, 'cubicBezier', nextBez);
+        } else {
+          if (kfAtCur) kfAtCur.bezier = [...origBez];
+          this.app.mutateProject(() => {
+            if (kfAtCur) {
+              kfAtCur.bezier = nextBez;
+              kfAtCur.easing = 'cubicBezier';
+            } else if (layer) {
+              KeyframeEngine.setKeyframe(layer, prop, frame, curVal, 'cubicBezier', nextBez);
+            }
+            if (layer?.type === 'camera') TimelineEngine.syncLayerToCamera(this.app.project, layer);
+          });
+        }
       }
       activeHandle = null;
     };
@@ -1126,6 +1258,64 @@ export class PanelsUI {
     const def = { inType: 'none', inFrames: 15, outType: 'none', outFrames: 15 };
     layer.transitions = layer.transitions ? Object.assign(def, layer.transitions) : def;
     return layer.transitions;
+  }
+
+  ensureLayerMotionBlur(layer) {
+    const def = { enabled: false, strength: 0.7 };
+    layer.motionBlur = layer.motionBlur
+      ? {
+          enabled: Boolean(layer.motionBlur.enabled),
+          strength: Number.isFinite(Number(layer.motionBlur.strength))
+            ? Math.max(0.1, Math.min(1.5, Number(layer.motionBlur.strength)))
+            : 0.7
+        }
+      : def;
+    return layer.motionBlur;
+  }
+
+  renderLayerMotionBlurCardHtml(layer) {
+    if (!layer || !['video', 'image', 'text', 'shape'].includes(layer.type)) return '';
+    const mb = this.ensureLayerMotionBlur(layer);
+    return `
+      <div class="p-2 rounded bg-dark border border-secondary-subtle mt-2 mb-2">
+        <div class="d-flex justify-content-between align-items-center mb-1">
+          <div>
+            <span class="small fw-semibold text-info"><i class="bi bi-wind me-1"></i>Procedural Motion Blur</span>
+            <div class="text-secondary" style="font-size:0.64rem;">Blur otomatis pada pergerakan keyframe &amp; transisi (2D/3D)</div>
+          </div>
+          <div class="form-check form-switch mb-0">
+            <input class="form-check-input" type="checkbox" id="chkLayerMotionBlur" ${mb.enabled ? 'checked' : ''} />
+          </div>
+        </div>
+        <div id="layerMotionBlurStrengthWrap" class="${mb.enabled ? '' : 'd-none'} mt-1">
+          <label class="form-label small text-secondary mb-0">Shutter Strength (<span id="lblLayerMbStrength">${Math.round(mb.strength * 100)}%</span>)</label>
+          <input id="rngLayerMbStrength" type="range" min="0.1" max="1.5" step="0.05" class="form-range" value="${mb.strength}" />
+        </div>
+      </div>
+    `;
+  }
+
+  bindLayerMotionBlurEvents(body, layer) {
+    if (!body || !layer || !['video', 'image', 'text', 'shape'].includes(layer.type)) return;
+    const mb = this.ensureLayerMotionBlur(layer);
+    const chk = body.querySelector('#chkLayerMotionBlur');
+    const wrap = body.querySelector('#layerMotionBlurStrengthWrap');
+    if (chk) {
+      chk.onchange = (e) => {
+        const enabled = e.target.checked;
+        wrap?.classList.toggle('d-none', !enabled);
+        this.app.mutateProject(() => {
+          this.ensureLayerMotionBlur(layer).enabled = enabled;
+        });
+      };
+    }
+    this.bindLiveRange(
+      body.querySelector('#rngLayerMbStrength'),
+      body.querySelector('#lblLayerMbStrength'),
+      mb,
+      'strength',
+      (v) => `${Math.round(v * 100)}%`
+    );
   }
 
   bindLiveRange(inputEl, labelEl, obj, key, fmtFn) {
@@ -1771,6 +1961,7 @@ export class PanelsUI {
               <input id="txtGradCol2" type="color" class="form-control form-control-color form-control-sm" style="width:46px;" value="${tp.gradientColor2 || '#00E5FF'}" />
             </div>
           </div>
+          ${this.renderLayerMotionBlurCardHtml(layer)}
         `}
       `;
     } else if (layer.type === 'shape' && layer.shapeProps) {
@@ -1811,6 +2002,7 @@ export class PanelsUI {
             <input id="shpRad" type="number" min="0" max="200" class="form-control form-control-sm" value="${sp.cornerRadius || 0}" />
           </div>
         </div>
+        ${this.renderLayerMotionBlurCardHtml(layer)}
       `;
     } else if (layer.type === 'audio' || layer.type === 'video') {
       const ap = layer.audioProps || { volume: 1, fadeInFrames: 0, fadeOutFrames: 0, muted: false, voiceEffect: 'none', reduceNoise: false };
@@ -1929,7 +2121,17 @@ export class PanelsUI {
             </div>
           `;
         })() : ''}
+        ${layer.type === 'video' ? this.renderLayerMotionBlurCardHtml(layer) : ''}
         ${this.renderSpeedCurveEditorHtml(layer)}
+      `;
+    } else if (layer.type === 'image') {
+      innerHtml = `
+        <div class="d-flex justify-content-between align-items-center mb-2">
+          <span class="small fw-semibold text-success"><i class="bi bi-image me-1"></i>Image Layer Settings</span>
+          <button id="btnStyleReplaceImg" class="btn btn-xs btn-outline-light py-1 px-2"><i class="bi bi-arrow-left-right me-1"></i>Replace Media</button>
+        </div>
+        ${this.renderLayerMotionBlurCardHtml(layer)}
+        <div class="text-secondary small text-center mt-1">Gunakan tab Color/FX &amp; Mask/Tr untuk grading, filter, dan efek lainnya.</div>
       `;
     } else {
       innerHtml = `<div class="text-secondary small py-3 text-center">Use Color/FX, Mask/Tr, Transform &amp; Keyframes tabs to style and animate this ${layer.type} layer.</div>`;
@@ -2090,6 +2292,7 @@ export class PanelsUI {
       this.bindLiveRange(body.querySelector('#txtBgOp'), body.querySelector('#lblTxtBgOp'), tp, 'bgOpacity', (v) => `${Math.round(v * 100)}%`);
       this.bindLiveRange(body.querySelector('#txtBgRad'), body.querySelector('#lblTxtBgRad'), tp, 'bgRadius', (v) => String(Math.round(v)));
       this.bindLiveRange(body.querySelector('#txtBgPad'), body.querySelector('#lblTxtBgPad'), tp, 'bgPadding', (v) => String(Math.round(v)));
+      this.bindLayerMotionBlurEvents(body, layer);
     } else if (layer.type === 'shape' && layer.shapeProps) {
       const sp = layer.shapeProps;
       body.querySelector('#shpType').onchange = (e) => this.app.mutateProject(() => { sp.shapeType = e.target.value; });
@@ -2099,6 +2302,10 @@ export class PanelsUI {
       body.querySelector('#shpStroke').onchange = (e) => this.app.mutateProject(() => { sp.strokeColor = e.target.value; });
       body.querySelector('#shpStrokeW').onchange = (e) => this.app.mutateProject(() => { sp.strokeWidth = Number(e.target.value) || 0; });
       body.querySelector('#shpRad').onchange = (e) => this.app.mutateProject(() => { sp.cornerRadius = Number(e.target.value) || 0; });
+      this.bindLayerMotionBlurEvents(body, layer);
+    } else if (layer.type === 'image') {
+      body.querySelector('#btnStyleReplaceImg')?.addEventListener('click', () => this.app.replaceSelectedClip());
+      this.bindLayerMotionBlurEvents(body, layer);
     } else if (layer.type === 'audio' || layer.type === 'video') {
       if (!layer.audioProps) layer.audioProps = { volume: 1, fadeInFrames: 0, fadeOutFrames: 0, muted: false, voiceEffect: 'none', reduceNoise: false, normalize: false };
       const ap = layer.audioProps;
@@ -2148,6 +2355,7 @@ export class PanelsUI {
         body.querySelector('#btnStabClear')?.addEventListener('click', () => {
           this.app.clearVideoStabilizer(layer.id);
         });
+        this.bindLayerMotionBlurEvents(body, layer);
       }
       this.bindLiveRange(body.querySelector('#audVol'), body.querySelector('#lblAudVol'), ap, 'volume', (v) => `${Math.round(v * 100)}%`);
       const audSpeedEl = body.querySelector('#audSpeed');
@@ -2679,6 +2887,7 @@ export class PanelsUI {
             <input id="fxGrain" type="range" min="0" max="1" step="0.02" class="form-range" value="${fx.grain || 0}" />
           </div>
         </div>
+        ${this.renderLayerMotionBlurCardHtml(layer)}
       `}
     `;
   }
@@ -3010,6 +3219,7 @@ export class PanelsUI {
     this.bindLiveRange(body.querySelector('#fxChromaSim'), body.querySelector('#lblChromaSim'), fx, 'chromaSimilarity', (v) => v.toFixed(2));
     this.bindLiveRange(body.querySelector('#fxChromaSm'), body.querySelector('#lblChromaSm'), fx, 'chromaSmoothness', (v) => v.toFixed(2));
     this.bindLiveRange(body.querySelector('#fxChromaSp'), body.querySelector('#lblChromaSp'), fx, 'chromaSpill', (v) => `${Math.round(v * 100)}%`);
+    this.bindLayerMotionBlurEvents(body, layer);
   }
 
   buildMaskTransTabHtml(layer) {

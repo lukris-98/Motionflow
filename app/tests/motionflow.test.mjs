@@ -14,7 +14,8 @@ import { TimelineEngine } from '../src/main/assets/www/js/engine/timelineEngine.
 import { AudioEngine, detectBeatsFromPcm } from '../src/main/assets/www/js/engine/audioEngine.js';
 import { parseSrtOrLyrics, FILTER_PRESETS, VIDEO_EFFECT_PRESETS, TRANSITION_PRESETS, TRANSITION_CATEGORIES } from '../src/main/assets/www/js/engine/capcutCatalog.js';
 import { ExportEngine } from '../src/main/assets/www/js/export/exportEngine.js';
-import { createEmptyProject, deserializeProject } from '../src/main/assets/www/js/storage/projectStorage.js';
+import { createEmptyProject, deserializeProject, serializeProject } from '../src/main/assets/www/js/storage/projectStorage.js';
+import { RendererEngine } from '../src/main/assets/www/js/engine/rendererEngine.js';
 import { extractGrayscale, extractTemplatePatch, matchTemplateCoarseToFine } from '../src/main/assets/www/js/engine/trackerEngine.js';
 import {
   analyzeRgbaPalette,
@@ -1561,5 +1562,62 @@ test('Auto-Rec 3D Camera timeline item bidirectional sync, visibility lanes & de
   assert.equal(TimelineEngine.getCameraLayer(proj), null);
   assert.equal(KeyframeEngine.getAllCameraKeyframeFrames(proj.camera).length, 0);
 });
+
+test('Per-layer procedural motionBlur defaults, velocity detection & Dark/Light themeMode storage', () => {
+  const proj = createEmptyProject('ThemeAndBlur', { width: 1080, height: 1920, fps: 30, durationSec: 5 });
+  assert.equal(proj.settings.themeMode, 'dark');
+  proj.settings.themeMode = 'light';
+
+  const txt = TimelineEngine.createTextLayer(proj, 0);
+  assert.deepEqual(txt.motionBlur, { enabled: false, strength: 0.7 });
+  txt.motionBlur.enabled = true;
+  txt.motionBlur.strength = 1.15;
+  KeyframeEngine.setKeyframe(txt, 'x', 0, -240, 'cubicBezier', [0.22, 1, 0.36, 1]);
+  KeyframeEngine.setKeyframe(txt, 'x', 30, 240, 'cubicBezier', [0.22, 1, 0.36, 1]);
+  TimelineEngine.addLayer(proj, txt);
+
+  const staticShape = TimelineEngine.createShapeLayer(proj, 'rectangle', 0);
+  staticShape.motionBlur.enabled = true;
+  TimelineEngine.addLayer(proj, staticShape);
+
+  const roundtrip = deserializeProject(serializeProject(proj));
+  assert.equal(roundtrip.settings.themeMode, 'light');
+  const rtTxt = roundtrip.layers.find((l) => l.id === txt.id);
+  assert.equal(rtTxt.motionBlur.enabled, true);
+  assert.equal(rtTxt.motionBlur.strength, 1.15);
+
+  // Verify RendererEngine motion velocity detection for 2D/3D movement vs static layer
+  const proto = RendererEngine.prototype;
+  const fakeRenderer = {
+    resolveEffectiveTransform: (layer, frame) => ({
+      x: KeyframeEngine.getValueAtFrame(layer, 'x', frame, layer.transform.x),
+      y: KeyframeEngine.getValueAtFrame(layer, 'y', frame, layer.transform.y),
+      z: KeyframeEngine.getValueAtFrame(layer, 'z', frame, layer.transform.z || 0),
+      scaleX: KeyframeEngine.getValueAtFrame(layer, 'scaleX', frame, layer.transform.scaleX),
+      scaleY: KeyframeEngine.getValueAtFrame(layer, 'scaleY', frame, layer.transform.scaleY),
+      rotation: KeyframeEngine.getValueAtFrame(layer, 'rotation', frame, layer.transform.rotation),
+      rotX: KeyframeEngine.getValueAtFrame(layer, 'rotX', frame, layer.transform.rotX || 0),
+      rotY: KeyframeEngine.getValueAtFrame(layer, 'rotY', frame, layer.transform.rotY || 0)
+    }),
+    computeTransitionState: () => ({ dx: 0, dy: 0, rotDelta: 0, scaleMul: 1 })
+  };
+
+  assert.equal(proto.hasLayerMotionVelocity.call(fakeRenderer, rtTxt, 15, 1080, 1920, false), true);
+  assert.equal(proto.hasLayerMotionVelocity.call(fakeRenderer, staticShape, 15, 1080, 1920, false), false);
+
+  // Verify 3D Z/rotY keyframe movement also triggers motion blur velocity
+  KeyframeEngine.setKeyframe(staticShape, 'z', 0, 0, 'smooth');
+  KeyframeEngine.setKeyframe(staticShape, 'z', 30, 300, 'smooth');
+  assert.equal(proto.hasLayerMotionVelocity.call(fakeRenderer, staticShape, 15, 1080, 1920, false), true);
+
+  // Verify Ease Curve cubic-bezier presets produce valid monotonic / overshoot values
+  for (const bp of CUBIC_BEZIER_PRESETS) {
+    assert.equal(applyEasing(0, 'cubicBezier', bp.bezier), 0);
+    assert.equal(applyEasing(1, 'cubicBezier', bp.bezier), 1);
+    const midVal = applyEasing(0.5, 'cubicBezier', bp.bezier);
+    assert.ok(Number.isFinite(midVal), `Preset ${bp.id} midpoint should be finite`);
+  }
+});
+
 
 
