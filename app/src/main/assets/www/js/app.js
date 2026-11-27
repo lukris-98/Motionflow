@@ -47,6 +47,7 @@ class MotionFlowApp {
     this._drawMode = 'doodle';
     this._cutoutTargetLayerId = null;
     this._cutoutSourceCanvas = null;
+    this._templatePreview = null;
 
     this.history = new HistoryManager(40);
     this.audioEngine = new AudioEngine();
@@ -278,6 +279,7 @@ class MotionFlowApp {
   }
 
   mutateProject(mutator) {
+    this.stopTemplateLivePreview({ skipRender: true });
     this.pushUndo();
     mutator();
     this.onTimelineMutated();
@@ -385,10 +387,161 @@ class MotionFlowApp {
   }
 
   renderPreview() {
+    if (this._templatePreview?.active && this._templatePreview.previewProject) {
+      this.renderer.renderFrame(
+        this._templatePreview.previewProject,
+        this._templatePreview.previewFrame,
+        this.mediaMap,
+        this.selectedLayerId
+      );
+      return;
+    }
     this.renderer.renderFrame(this.project, this.currentFrame, this.mediaMap, this.selectedLayerId);
   }
 
+  stopTemplateLivePreview(opts = {}) {
+    const prev = this._templatePreview;
+    if (!prev) return;
+    if (prev.rafId) cancelAnimationFrame(prev.rafId);
+    this._templatePreview = null;
+    if (!opts.skipRender && !this.isPlaying) {
+      this.renderer.seekVideosForFrame(this.project, this.currentFrame, this.mediaMap, false).catch(() => {});
+      this.renderPreview();
+    }
+  }
+
+  startTemplateLivePreview(spec) {
+    this.stopTemplateLivePreview({ skipRender: true });
+    if (!spec || !this.project) return false;
+    if (this.isPlaying) this.pause();
+
+    const cloneObj = (o) => (o ? JSON.parse(JSON.stringify(o)) : {});
+    const cloneLayer = (l) => ({
+      ...l,
+      transform: { ...(l.transform || {}) },
+      keyframes: cloneObj(l.keyframes || {}),
+      transitions: { inType: 'none', inFrames: 15, outType: 'none', outFrames: 15, ...(l.transitions || {}) }
+    });
+
+    const previewProject = {
+      ...this.project,
+      layers: this.project.layers.map((l) => l)
+    };
+    const fps = Math.max(1, previewProject.fps || 30);
+    let winStart = this.currentFrame;
+    let winEnd = this.currentFrame + 24;
+
+    if (spec.kind === 'animation') {
+      const targetId = spec.layerId || this.selectedLayerId;
+      const idx = previewProject.layers.findIndex((l) => l.id === targetId);
+      if (idx === -1) return false;
+      const orig = previewProject.layers[idx];
+      if (!orig || orig.type === 'audio' || orig.type === 'group') return false;
+
+      const cloned = cloneLayer(orig);
+      previewProject.layers[idx] = cloned;
+      const durF = Math.max(6, Math.min(180, Number(spec.durationFrames) || 24));
+      KeyframeEngine.applyPreset(
+        cloned,
+        spec.presetId,
+        previewProject.width || 1280,
+        previewProject.height || 720,
+        durF
+      );
+      const cat = KeyframeEngine.getPresetCategory(spec.presetId);
+      if (cat === 'in') {
+        winStart = cloned.startFrame;
+        winEnd = Math.min(cloned.endFrame, cloned.startFrame + durF + 4);
+      } else if (cat === 'out') {
+        winEnd = cloned.endFrame;
+        winStart = Math.max(cloned.startFrame, cloned.endFrame - durF - 4);
+      } else {
+        winStart = cloned.startFrame;
+        const loopCap = Math.min(90, Math.max(durF + 6, cloned.endFrame - cloned.startFrame));
+        winEnd = Math.min(cloned.endFrame, cloned.startFrame + loopCap);
+      }
+    } else if (spec.kind === 'transition') {
+      const tgt = spec.target || {};
+      const typeId = spec.typeId || 'none';
+      const durF = Math.max(4, Math.min(120, Number(spec.durationFrames) || 18));
+      const hasJunction = tgt.mode === 'junction' && tgt.leftId && tgt.rightId;
+      if (hasJunction) {
+        const lIdx = previewProject.layers.findIndex((l) => l.id === tgt.leftId);
+        const rIdx = previewProject.layers.findIndex((l) => l.id === tgt.rightId);
+        if (lIdx === -1 || rIdx === -1) return false;
+        const leftClone = cloneLayer(previewProject.layers[lIdx]);
+        const rightClone = cloneLayer(previewProject.layers[rIdx]);
+        previewProject.layers[lIdx] = leftClone;
+        previewProject.layers[rIdx] = rightClone;
+        TimelineEngine.applyTransitionBetweenClips(previewProject, tgt.leftId, tgt.rightId, typeId, durF);
+        const seam = Math.round((leftClone.endFrame + rightClone.startFrame) / 2);
+        const halfSpan = Math.ceil(durF * 0.7) + 4;
+        winStart = Math.max(leftClone.startFrame, seam - halfSpan);
+        winEnd = Math.min(rightClone.endFrame, seam + halfSpan);
+      } else {
+        const targetId = tgt.layerId || this.selectedLayerId;
+        const idx = previewProject.layers.findIndex((l) => l.id === targetId);
+        if (idx === -1) return false;
+        const orig = previewProject.layers[idx];
+        if (!orig || orig.type === 'audio' || orig.type === 'group') return false;
+        const cloned = cloneLayer(orig);
+        previewProject.layers[idx] = cloned;
+        if (tgt.mode === 'out') {
+          cloned.transitions.outType = typeId;
+          cloned.transitions.outFrames = durF;
+          winEnd = cloned.endFrame;
+          winStart = Math.max(cloned.startFrame, cloned.endFrame - durF - 4);
+        } else {
+          cloned.transitions.inType = typeId;
+          cloned.transitions.inFrames = durF;
+          winStart = cloned.startFrame;
+          winEnd = Math.min(cloned.endFrame, cloned.startFrame + durF + 4);
+        }
+      }
+    } else {
+      return false;
+    }
+
+    if (winEnd <= winStart) winEnd = winStart + 1;
+    const span = winEnd - winStart;
+    const token = (this._templatePreviewToken = (this._templatePreviewToken || 0) + 1);
+    const state = {
+      active: true,
+      token,
+      previewProject,
+      previewFrame: winStart,
+      rafId: null
+    };
+    this._templatePreview = state;
+
+    const frameMs = 1000 / fps;
+    const holdMs = 340;
+    const cycleMs = span * frameMs + holdMs;
+    const startMs = performance.now();
+    let lastSeekFrame = -9999;
+
+    const step = (now) => {
+      if (!this._templatePreview || this._templatePreview.token !== token) return;
+      const elapsedInCycle = (now - startMs) % Math.max(200, cycleMs);
+      const rawStep = elapsedInCycle / frameMs;
+      const curF = Math.min(winEnd, Math.round(winStart + Math.min(span, rawStep)));
+      state.previewFrame = curF;
+      if (Math.abs(curF - lastSeekFrame) >= 2) {
+        lastSeekFrame = curF;
+        this.renderer.seekVideosForFrame(previewProject, curF, this.mediaMap, false).catch(() => {});
+      }
+      this.renderer.renderFrame(previewProject, curF, this.mediaMap, this.selectedLayerId);
+      state.rafId = requestAnimationFrame(step);
+    };
+
+    this.renderer.seekVideosForFrame(previewProject, winStart, this.mediaMap, false).catch(() => {});
+    this.renderer.renderFrame(previewProject, winStart, this.mediaMap, this.selectedLayerId);
+    state.rafId = requestAnimationFrame(step);
+    return true;
+  }
+
   async seekToFrame(frame) {
+    this.stopTemplateLivePreview({ skipRender: true });
     const token = (this._seekVersion = (this._seekVersion || 0) + 1);
     const clamped = Math.max(0, Math.min(this.project.durationFrames, Math.round(frame)));
     this.currentFrame = clamped;
@@ -416,6 +569,7 @@ class MotionFlowApp {
 
   play() {
     if (this.isPlaying) return;
+    this.stopTemplateLivePreview({ skipRender: true });
     if (this.currentFrame >= this.project.durationFrames) {
       this.currentFrame = 0;
     }
@@ -2544,6 +2698,7 @@ class MotionFlowApp {
 
   bindNativeBridgeCallbacks() {
     window.__mfNative = {
+      getPixabayApiKey: () => window.AndroidBridge?.getPixabayApiKey?.() || '',
       handleBack: () => {
         const openModal = document.querySelector('.modal.show');
         if (openModal) {
@@ -2715,6 +2870,10 @@ class MotionFlowApp {
   }
 
   bindUIEvents() {
+    document.addEventListener('hidden.bs.offcanvas', () => {
+      this.stopTemplateLivePreview();
+    });
+
     document.getElementById('btnGroupChecked').onclick = () => {
       const ids = [...this.timelineView.checkedLayerIds];
       if (ids.length < 2) return;

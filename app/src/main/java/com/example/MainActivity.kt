@@ -539,6 +539,9 @@ class MainActivity : ComponentActivity() {
         fun isAndroidNative(): Boolean = true
 
         @JavascriptInterface
+        fun getPixabayApiKey(): String = BuildConfig.PIXABAY_API_KEY
+
+        @JavascriptInterface
         fun pickVisualMedia(mode: String) {
             runOnUiThread {
                 val mediaType = when (mode) {

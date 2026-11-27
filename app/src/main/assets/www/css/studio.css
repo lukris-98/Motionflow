@@ -1200,7 +1200,24 @@ html, body {
 }
 
 .mf-preview-tile.is-previewing {
-  border-color: rgba(0, 229, 255, 0.65);
+  border-color: rgba(0, 229, 255, 0.8);
+  box-shadow: 0 0 0 1px rgba(0, 229, 255, 0.28);
+}
+
+.mf-preview-tile.is-previewing .mf-tile-stage::after {
+  content: 'PREVIEW';
+  position: absolute;
+  top: 4px;
+  left: 4px;
+  font-size: 0.48rem;
+  font-weight: 800;
+  letter-spacing: 0.05em;
+  padding: 1px 4px;
+  border-radius: 4px;
+  background: rgba(0, 229, 255, 0.92);
+  color: #071018;
+  z-index: 4;
+  pointer-events: none;
 }
 
 .mf-preview-tile:not(.is-previewing) [class*="mf-anim-"],
@@ -1222,8 +1239,8 @@ html, body {
 
 .mf-preview-tile.has-add-btn .mf-tile-label {
   text-align: left;
-  padding-right: 24px;
-  min-height: 20px;
+  padding-right: 28px;
+  min-height: 22px;
   display: flex;
   align-items: center;
 }
@@ -1232,27 +1249,27 @@ html, body {
   position: absolute;
   right: 4px;
   bottom: 4px;
-  width: 20px;
-  height: 20px;
-  border-radius: 6px;
-  border: none;
+  width: 24px;
+  height: 24px;
+  border-radius: 7px;
+  border: 1.5px solid #09131d;
   background: var(--mf-cyan);
   color: #071018;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  font-size: 0.72rem;
+  font-size: 0.78rem;
   font-weight: 800;
   padding: 0;
-  z-index: 5;
-  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.5);
+  z-index: 6;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.65);
   cursor: pointer;
 }
 
 .mf-tile-add-btn::after {
   content: '';
   position: absolute;
-  inset: -6px;
+  inset: -8px;
 }
 
 .mf-tile-add-btn:active {

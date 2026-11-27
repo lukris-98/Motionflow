@@ -235,7 +235,7 @@ export function computeEdgeAutoScrollDelta(
 export class TimelineView {
   constructor(callbacks) {
     this.cb = callbacks;
-    this.pxPerFrame = 1.15; // Default overview (~34.5 px/s @ 30fps): 0s, 5s, 10s...; zoom reveals 1s..10s then frames
+    this.pxPerFrame = 0.72; // Default overview (~21.6 px/s @ 30fps): 0s, 5s, 10s...; pinch zoom smoothly opens 1s, 2s, 3s...10s then frames
     this.scrollEl = document.getElementById('timelineScroll');
     this.contentEl = document.getElementById('timelineContent');
     this.rulerCanvas = document.getElementById('rulerCanvas');
@@ -255,8 +255,10 @@ export class TimelineView {
     this.activePointers = new Map();
     this.pinchStartDist = null;
     this.pinchStartPx = this.pxPerFrame;
+    this.pinchTargetPx = this.pxPerFrame;
     this.pinchPivotFrame = 0;
     this.pinchPivotScreenX = 0;
+    this._suppressBgTapUntil = 0;
     this._pendingScrollLeft = null;
     this._lastRulerParams = null;
     this._lastTimelineMarkers = [];
@@ -271,6 +273,7 @@ export class TimelineView {
     this._zoomRafId = null;
     this._pinchEndTimer = null;
     this._activeClipAbort = null;
+    this._activeScrubAbort = null;
     this._hoverTimer = null;
     this._tooltipVariant = null;
     this._modifierHeld = false;
@@ -498,23 +501,39 @@ export class TimelineView {
   }
 
   zoomIn(anchorFrame = null) {
-    this._setZoomAnchored(this.pxPerFrame * 1.55, anchorFrame);
+    this._setZoomAnchored(this.pxPerFrame * 1.38, anchorFrame);
+    this.pinchTargetPx = this.pxPerFrame;
     this._applyFastZoomLayout();
     this._scheduleCrispRedraw(40);
   }
 
   zoomOut(anchorFrame = null) {
-    this._setZoomAnchored(this.pxPerFrame / 1.55, anchorFrame);
+    this._setZoomAnchored(this.pxPerFrame / 1.38, anchorFrame);
+    this.pinchTargetPx = this.pxPerFrame;
     this._applyFastZoomLayout();
     this._scheduleCrispRedraw(40);
   }
 
   _scheduleFastZoomUpdate() {
     if (this._zoomRafId !== null) return;
-    this._zoomRafId = requestAnimationFrame(() => {
+    const step = () => {
+      if (this._isPinching) {
+        const diff = this.pinchTargetPx - this.pxPerFrame;
+        const nextPx = Math.abs(diff) < 0.0025
+          ? this.pinchTargetPx
+          : this.pxPerFrame + diff * 0.42;
+        this._setZoomAnchored(nextPx, this.pinchPivotFrame, this.pinchPivotScreenX);
+        this._applyFastZoomLayout();
+        if (Math.abs(this.pinchTargetPx - this.pxPerFrame) >= 0.0025) {
+          this._zoomRafId = requestAnimationFrame(step);
+          return;
+        }
+      } else {
+        this._applyFastZoomLayout();
+      }
       this._zoomRafId = null;
-      this._applyFastZoomLayout();
-    });
+    };
+    this._zoomRafId = requestAnimationFrame(step);
   }
 
   _applyFastZoomLayout() {
@@ -605,53 +624,105 @@ export class TimelineView {
     }, delayMs);
   }
 
+  _beginPinchSession(x1, y1, x2, y2) {
+    this._isPinching = true;
+    clearTimeout(this._pinchEndTimer);
+    if (this._activeClipAbort) {
+      this._activeClipAbort();
+      this._activeClipAbort = null;
+    }
+    if (this._activeScrubAbort) {
+      this._activeScrubAbort();
+      this._activeScrubAbort = null;
+    }
+    this.pinchStartDist = Math.max(20, Math.hypot(x1 - x2, y1 - y2));
+    this.pinchStartPx = this.pxPerFrame;
+    this.pinchTargetPx = this.pxPerFrame;
+    const rect = this.scrollEl.getBoundingClientRect();
+    const midScreenX = Math.max(0, ((x1 + x2) * 0.5) - rect.left);
+    this.pinchPivotScreenX = midScreenX;
+    this.pinchPivotFrame = (this.scrollEl.scrollLeft + midScreenX) / Math.max(MIN_PX_PER_FRAME, this.pxPerFrame);
+  }
+
+  _updatePinchSession(x1, y1, x2, y2) {
+    if (!this._isPinching || !this.pinchStartDist) return;
+    const dist = Math.hypot(x1 - x2, y1 - y2);
+    const deltaPx = dist - this.pinchStartDist;
+    // Initial-finger-spacing invariant exponential scale: moderate, smooth expansion/contraction
+    const rawTarget = this.pinchStartPx * Math.exp(deltaPx / 135);
+    this.pinchTargetPx = Math.max(MIN_PX_PER_FRAME, Math.min(MAX_PX_PER_FRAME, rawTarget));
+    const rect = this.scrollEl.getBoundingClientRect();
+    this.pinchPivotScreenX = Math.max(0, ((x1 + x2) * 0.5) - rect.left);
+    this._scheduleFastZoomUpdate();
+  }
+
+  _endPinchSession() {
+    this.pinchStartDist = null;
+    if (this._isPinching) {
+      this._isPinching = false;
+      this._suppressBgTapUntil = performance.now() + 280;
+      if (Math.abs(this.pinchTargetPx - this.pxPerFrame) >= 0.002) {
+        this._setZoomAnchored(this.pinchTargetPx, this.pinchPivotFrame, this.pinchPivotScreenX);
+        this._applyFastZoomLayout();
+      }
+      this._scheduleCrispRedraw(70);
+    }
+  }
+
   bindPinchZoom() {
+    // Primary multi-touch handler on Android WebView (prevents scroll/pan steal when 2nd finger lands)
+    this.scrollEl.addEventListener('touchstart', (e) => {
+      if (e.touches && e.touches.length >= 2) {
+        e.preventDefault();
+        const t0 = e.touches[0];
+        const t1 = e.touches[1];
+        this._beginPinchSession(t0.clientX, t0.clientY, t1.clientX, t1.clientY);
+      }
+    }, { passive: false, capture: true });
+
     this.scrollEl.addEventListener('touchmove', (e) => {
       if (e.touches && e.touches.length >= 2) {
         e.preventDefault();
+        const t0 = e.touches[0];
+        const t1 = e.touches[1];
+        if (!this._isPinching) {
+          this._beginPinchSession(t0.clientX, t0.clientY, t1.clientX, t1.clientY);
+        } else {
+          this._updatePinchSession(t0.clientX, t0.clientY, t1.clientX, t1.clientY);
+        }
       }
-    }, { passive: false });
+    }, { passive: false, capture: true });
 
+    const onTouchEnd = (e) => {
+      if (this._isPinching && (!e.touches || e.touches.length < 2)) {
+        this._endPinchSession();
+      }
+    };
+    this.scrollEl.addEventListener('touchend', onTouchEnd, { capture: true });
+    this.scrollEl.addEventListener('touchcancel', onTouchEnd, { capture: true });
+
+    // Secondary multi-pointer fallback (desktop/trackpad/stylus)
     this.scrollEl.addEventListener('pointerdown', (e) => {
       this.activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
-      if (this.activePointers.size >= 2) {
-        this._isPinching = true;
-        clearTimeout(this._pinchEndTimer);
-        // Cancel any single-finger drag/trim that began on finger #1
-        if (this._activeClipAbort) {
-          this._activeClipAbort();
-          this._activeClipAbort = null;
-        }
+      if (this.activePointers.size >= 2 && !this._isPinching) {
         const pts = [...this.activePointers.values()];
-        this.pinchStartDist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
-        this.pinchStartPx = this.pxPerFrame;
-        const rect = this.scrollEl.getBoundingClientRect();
-        const midScreenX = Math.max(0, ((pts[0].x + pts[1].x) * 0.5) - rect.left);
-        this.pinchPivotScreenX = midScreenX;
-        this.pinchPivotFrame = (this.scrollEl.scrollLeft + midScreenX) / Math.max(MIN_PX_PER_FRAME, this.pxPerFrame);
+        this._beginPinchSession(pts[0].x, pts[0].y, pts[1].x, pts[1].y);
       }
     }, { capture: true });
 
     this.scrollEl.addEventListener('pointermove', (e) => {
       if (!this.activePointers.has(e.pointerId)) return;
       this.activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
-      if (this.activePointers.size === 2 && this.pinchStartDist > 8) {
+      if (this.activePointers.size >= 2 && this._isPinching && e.pointerType !== 'touch') {
         const pts = [...this.activePointers.values()];
-        const dist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
-        const ratio = dist / this.pinchStartDist;
-        this._setZoomAnchored(this.pinchStartPx * ratio, this.pinchPivotFrame, this.pinchPivotScreenX);
-        this._scheduleFastZoomUpdate();
+        this._updatePinchSession(pts[0].x, pts[0].y, pts[1].x, pts[1].y);
       }
     }, { capture: true });
 
     const endPtr = (e) => {
       this.activePointers.delete(e.pointerId);
-      if (this.activePointers.size < 2) {
-        this.pinchStartDist = null;
-        if (this._isPinching && this.activePointers.size === 0) {
-          this._isPinching = false;
-          this._scheduleCrispRedraw(70);
-        }
+      if (this.activePointers.size < 2 && this._isPinching && e.pointerType !== 'touch') {
+        this._endPinchSession();
       }
     };
     this.scrollEl.addEventListener('pointerup', endPtr, { capture: true });
@@ -712,6 +783,7 @@ export class TimelineView {
     };
 
     const startScrub = (targetEl, e, showTip) => {
+      if (this._isPinching || this.activePointers.size >= 2) return;
       e.stopPropagation();
       e.preventDefault();
       scrubbing = true;
@@ -719,6 +791,7 @@ export class TimelineView {
       lastScrubShowTip = showTip;
       this.isScrubbing = true;
       this.playheadEl?.classList.add('dragging');
+      this._activeScrubAbort = () => endScrub();
       try { targetEl.setPointerCapture(e.pointerId); } catch {}
       this.cb.onScrubStart?.();
       seekFromPointer(e.clientX, showTip);
@@ -727,6 +800,10 @@ export class TimelineView {
 
     const moveScrub = (e, showTip) => {
       if (!scrubbing) return;
+      if (this._isPinching) {
+        endScrub();
+        return;
+      }
       lastScrubX = e.clientX;
       lastScrubShowTip = showTip;
       seekFromPointer(e.clientX, showTip);
@@ -735,6 +812,7 @@ export class TimelineView {
     const endScrub = () => {
       if (!scrubbing) return;
       scrubbing = false;
+      this._activeScrubAbort = null;
       this._stopEdgeAutoScroll();
       this.isScrubbing = false;
       this.playheadEl?.classList.remove('dragging');
@@ -760,6 +838,8 @@ export class TimelineView {
     let bgTracking = false;
     this.scrollEl.addEventListener('pointerdown', (e) => {
       if (
+        this._isPinching ||
+        this.activePointers.size >= 2 ||
         e.target.closest('.mf-clip') ||
         e.target.closest('.mf-kf-diamond') ||
         e.target.closest('.mf-kf-lane-diamond') ||
@@ -778,7 +858,7 @@ export class TimelineView {
     this.scrollEl.addEventListener('pointerup', (e) => {
       if (!bgTracking) return;
       bgTracking = false;
-      if (this.activePointers.size > 1) return;
+      if (this._isPinching || this.activePointers.size > 1 || performance.now() < this._suppressBgTapUntil) return;
       if (Math.hypot(e.clientX - bgDownX, e.clientY - bgDownY) <= 8) {
         this.selectedKf = null;
         this._renderKfFloatingBar(this._lastRenderContext?.project);

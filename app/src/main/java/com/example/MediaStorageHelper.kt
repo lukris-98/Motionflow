@@ -283,6 +283,25 @@ class MediaStorageHelper(private val context: Context) {
             return notFoundResponse()
         }
 
+        if (path == "img/filter_landscape" || path == "img/filter_landscape.jpg") {
+            return try {
+                val headers = mapOf(
+                    "Access-Control-Allow-Origin" to "*",
+                    "Cache-Control" to "max-age=86400"
+                )
+                WebResourceResponse(
+                    "image/jpeg",
+                    null,
+                    200,
+                    "OK",
+                    headers,
+                    context.resources.openRawResource(R.drawable.img_filter_landscape)
+                )
+            } catch (_: Exception) {
+                notFoundResponse()
+            }
+        }
+
         val assetPath = if (path.isEmpty()) "www/index.html" else "www/$path"
         return try {
             val stream = context.assets.open(assetPath)

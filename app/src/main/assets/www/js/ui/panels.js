@@ -20,6 +20,8 @@ import { TrackerEngine } from '../engine/trackerEngine.js';
 import { setLayerColorMatchIntensity, toggleLayerColorMatch } from '../engine/colorMatchEngine.js';
 import { formatBytes, formatDurationMs, normalizeHexColor } from '../utils/math.js';
 
+const LANDSCAPE_FILTER_SRC = './img/filter_landscape.jpg';
+
 const SAMPLE_PREVIEW_SVG = 'data:image/svg+xml;utf8,' + encodeURIComponent(
   '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 90">' +
   '<defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">' +
@@ -49,6 +51,163 @@ export class PanelsUI {
     this.activeTransCat = 'all';
     this.transitionTarget = { mode: 'junction', leftId: null, rightId: null, layerId: null };
     this.selectedHslIdx = 0;
+    this.filterThumbCache = new Map();
+    this._landscapeImg = null;
+    this._landscapeImgState = 'idle';
+  }
+
+  _ensureLandscapeImageLoaded() {
+    if (this._landscapeImgState === 'ready' || this._landscapeImgState === 'loading' || this._landscapeImgState === 'error') {
+      return;
+    }
+    this._landscapeImgState = 'loading';
+    const img = new Image();
+    img.onload = () => {
+      this._landscapeImg = img;
+      this._landscapeImgState = 'ready';
+      this._upgradeRenderedFilterThumbs();
+    };
+    img.onerror = () => {
+      this._landscapeImgState = 'error';
+      document.querySelectorAll('img[data-filter-thumb]').forEach((el) => {
+        el.src = SAMPLE_PREVIEW_SVG;
+      });
+    };
+    img.src = LANDSCAPE_FILTER_SRC;
+  }
+
+  _renderGradedLandscapeThumb(fp) {
+    if (!fp || this._landscapeImgState !== 'ready' || !this._landscapeImg) return null;
+    if (this.filterThumbCache.has(fp.id)) return this.filterThumbCache.get(fp.id);
+
+    const w = 144;
+    const h = 108;
+    const c = document.createElement('canvas');
+    c.width = w;
+    c.height = h;
+    const ctx = c.getContext('2d');
+    const img = this._landscapeImg;
+    const iw = img.naturalWidth || w;
+    const ih = img.naturalHeight || h;
+    const scale = Math.max(w / iw, h / ih);
+    const dw = iw * scale;
+    const dh = ih * scale;
+    ctx.drawImage(img, (w - dw) * 0.5, (h - dh) * 0.5, dw, dh);
+
+    const fx = fp.fx || {};
+    const expMul = Math.pow(2, (fx.exposure || 0) * 1.4);
+    const temp = fx.temperature || 0;
+    const tint = fx.tint || 0;
+    const bright = (fx.brightness || 0) * 0.45;
+    const shadows = (fx.shadows || 0) * 0.35;
+    const highlights = (fx.highlights || 0) * 0.35;
+    const contrast = fx.contrast ?? 1;
+    const sat = fx.saturation ?? 1;
+    const fade = fx.fade || 0;
+    const vig = fx.vignette || 0;
+
+    const needsPixelPass =
+      expMul !== 1 || temp !== 0 || tint !== 0 || bright !== 0 ||
+      shadows !== 0 || highlights !== 0 || contrast !== 1 || sat !== 1 ||
+      fade > 0.005 || vig > 0.005;
+
+    if (needsPixelPass) {
+      const imgData = ctx.getImageData(0, 0, w, h);
+      const data = imgData.data;
+      const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
+
+      for (let y = 0; y < h; y++) {
+        const ny = y / h - 0.5;
+        for (let x = 0; x < w; x++) {
+          const i = (y * w + x) * 4;
+          let r = (data[i] / 255) * expMul;
+          let g = (data[i + 1] / 255) * expMul;
+          let b = (data[i + 2] / 255) * expMul;
+
+          r += temp * 0.14 + tint * 0.06 + bright;
+          g += temp * 0.02 - tint * 0.10 + bright;
+          b += -temp * 0.14 + tint * 0.06 + bright;
+
+          if (shadows !== 0 || highlights !== 0) {
+            const lumAdj = clamp01(0.299 * r + 0.587 * g + 0.114 * b);
+            const shadowW = Math.pow(1 - lumAdj, 1.6);
+            const highW = Math.pow(lumAdj, 1.6);
+            const delta = shadows * shadowW + highlights * highW;
+            r += delta;
+            g += delta;
+            b += delta;
+          }
+
+          if (contrast !== 1) {
+            r = (r - 0.5) * contrast + 0.5;
+            g = (g - 0.5) * contrast + 0.5;
+            b = (b - 0.5) * contrast + 0.5;
+          }
+
+          if (sat !== 1) {
+            const lum = 0.299 * r + 0.587 * g + 0.114 * b;
+            r = lum + (r - lum) * sat;
+            g = lum + (g - lum) * sat;
+            b = lum + (b - lum) * sat;
+          }
+
+          if (fade > 0.005) {
+            const fr = Math.max(r, 0.16);
+            const fg = Math.max(g, 0.16);
+            const fb = Math.max(b, 0.16);
+            r = r + (fr - r) * fade;
+            g = g + (fg - g) * fade;
+            b = b + (fb - b) * fade;
+          }
+
+          if (vig > 0.005) {
+            const nx = x / w - 0.5;
+            const vd = Math.hypot(nx, ny) * 1.414;
+            const t = clamp01((vd - 0.35) / 0.70);
+            const sm = t * t * (3 - 2 * t);
+            const vMul = 1 - sm * vig * 0.85;
+            r *= vMul;
+            g *= vMul;
+            b *= vMul;
+          }
+
+          data[i] = Math.round(clamp01(r) * 255);
+          data[i + 1] = Math.round(clamp01(g) * 255);
+          data[i + 2] = Math.round(clamp01(b) * 255);
+        }
+      }
+      ctx.putImageData(imgData, 0, 0);
+    }
+
+    const url = c.toDataURL('image/jpeg', 0.86);
+    this.filterThumbCache.set(fp.id, url);
+    return url;
+  }
+
+  _upgradeRenderedFilterThumbs() {
+    if (this._landscapeImgState !== 'ready') return;
+    document.querySelectorAll('img[data-filter-thumb]').forEach((imgEl) => {
+      const fid = imgEl.dataset.filterThumb;
+      const fp = FILTER_PRESETS.find((p) => p.id === fid);
+      if (!fp) return;
+      const graded = this._renderGradedLandscapeThumb(fp);
+      if (graded) {
+        imgEl.src = graded;
+        imgEl.style.filter = 'none';
+      }
+    });
+  }
+
+  getFilterPreviewInfo(fp) {
+    this._ensureLandscapeImageLoaded();
+    if (this._landscapeImgState === 'ready') {
+      const graded = this._renderGradedLandscapeThumb(fp);
+      if (graded) return { src: graded, cssFilter: 'none' };
+    }
+    if (this._landscapeImgState === 'error') {
+      return { src: SAMPLE_PREVIEW_SVG, cssFilter: fp.css || 'none' };
+    }
+    return { src: LANDSCAPE_FILTER_SRC, cssFilter: fp.css || 'none' };
   }
 
   getPreviewThumbSrc() {
@@ -56,7 +215,8 @@ export class PanelsUI {
       const snap = this.app.renderer?.capturePreviewThumbnailDataUrl?.(120, 90);
       if (snap) return snap;
     }
-    return SAMPLE_PREVIEW_SVG;
+    this._ensureLandscapeImageLoaded();
+    return this._landscapeImgState === 'error' ? SAMPLE_PREVIEW_SVG : LANDSCAPE_FILTER_SRC;
   }
 
   refreshAll() {
@@ -391,34 +551,35 @@ export class PanelsUI {
 
   renderKeyframesPanel() {
     const body = document.getElementById('keyframesBody');
+    if (!body) return;
     const layer = this.app.getSelectedLayer();
-    if (!layer) {
-      body.innerHTML = `<div class="text-center text-secondary py-4 small">Select a layer to preview Animations &amp; Keyframes.</div>`;
-      return;
-    }
+    const canApplyToLayer = Boolean(layer && layer.type !== 'audio' && layer.type !== 'group');
 
     const frame = this.app.currentFrame;
     const prop = this.selectedKfProp;
     const propMeta = ANIMATABLE_PROPS.find((p) => p.key === prop);
     const isColorProp = prop === 'color' || Boolean(propMeta?.isColor);
-    const tf = KeyframeEngine.getTransformAtFrame(layer, frame);
-    const curVal = isColorProp
-      ? KeyframeEngine.getColorAtFrame(layer, frame, KeyframeEngine.getDefaultPropValue(layer, 'color'))
-      : prop === 'volume'
-        ? KeyframeEngine.getValueAtFrame(layer, 'volume', frame, KeyframeEngine.getDefaultPropValue(layer, 'volume'))
-        : (tf[prop] ?? KeyframeEngine.getDefaultPropValue(layer, prop));
-    const kfAtCur = KeyframeEngine.getKeyframeAtFrame(layer, prop, frame);
-    const list = KeyframeEngine.ensurePropTrack(layer, prop);
+    const tf = layer ? KeyframeEngine.getTransformAtFrame(layer, frame) : {};
+    const curVal = layer
+      ? (isColorProp
+        ? KeyframeEngine.getColorAtFrame(layer, frame, KeyframeEngine.getDefaultPropValue(layer, 'color'))
+        : prop === 'volume'
+          ? KeyframeEngine.getValueAtFrame(layer, 'volume', frame, KeyframeEngine.getDefaultPropValue(layer, 'volume'))
+          : (tf[prop] ?? KeyframeEngine.getDefaultPropValue(layer, prop)))
+      : 0;
+    const kfAtCur = layer ? KeyframeEngine.getKeyframeAtFrame(layer, prop, frame) : null;
+    const list = layer ? KeyframeEngine.ensurePropTrack(layer, prop) : [];
     const activeEasing = kfAtCur?.easing || 'easeInOut';
     const bez = [...(kfAtCur?.bezier || [0.42, 0, 0.58, 1])];
     const animItems = ANIMATION_CATALOG.filter((a) => a.cat === this.activeAnimTab);
-    const isPresetActive = (id) =>
-      layer.presetInId === id || layer.presetOutId === id || layer.presetComboId === id || layer.activePresetId === id;
-    const activePresetChips = [
+    const isPresetActive = (id) => Boolean(layer && (
+      layer.presetInId === id || layer.presetOutId === id || layer.presetComboId === id || layer.activePresetId === id
+    ));
+    const activePresetChips = layer ? [
       layer.presetInId ? { cat: 'in', label: `In: ${ANIMATION_CATALOG.find((x) => x.id === layer.presetInId)?.label || layer.presetInId}` } : null,
       layer.presetOutId ? { cat: 'out', label: `Out: ${ANIMATION_CATALOG.find((x) => x.id === layer.presetOutId)?.label || layer.presetOutId}` } : null,
       layer.presetComboId ? { cat: 'combo', label: `Combo: ${ANIMATION_CATALOG.find((x) => x.id === layer.presetComboId)?.label || layer.presetComboId}` } : null
-    ].filter(Boolean);
+    ].filter(Boolean) : [];
 
     body.innerHTML = `
       <div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mb-2">
@@ -431,6 +592,14 @@ export class PanelsUI {
           <span class="small text-secondary">Dur(f)</span>
           <input id="presetDurFrames" type="number" min="6" max="180" value="24" class="form-control form-control-sm" style="width:62px;" />
         </div>
+      </div>
+
+      <div class="small text-secondary mb-2" style="font-size:0.7rem;">
+        <i class="bi bi-play-circle text-info me-1"></i>${
+          canApplyToLayer
+            ? `Tap kartu untuk <strong>preview</strong> animasi, tekan tombol <strong class="text-info">+</strong> di pojok kanan bawah untuk menerapkan ke <strong>${this.esc(layer.name)}</strong>.`
+            : 'Tap kartu untuk <strong>preview</strong> animasi. Pilih item video, gambar, teks, atau shape di timeline lalu tekan <strong class="text-info">+</strong> untuk menerapkan.'
+        }
       </div>
 
       <div class="mf-tile-grid mb-2">
@@ -447,194 +616,219 @@ export class PanelsUI {
         `).join('')}
       </div>
 
-      <div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mb-2 px-2 py-1 rounded-2 bg-dark border border-secondary-subtle">
-        <div class="d-flex flex-wrap align-items-center gap-1">
-          <span class="small text-secondary" style="font-size:0.68rem;"><i class="bi bi-diamond-fill text-info me-1"></i>Preset = Keyframe siap pakai</span>
-          ${activePresetChips.map((c) => `
-            <span class="badge text-bg-dark border border-info-subtle d-inline-flex align-items-center gap-1">
-              <span>${c.label}</span>
-              <button type="button" class="btn-close btn-close-white" style="font-size:0.45rem;" data-clear-preset-cat="${c.cat}" aria-label="Hapus preset ${c.cat}"></button>
-            </span>
-          `).join('')}
+      ${layer ? `
+        <div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mb-2 px-2 py-1 rounded-2 bg-dark border border-secondary-subtle">
+          <div class="d-flex flex-wrap align-items-center gap-1">
+            <span class="small text-secondary" style="font-size:0.68rem;"><i class="bi bi-diamond-fill text-info me-1"></i>Preset = Keyframe siap pakai</span>
+            ${activePresetChips.map((c) => `
+              <span class="badge text-bg-dark border border-info-subtle d-inline-flex align-items-center gap-1">
+                <span>${c.label}</span>
+                <button type="button" class="btn-close btn-close-white" style="font-size:0.45rem;" data-clear-preset-cat="${c.cat}" aria-label="Hapus preset ${c.cat}"></button>
+              </span>
+            `).join('')}
+          </div>
+          <button type="button" id="btnRevealKfLanes" class="btn btn-sm btn-outline-info py-0 px-2" style="font-size:0.7rem;">
+            <i class="bi bi-sliders2 me-1"></i>Lane Timeline
+          </button>
         </div>
-        <button type="button" id="btnRevealKfLanes" class="btn btn-sm btn-outline-info py-0 px-2" style="font-size:0.7rem;">
-          <i class="bi bi-sliders2 me-1"></i>Lane Timeline
-        </button>
-      </div>
 
-      <hr class="border-secondary-subtle my-2" />
-      <div class="small text-info fw-semibold mb-1"><i class="bi bi-diamond-half me-1"></i>Custom Keyframe Curve (${prop})</div>
-      <div class="row g-2 mb-2 align-items-end">
-        <div class="col-5">
-          <label class="form-label small text-secondary mb-0">Property</label>
-          <select id="kfPropSel" class="form-select form-select-sm">
-            ${ANIMATABLE_PROPS.map((p) => `<option value="${p.key}" ${p.key === prop ? 'selected' : ''}>${p.label}</option>`).join('')}
-          </select>
-        </div>
-        <div class="col-4">
-          <label class="form-label small text-secondary mb-0">Val @ F${frame}</label>
-          ${isColorProp
-            ? `<input id="kfValInp" type="color" class="form-control form-control-color form-control-sm w-100" value="${normalizeHexColor(String(curVal), '#ffffff')}" />`
-            : `<input id="kfValInp" type="number" step="${propMeta?.step ?? 0.1}" class="form-control form-control-sm" value="${Number(Number(curVal).toFixed(2))}" />`
-          }
-        </div>
-        <div class="col-3 d-flex gap-1">
-          <button id="btnAddSetKf" class="btn btn-sm mf-btn-accent flex-grow-1" title="Set Keyframe"><i class="bi bi-diamond-fill"></i></button>
-          <button id="btnCopyKf" class="btn btn-sm btn-outline-light" title="Copy Keyframe" ${kfAtCur ? '' : 'disabled'}><i class="bi bi-clipboard"></i></button>
-          <button id="btnPasteKf" class="btn btn-sm btn-outline-info" title="Paste Keyframe" ${this.copiedKeyframe ? '' : 'disabled'}><i class="bi bi-clipboard-check"></i></button>
-        </div>
-      </div>
-
-      <div class="row g-2 mb-2 align-items-start">
-        <div class="col-6">
-          <label class="form-label small text-secondary mb-0">Easing Curve</label>
-          <select id="kfEasingSel" class="form-select form-select-sm mb-2">
-            ${EASING_TYPES.map((e) => `<option value="${e.key}" ${e.key === activeEasing ? 'selected' : ''}>${e.label}</option>`).join('')}
-          </select>
-          <div id="kfBezierWrap" class="${activeEasing === 'cubicBezier' ? '' : 'd-none'}">
-            <label class="form-label small text-secondary mb-0">Cubic Bezier (x1, y1, x2, y2)</label>
-            <div class="input-group input-group-sm">
-              <input id="bzX1" type="number" min="0" max="1" step="0.05" class="form-control" value="${bez[0]}" />
-              <input id="bzY1" type="number" min="-0.5" max="1.5" step="0.05" class="form-control" value="${bez[1]}" />
-              <input id="bzX2" type="number" min="0" max="1" step="0.05" class="form-control" value="${bez[2]}" />
-              <input id="bzY2" type="number" min="-0.5" max="1.5" step="0.05" class="form-control" value="${bez[3]}" />
-            </div>
+        <hr class="border-secondary-subtle my-2" />
+        <div class="small text-info fw-semibold mb-1"><i class="bi bi-diamond-half me-1"></i>Custom Keyframe Curve (${prop})</div>
+        <div class="row g-2 mb-2 align-items-end">
+          <div class="col-5">
+            <label class="form-label small text-secondary mb-0">Property</label>
+            <select id="kfPropSel" class="form-select form-select-sm">
+              ${ANIMATABLE_PROPS.map((p) => `<option value="${p.key}" ${p.key === prop ? 'selected' : ''}>${p.label}</option>`).join('')}
+            </select>
+          </div>
+          <div class="col-4">
+            <label class="form-label small text-secondary mb-0">Val @ F${frame}</label>
+            ${isColorProp
+              ? `<input id="kfValInp" type="color" class="form-control form-control-color form-control-sm w-100" value="${normalizeHexColor(String(curVal), '#ffffff')}" />`
+              : `<input id="kfValInp" type="number" step="${propMeta?.step ?? 0.1}" class="form-control form-control-sm" value="${Number(Number(curVal).toFixed(2))}" />`
+            }
+          </div>
+          <div class="col-3 d-flex gap-1">
+            <button id="btnAddSetKf" class="btn btn-sm mf-btn-accent flex-grow-1" title="Set Keyframe"><i class="bi bi-diamond-fill"></i></button>
+            <button id="btnCopyKf" class="btn btn-sm btn-outline-light" title="Copy Keyframe" ${kfAtCur ? '' : 'disabled'}><i class="bi bi-clipboard"></i></button>
+            <button id="btnPasteKf" class="btn btn-sm btn-outline-info" title="Paste Keyframe" ${this.copiedKeyframe ? '' : 'disabled'}><i class="bi bi-clipboard-check"></i></button>
           </div>
         </div>
-        <div class="col-6 ${activeEasing === 'cubicBezier' ? '' : 'd-none'}" id="kfBezierGraphWrap">
-          <svg id="svgBezier" viewBox="0 0 120 100" class="mf-bezier-svg"></svg>
-        </div>
-      </div>
 
-      <div class="d-flex flex-wrap gap-1">
-        ${list.length === 0 ? '<span class="small text-secondary">Tap preset di atas atau tambah keyframe manual per properti.</span>' : ''}
-        ${list.map((k) => {
-          const valLabel = isColorProp
-            ? `<span class="rounded-1 border border-light-subtle" style="display:inline-block;width:9px;height:9px;background:${normalizeHexColor(String(k.value), '#ffffff')};"></span> ${normalizeHexColor(String(k.value), '#ffffff')}`
-            : Number(Number(k.value).toFixed(2));
-          return `
-            <div class="badge ${k.frame === frame ? 'text-bg-info' : 'text-bg-dark border border-secondary-subtle'} d-inline-flex align-items-center gap-1 py-1 px-2">
-              <span class="cursor-pointer d-inline-flex align-items-center gap-1" data-kf-jump="${k.frame}">F${k.frame}: ${valLabel} (${k.easing})</span>
-              <button class="btn-close btn-close-white ms-1" style="font-size:0.5rem;" data-kf-del="${k.id}" aria-label="Delete Keyframe"></button>
+        <div class="row g-2 mb-2 align-items-start">
+          <div class="col-6">
+            <label class="form-label small text-secondary mb-0">Easing Curve</label>
+            <select id="kfEasingSel" class="form-select form-select-sm mb-2">
+              ${EASING_TYPES.map((e) => `<option value="${e.key}" ${e.key === activeEasing ? 'selected' : ''}>${e.label}</option>`).join('')}
+            </select>
+            <div id="kfBezierWrap" class="${activeEasing === 'cubicBezier' ? '' : 'd-none'}">
+              <label class="form-label small text-secondary mb-0">Cubic Bezier (x1, y1, x2, y2)</label>
+              <div class="input-group input-group-sm">
+                <input id="bzX1" type="number" min="0" max="1" step="0.05" class="form-control" value="${bez[0]}" />
+                <input id="bzY1" type="number" min="-0.5" max="1.5" step="0.05" class="form-control" value="${bez[1]}" />
+                <input id="bzX2" type="number" min="0" max="1" step="0.05" class="form-control" value="${bez[2]}" />
+                <input id="bzY2" type="number" min="-0.5" max="1.5" step="0.05" class="form-control" value="${bez[3]}" />
+              </div>
             </div>
-          `;
-        }).join('')}
-      </div>
+          </div>
+          <div class="col-6 ${activeEasing === 'cubicBezier' ? '' : 'd-none'}" id="kfBezierGraphWrap">
+            <svg id="svgBezier" viewBox="0 0 120 100" class="mf-bezier-svg"></svg>
+          </div>
+        </div>
+
+        <div class="d-flex flex-wrap gap-1">
+          ${list.length === 0 ? '<span class="small text-secondary">Tekan tombol + di pojok kanan bawah kartu untuk menerapkan animasi atau tambah keyframe manual.</span>' : ''}
+          ${list.map((k) => {
+            const valLabel = isColorProp
+              ? `<span class="rounded-1 border border-light-subtle" style="display:inline-block;width:9px;height:9px;background:${normalizeHexColor(String(k.value), '#ffffff')};"></span> ${normalizeHexColor(String(k.value), '#ffffff')}`
+              : Number(Number(k.value).toFixed(2));
+            return `
+              <div class="badge ${k.frame === frame ? 'text-bg-info' : 'text-bg-dark border border-secondary-subtle'} d-inline-flex align-items-center gap-1 py-1 px-2">
+                <span class="cursor-pointer d-inline-flex align-items-center gap-1" data-kf-jump="${k.frame}">F${k.frame}: ${valLabel} (${k.easing})</span>
+                <button class="btn-close btn-close-white ms-1" style="font-size:0.5rem;" data-kf-del="${k.id}" aria-label="Delete Keyframe"></button>
+              </div>
+            `;
+          }).join('')}
+        </div>
+      ` : ''}
     `;
 
-    this.drawBezierGraph(body.querySelector('#svgBezier'), bez, kfAtCur, body, layer, prop, frame, curVal);
+    if (layer) {
+      this.drawBezierGraph(body.querySelector('#svgBezier'), bez, kfAtCur, body, layer, prop, frame, curVal);
+    }
 
     body.querySelectorAll('[data-anim-tab]').forEach((btn) => {
       btn.onclick = () => {
+        this.app.stopTemplateLivePreview();
         this.activeAnimTab = btn.dataset.animTab;
         this.renderKeyframesPanel();
       };
     });
 
-    const revealBtn = body.querySelector('#btnRevealKfLanes');
-    if (revealBtn) {
-      revealBtn.onclick = () => {
-        layer.kfExpanded = true;
-        this.app.scheduleAutosave();
-        this.app.refreshTimelineOnly();
-        this.app.hideOpenSheets();
-      };
-    }
-
-    body.querySelectorAll('[data-clear-preset-cat]').forEach((btn) => {
-      btn.onclick = () => {
-        const cat = btn.dataset.clearPresetCat;
-        this.app.mutateProject(() => {
-          KeyframeEngine.clearPresetCategory(layer, cat);
-        });
-        this.app.showToast(`Preset ${cat.toUpperCase()} dihapus`);
-      };
-    });
-
-    body.querySelector('#kfPropSel').onchange = (e) => {
-      this.selectedKfProp = e.target.value;
-      this.renderKeyframesPanel();
-    };
-
-    body.querySelector('#btnAddSetKf').onclick = () => {
-      const rawVal = body.querySelector('#kfValInp').value;
-      const val = isColorProp ? normalizeHexColor(String(rawVal), '#ffffff') : Number(rawVal);
-      const easing = body.querySelector('#kfEasingSel').value;
-      const bezVal = [
-        Number(body.querySelector('#bzX1').value) || 0.42,
-        Number(body.querySelector('#bzY1').value) || 0,
-        Number(body.querySelector('#bzX2').value) || 0.58,
-        Number(body.querySelector('#bzY2').value) || 1
-      ];
-      this.app.mutateProject(() => {
-        KeyframeEngine.setKeyframe(layer, prop, frame, val, easing, bezVal);
-      });
-    };
-
-    body.querySelector('#kfEasingSel').onchange = (e) => {
-      const easing = e.target.value;
-      body.querySelector('#kfBezierWrap').classList.toggle('d-none', easing !== 'cubicBezier');
-      body.querySelector('#kfBezierGraphWrap').classList.toggle('d-none', easing !== 'cubicBezier');
-      if (kfAtCur) {
-        this.app.mutateProject(() => { kfAtCur.easing = easing; });
+    if (layer) {
+      const revealBtn = body.querySelector('#btnRevealKfLanes');
+      if (revealBtn) {
+        revealBtn.onclick = () => {
+          layer.kfExpanded = true;
+          this.app.scheduleAutosave();
+          this.app.refreshTimelineOnly();
+          this.app.hideOpenSheets();
+        };
       }
-    };
 
-    ['#bzX1', '#bzY1', '#bzX2', '#bzY2'].forEach((sel, idx) => {
-      body.querySelector(sel).onchange = (e) => {
-        if (kfAtCur) {
+      body.querySelectorAll('[data-clear-preset-cat]').forEach((btn) => {
+        btn.onclick = () => {
+          const cat = btn.dataset.clearPresetCat;
           this.app.mutateProject(() => {
-            if (!kfAtCur.bezier) kfAtCur.bezier = [0.42, 0, 0.58, 1];
-            kfAtCur.bezier[idx] = Number(e.target.value);
+            KeyframeEngine.clearPresetCategory(layer, cat);
+          });
+          this.app.showToast(`Preset ${cat.toUpperCase()} dihapus`);
+        };
+      });
+
+      body.querySelector('#kfPropSel').onchange = (e) => {
+        this.selectedKfProp = e.target.value;
+        this.renderKeyframesPanel();
+      };
+
+      body.querySelector('#btnAddSetKf').onclick = () => {
+        const rawVal = body.querySelector('#kfValInp').value;
+        const val = isColorProp ? normalizeHexColor(String(rawVal), '#ffffff') : Number(rawVal);
+        const easing = body.querySelector('#kfEasingSel').value;
+        const bezVal = [
+          Number(body.querySelector('#bzX1').value) || 0.42,
+          Number(body.querySelector('#bzY1').value) || 0,
+          Number(body.querySelector('#bzX2').value) || 0.58,
+          Number(body.querySelector('#bzY2').value) || 1
+        ];
+        this.app.mutateProject(() => {
+          KeyframeEngine.setKeyframe(layer, prop, frame, val, easing, bezVal);
+        });
+      };
+
+      body.querySelector('#kfEasingSel').onchange = (e) => {
+        const easing = e.target.value;
+        body.querySelector('#kfBezierWrap').classList.toggle('d-none', easing !== 'cubicBezier');
+        body.querySelector('#kfBezierGraphWrap').classList.toggle('d-none', easing !== 'cubicBezier');
+        if (kfAtCur) {
+          this.app.mutateProject(() => { kfAtCur.easing = easing; });
+        }
+      };
+
+      ['#bzX1', '#bzY1', '#bzX2', '#bzY2'].forEach((sel, idx) => {
+        body.querySelector(sel).onchange = (e) => {
+          if (kfAtCur) {
+            this.app.mutateProject(() => {
+              if (!kfAtCur.bezier) kfAtCur.bezier = [0.42, 0, 0.58, 1];
+              kfAtCur.bezier[idx] = Number(e.target.value);
+            });
+          }
+        };
+      });
+
+      body.querySelector('#btnCopyKf').onclick = () => {
+        if (kfAtCur) {
+          this.copiedKeyframe = {
+            prop,
+            value: kfAtCur.value,
+            easing: kfAtCur.easing,
+            bezier: [...(kfAtCur.bezier || [0.42, 0, 0.58, 1])]
+          };
+          this.app.showToast('Keyframe copied');
+          this.renderKeyframesPanel();
+        }
+      };
+
+      body.querySelector('#btnPasteKf').onclick = () => {
+        if (this.copiedKeyframe) {
+          const pasteColor = isColorProp
+            ? normalizeHexColor(String(this.copiedKeyframe.value), '#ffffff')
+            : Number(this.copiedKeyframe.value);
+          if (!isColorProp && !Number.isFinite(pasteColor)) {
+            this.app.showToast('Tipe keyframe berbeda');
+            return;
+          }
+          this.app.mutateProject(() => {
+            KeyframeEngine.setKeyframe(layer, prop, frame, isColorProp ? pasteColor : Number(this.copiedKeyframe.value), this.copiedKeyframe.easing, this.copiedKeyframe.bezier);
           });
         }
       };
-    });
 
-    body.querySelector('#btnCopyKf').onclick = () => {
-      if (kfAtCur) {
-        this.copiedKeyframe = {
-          prop,
-          value: kfAtCur.value,
-          easing: kfAtCur.easing,
-          bezier: [...(kfAtCur.bezier || [0.42, 0, 0.58, 1])]
+      body.querySelectorAll('[data-kf-jump]').forEach((el) => {
+        el.onclick = () => this.app.seekToFrame(Number(el.dataset.kfJump));
+      });
+
+      body.querySelectorAll('[data-kf-del]').forEach((el) => {
+        el.onclick = () => {
+          this.app.mutateProject(() => KeyframeEngine.removeKeyframe(layer, prop, el.dataset.kfDel));
         };
-        this.app.showToast('Keyframe copied');
-        this.renderKeyframesPanel();
+      });
+    }
+
+    this.bindTemplatePreviewTiles(body, '[data-anim-preview]', (tile, isPreviewing) => {
+      if (!isPreviewing) {
+        this.app.stopTemplateLivePreview();
+        return;
       }
-    };
-
-    body.querySelector('#btnPasteKf').onclick = () => {
-      if (this.copiedKeyframe) {
-        const pasteColor = isColorProp
-          ? normalizeHexColor(String(this.copiedKeyframe.value), '#ffffff')
-          : Number(this.copiedKeyframe.value);
-        if (!isColorProp && !Number.isFinite(pasteColor)) {
-          this.app.showToast('Tipe keyframe berbeda');
-          return;
-        }
-        this.app.mutateProject(() => {
-          KeyframeEngine.setKeyframe(layer, prop, frame, isColorProp ? pasteColor : Number(this.copiedKeyframe.value), this.copiedKeyframe.easing, this.copiedKeyframe.bezier);
-        });
-      }
-    };
-
-    body.querySelectorAll('[data-kf-jump]').forEach((el) => {
-      el.onclick = () => this.app.seekToFrame(Number(el.dataset.kfJump));
+      const pid = tile.dataset.animPreview;
+      const durF = Number(body.querySelector('#presetDurFrames')?.value) || 24;
+      this.app.startTemplateLivePreview({
+        kind: 'animation',
+        presetId: pid,
+        durationFrames: durF,
+        layerId: canApplyToLayer ? layer.id : null
+      });
     });
-
-    body.querySelectorAll('[data-kf-del]').forEach((el) => {
-      el.onclick = () => {
-        this.app.mutateProject(() => KeyframeEngine.removeKeyframe(layer, prop, el.dataset.kfDel));
-      };
-    });
-
-    this.bindTemplatePreviewTiles(body, '[data-anim-preview]');
 
     body.querySelectorAll('[data-preset]').forEach((btn) => {
       btn.onclick = (e) => {
         e.stopPropagation();
-        const durF = Number(body.querySelector('#presetDurFrames').value) || 24;
+        this.app.stopTemplateLivePreview({ skipRender: true });
+        if (!canApplyToLayer) {
+          this.app.showToast('Pilih item video, gambar, teks, atau shape di timeline terlebih dahulu');
+          return;
+        }
+        const durF = Number(body.querySelector('#presetDurFrames')?.value) || 24;
         const pid = btn.dataset.preset;
         const tileLabel = btn.closest('.mf-preview-tile')?.querySelector('.mf-tile-label')?.textContent || pid;
         this.app.mutateProject(() => {
@@ -785,15 +979,19 @@ export class PanelsUI {
     });
   }
 
-  bindTemplatePreviewTiles(rootEl, tileSelector) {
+  bindTemplatePreviewTiles(rootEl, tileSelector, onToggleCallback = null) {
     if (!rootEl) return;
     const tiles = [...rootEl.querySelectorAll(tileSelector)];
     const togglePreview = (tile) => {
       const wasPreviewing = tile.classList.contains('is-previewing');
       tiles.forEach((other) => other.classList.remove('is-previewing'));
-      if (!wasPreviewing) {
+      const nowPreviewing = !wasPreviewing;
+      if (nowPreviewing) {
         void tile.offsetWidth;
         tile.classList.add('is-previewing');
+      }
+      if (typeof onToggleCallback === 'function') {
+        onToggleCallback(tile, nowPreviewing);
       }
     };
     tiles.forEach((tile) => {
@@ -1235,15 +1433,16 @@ export class PanelsUI {
 
     body.innerHTML = tabsHtml + innerHtml;
 
-    body.querySelector('#tabStyleLayer').onclick = () => { this.activeStyleTab = 'layer'; this.renderStylePanel(); };
-    body.querySelector('#tabStyleFx').onclick = () => { this.activeStyleTab = 'fx'; this.renderStylePanel(); };
-    body.querySelector('#tabStyleMask').onclick = () => { this.activeStyleTab = 'mask'; this.renderStylePanel(); };
+    body.querySelector('#tabStyleLayer').onclick = () => { this.app.stopTemplateLivePreview(); this.activeStyleTab = 'layer'; this.renderStylePanel(); };
+    body.querySelector('#tabStyleFx').onclick = () => { this.app.stopTemplateLivePreview(); this.activeStyleTab = 'fx'; this.renderStylePanel(); };
+    body.querySelector('#tabStyleMask').onclick = () => { this.app.stopTemplateLivePreview(); this.activeStyleTab = 'mask'; this.renderStylePanel(); };
     body.querySelector('#tabStyleTracker').onclick = () => {
+      this.app.stopTemplateLivePreview();
       this.activeStyleTab = 'tracker';
       this.app.ensureTrackerSourceSelected();
       this.renderStylePanel();
     };
-    body.querySelector('#tabStyleCamera').onclick = () => { this.activeStyleTab = 'camera'; this.renderStylePanel(); };
+    body.querySelector('#tabStyleCamera').onclick = () => { this.app.stopTemplateLivePreview(); this.activeStyleTab = 'camera'; this.renderStylePanel(); };
 
     if (this.activeStyleTab === 'tracker') {
       this.bindTrackerTabEvents(body);
@@ -1652,14 +1851,17 @@ export class PanelsUI {
           `).join('')}
         </div>
         <div class="mf-tile-grid mb-2">
-          ${visibleFilters.map((fp) => `
+          ${visibleFilters.map((fp) => {
+            const pInfo = this.getFilterPreviewInfo(fp);
+            return `
             <button type="button" class="mf-preview-tile ${(layer.filterId || 'normal') === fp.id ? 'active' : ''}" data-fx-preset="${fp.id}">
               <div class="mf-tile-stage">
-                <img src="${thumbSrc}" class="mf-tile-thumb" style="filter:${fp.css};" alt="${this.esc(fp.label)}" />
+                <img src="${pInfo.src}" data-filter-thumb="${fp.id}" class="mf-tile-thumb" style="filter:${pInfo.cssFilter};" alt="${this.esc(fp.label)}" />
               </div>
               <div class="mf-tile-label">${fp.label}</div>
             </button>
-          `).join('')}
+          `;
+          }).join('')}
         </div>
         <div class="row g-2 align-items-end">
           <div class="col-8">
@@ -2183,23 +2385,47 @@ export class PanelsUI {
 
     body.querySelectorAll('[data-tr-side]').forEach((btn) => {
       btn.onclick = () => {
+        this.app.stopTemplateLivePreview();
         this.activeTransSide = btn.dataset.trSide;
         this.renderStylePanel();
       };
     });
-    this.bindTemplatePreviewTiles(body, '[data-tr-preview]');
+    this.bindTemplatePreviewTiles(body, '[data-tr-preview]', (tile, isPreviewing) => {
+      if (!isPreviewing) {
+        this.app.stopTemplateLivePreview();
+        return;
+      }
+      const typeId = tile.dataset.trPreview;
+      const durF = Math.max(2, Number(body.querySelector('#trCurFrames')?.value) || 15);
+      this.app.startTemplateLivePreview({
+        kind: 'transition',
+        typeId,
+        durationFrames: durF,
+        target: { mode: this.activeTransSide, layerId: layer.id }
+      });
+    });
 
     body.querySelectorAll('[data-tr-pick]').forEach((btn) => {
       btn.onclick = (e) => {
         e.stopPropagation();
+        this.app.stopTemplateLivePreview({ skipRender: true });
         const val = btn.dataset.trPick;
+        const durF = Math.max(2, Number(body.querySelector('#trCurFrames')?.value) || 15);
         this.app.mutateProject(() => {
-          if (this.activeTransSide === 'in') tr.inType = val;
-          else tr.outType = val;
+          if (this.activeTransSide === 'in') {
+            tr.inType = val;
+            tr.inFrames = durF;
+          } else {
+            tr.outType = val;
+            tr.outFrames = durF;
+          }
         });
+        const label = btn.closest('.mf-preview-tile')?.querySelector('.mf-tile-label')?.textContent || val;
+        this.app.showToast(val === 'none' ? 'Transisi dihapus' : `Transisi "${label}" diterapkan`);
       };
     });
     body.querySelector('#btnOpenFullTransitions')?.addEventListener('click', () => {
+      this.app.stopTemplateLivePreview();
       this.app.hideOpenSheets();
       this.app.openTransitionsSheet({ layerId: layer.id });
     });
@@ -2590,12 +2816,14 @@ export class PanelsUI {
 
     body.querySelectorAll('[data-tr-mode]').forEach((btn) => {
       btn.onclick = () => {
+        this.app.stopTemplateLivePreview();
         this.transitionTarget.mode = btn.dataset.trMode;
         this.renderTransitionsPanel();
       };
     });
 
     body.querySelector('#selTransJunction')?.addEventListener('change', (e) => {
+      this.app.stopTemplateLivePreview();
       const found = junctions.find((j) => j.id === e.target.value);
       if (found) {
         this.transitionTarget = { mode: 'junction', leftId: found.leftId, rightId: found.rightId, layerId: found.leftId };
@@ -2605,6 +2833,7 @@ export class PanelsUI {
 
     body.querySelectorAll('[data-tr-cat]').forEach((btn) => {
       btn.onclick = () => {
+        this.app.stopTemplateLivePreview();
         this.activeTransCat = btn.dataset.trCat;
         this.renderTransitionsPanel();
       };
@@ -2615,11 +2844,25 @@ export class PanelsUI {
       return Math.max(4, Math.round(secVal * fps));
     };
 
-    this.bindTemplatePreviewTiles(body, '[data-tr-sheet-preview]');
+    this.bindTemplatePreviewTiles(body, '[data-tr-sheet-preview]', (tile, isPreviewing) => {
+      if (!isPreviewing) {
+        this.app.stopTemplateLivePreview();
+        return;
+      }
+      const typeId = tile.dataset.trSheetPreview;
+      const durF = getChosenFrames();
+      this.app.startTemplateLivePreview({
+        kind: 'transition',
+        typeId,
+        durationFrames: durF,
+        target: { ...this.transitionTarget }
+      });
+    });
 
     body.querySelectorAll('[data-tr-apply]').forEach((btn) => {
       btn.onclick = (e) => {
         e.stopPropagation();
+        this.app.stopTemplateLivePreview({ skipRender: true });
         const typeId = btn.dataset.trApply;
         const durF = getChosenFrames();
         this.app.applyTransitionFromSheet(typeId, durF, this.transitionTarget);
