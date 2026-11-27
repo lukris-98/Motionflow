@@ -78,6 +78,7 @@ export function createEmptyProject(name = 'Untitled Project', options = {}) {
       rippleMode: true,
       autoColorMatch: true,
       mainTrackCompact: false,
+      zoneOrder: ['overlay', 'main', 'audio'],
       themeMode: options.themeMode === 'light' ? 'light' : 'dark'
     },
     coverDataUrl: options.coverDataUrl || null,
@@ -115,6 +116,18 @@ export function deserializeProject(jsonString) {
       rippleMode: raw.settings?.rippleMode ?? true,
       autoColorMatch: raw.settings?.autoColorMatch ?? true,
       mainTrackCompact: Boolean(raw.settings?.mainTrackCompact),
+      zoneOrder: (() => {
+        const def = ['overlay', 'main', 'audio'];
+        const rawZones = Array.isArray(raw.settings?.zoneOrder) ? raw.settings.zoneOrder : def;
+        const next = [];
+        for (const z of rawZones) {
+          if (def.includes(z) && !next.includes(z)) next.push(z);
+        }
+        for (const z of def) {
+          if (!next.includes(z)) next.push(z);
+        }
+        return next;
+      })(),
       themeMode: raw.settings?.themeMode === 'light' ? 'light' : 'dark'
     },
     exportPrefs: { ...base.exportPrefs, ...(raw.exportPrefs || {}) },

@@ -1293,12 +1293,17 @@ export class PanelsUI {
         tint: 0, exposure: 0, highlights: 0, shadows: 0, fade: 0, sharpen: 0,
         blur: 0, vignette: 0, grain: 0, outlineWidth: 0, outlineColor: '#FFFFFF',
         hsl: Array.from({ length: 8 }, () => [0, 0, 0]),
-        chromaEnabled: false, chromaColor: '#00FF00', chromaSimilarity: 0.35, chromaSmoothness: 0.12, chromaSpill: 0.5
+        chromaEnabled: false, chromaColor: '#00FF00', chromaSimilarity: 0.35, chromaSmoothness: 0.12, chromaSpill: 0.5,
+        removeBgMode: 'none', autoBgSensitivity: 0.48, autoBgFeather: 0.35, autoBgInvert: false
       };
     }
     if (layer.fx.grain === undefined) layer.fx.grain = 0;
     if (layer.fx.outlineWidth === undefined) layer.fx.outlineWidth = 0;
     if (!layer.fx.outlineColor) layer.fx.outlineColor = '#FFFFFF';
+    if (!layer.fx.removeBgMode) layer.fx.removeBgMode = layer.fx.chromaEnabled ? 'chroma' : 'none';
+    if (layer.fx.autoBgSensitivity === undefined) layer.fx.autoBgSensitivity = 0.48;
+    if (layer.fx.autoBgFeather === undefined) layer.fx.autoBgFeather = 0.35;
+    if (layer.fx.autoBgInvert === undefined) layer.fx.autoBgInvert = false;
     if (!Array.isArray(layer.fx.hsl) || layer.fx.hsl.length !== 8) {
       layer.fx.hsl = Array.from({ length: 8 }, () => [0, 0, 0]);
     }
@@ -2869,38 +2874,81 @@ export class PanelsUI {
     if (isAdjustment) activeSub = 'adjust';
     const curHsl = fx.hsl?.[this.selectedHslIdx] || [0, 0, 0];
     const activeCh = HSL_CHANNELS[this.selectedHslIdx] || HSL_CHANNELS[0];
+    const removeBgMode = fx.removeBgMode || (fx.chromaEnabled ? 'chroma' : 'none');
+    const chromaColorUpper = String(fx.chromaColor || '#00FF00').toUpperCase();
+    const chromaSwatches = ['#00D13B', '#0055FF', '#00C2FF', '#0A0A0A', '#F5F5F5'];
 
     body.innerHTML = `
       <div class="d-flex flex-wrap justify-content-between align-items-center mb-2 gap-1">
         <div class="btn-group btn-group-sm flex-grow-1">
           <button type="button" class="btn ${activeSub === 'adjust' ? 'btn-info text-dark fw-semibold' : 'btn-dark border-secondary-subtle'}" data-adj-sub="adjust">Adjust / HSL</button>
-          ${!isAdjustment ? `<button type="button" class="btn ${activeSub === 'chroma' ? 'btn-success text-dark fw-semibold' : 'btn-dark border-secondary-subtle'}" data-adj-sub="chroma">Cutout / Chroma</button>` : ''}
+          ${!isAdjustment ? `<button type="button" class="btn ${activeSub === 'chroma' ? 'btn-success text-dark fw-semibold' : 'btn-dark border-secondary-subtle'}" data-adj-sub="chroma">Remove BG</button>` : ''}
         </div>
         <button id="btnAdjReset" class="btn btn-xs btn-outline-secondary py-1 px-2 flex-shrink-0">Reset</button>
       </div>
       ${activeSub === 'chroma' ? `
         <div class="p-2 rounded bg-dark border border-secondary-subtle mb-2">
-          <div class="d-flex justify-content-between align-items-center mb-2">
+          <div class="d-flex justify-content-between align-items-center gap-2 mb-2">
+            <span class="small fw-semibold text-success"><i class="bi bi-person-bounding-box me-1"></i>Remove Background</span>
+            <div class="btn-group btn-group-xs">
+              <button type="button" class="btn ${removeBgMode === 'none' ? 'btn-secondary fw-semibold' : 'btn-outline-secondary'}" data-rbg-mode="none">Off</button>
+              <button type="button" class="btn ${removeBgMode === 'auto' ? 'btn-success text-dark fw-semibold' : 'btn-outline-success'}" data-rbg-mode="auto"><i class="bi bi-magic me-1"></i>Auto</button>
+              <button type="button" class="btn ${removeBgMode === 'chroma' ? 'btn-success text-dark fw-semibold' : 'btn-outline-success'}" data-rbg-mode="chroma"><i class="bi bi-eyedropper me-1"></i>Color Picker</button>
+            </div>
+          </div>
+
+          ${removeBgMode === 'auto' ? `
+            <div class="d-flex justify-content-between align-items-center mb-2">
+              <span class="text-secondary" style="font-size:0.68rem;">Auto-isolates foreground subject from background</span>
+              <button id="btnAutoBgRefresh" type="button" class="btn btn-xs btn-outline-info py-0 px-2">Re-analyze</button>
+            </div>
+            <div class="row g-2 mb-2">
+              <div class="col-4">
+                <label class="form-label small text-secondary mb-0">Threshold (<span id="lblAutoBgSens">${Math.round((fx.autoBgSensitivity ?? 0.48) * 100)}%</span>)</label>
+                <input id="fxAutoBgSens" type="range" min="0.08" max="0.92" step="0.02" class="form-range" value="${fx.autoBgSensitivity ?? 0.48}" />
+              </div>
+              <div class="col-4">
+                <label class="form-label small text-secondary mb-0">Feather (<span id="lblAutoBgFeather">${Math.round((fx.autoBgFeather ?? 0.35) * 100)}%</span>)</label>
+                <input id="fxAutoBgFeather" type="range" min="0" max="0.95" step="0.02" class="form-range" value="${fx.autoBgFeather ?? 0.35}" />
+              </div>
+              <div class="col-4">
+                <label class="form-label small text-secondary mb-0">Despill (<span id="lblChromaSp">${Math.round((fx.chromaSpill ?? 0.5) * 100)}%</span>)</label>
+                <input id="fxChromaSp" type="range" min="0" max="1" step="0.02" class="form-range" value="${fx.chromaSpill ?? 0.5}" />
+              </div>
+            </div>
             <div class="form-check form-switch mb-0">
-              <input class="form-check-input" type="checkbox" id="fxChromaOn" ${fx.chromaEnabled ? 'checked' : ''} />
-              <label class="form-check-label small fw-semibold text-success" for="fxChromaOn">Chroma Key (Green / Blue Screen)</label>
+              <input class="form-check-input" type="checkbox" id="fxAutoBgInvert" ${fx.autoBgInvert ? 'checked' : ''} />
+              <label class="form-check-label small" for="fxAutoBgInvert">Invert Foreground / Background</label>
             </div>
-            <input id="fxChromaColor" type="color" class="form-control form-control-color form-control-sm" style="width:46px;" value="${fx.chromaColor || '#00FF00'}" title="Key Color" />
-          </div>
-          <div class="row g-2">
-            <div class="col-4">
-              <label class="form-label small text-secondary mb-0">Sim (<span id="lblChromaSim">${(fx.chromaSimilarity ?? 0.35).toFixed(2)}</span>)</label>
-              <input id="fxChromaSim" type="range" min="0.05" max="0.75" step="0.01" class="form-range" value="${fx.chromaSimilarity ?? 0.35}" />
+          ` : removeBgMode === 'chroma' ? `
+            <div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mb-2">
+              <button id="btnChromaEyedropper" type="button" class="btn btn-xs btn-success text-dark fw-semibold px-2 py-1" ${layer.type === 'video' || layer.type === 'image' ? '' : 'disabled'}>
+                <i class="bi bi-eyedropper me-1"></i>Pick Color on Video
+              </button>
+              <div class="d-flex align-items-center gap-1">
+                ${chromaSwatches.map((hex) => `
+                  <button type="button" class="mf-chroma-preset-dot ${chromaColorUpper === hex ? 'active' : ''}" data-chroma-preset="${hex}" style="background:${hex};" title="Use ${hex}"></button>
+                `).join('')}
+                <input id="fxChromaColor" type="color" class="form-control form-control-color form-control-sm ms-1" style="width:36px;height:26px;" value="${fx.chromaColor || '#00FF00'}" title="Custom Key Color" />
+              </div>
             </div>
-            <div class="col-4">
-              <label class="form-label small text-secondary mb-0">Smooth (<span id="lblChromaSm">${(fx.chromaSmoothness ?? 0.12).toFixed(2)}</span>)</label>
-              <input id="fxChromaSm" type="range" min="0.01" max="0.35" step="0.01" class="form-range" value="${fx.chromaSmoothness ?? 0.12}" />
+            <div class="row g-2">
+              <div class="col-4">
+                <label class="form-label small text-secondary mb-0">Intensity (<span id="lblChromaSim">${Math.round((fx.chromaSimilarity ?? 0.35) * 100)}%</span>)</label>
+                <input id="fxChromaSim" type="range" min="0.03" max="0.80" step="0.01" class="form-range" value="${fx.chromaSimilarity ?? 0.35}" />
+              </div>
+              <div class="col-4">
+                <label class="form-label small text-secondary mb-0">Shadow (<span id="lblChromaSm">${Math.round((fx.chromaSmoothness ?? 0.12) * 100)}%</span>)</label>
+                <input id="fxChromaSm" type="range" min="0.01" max="0.40" step="0.01" class="form-range" value="${fx.chromaSmoothness ?? 0.12}" />
+              </div>
+              <div class="col-4">
+                <label class="form-label small text-secondary mb-0">Despill (<span id="lblChromaSp">${Math.round((fx.chromaSpill ?? 0.5) * 100)}%</span>)</label>
+                <input id="fxChromaSp" type="range" min="0" max="1" step="0.02" class="form-range" value="${fx.chromaSpill ?? 0.5}" />
+              </div>
             </div>
-            <div class="col-4">
-              <label class="form-label small text-secondary mb-0">Despill (<span id="lblChromaSp">${Math.round((fx.chromaSpill ?? 0.5) * 100)}%</span>)</label>
-              <input id="fxChromaSp" type="range" min="0" max="1" step="0.02" class="form-range" value="${fx.chromaSpill ?? 0.5}" />
-            </div>
-          </div>
+          ` : `
+            <div class="text-secondary" style="font-size:0.70rem;">Choose <b>Auto</b> to isolate subjects automatically, or <b>Color Picker</b> to remove any picked background color like CapCut.</div>
+          `}
         </div>
         <div class="p-2 rounded bg-dark border border-secondary-subtle">
           <div class="d-flex justify-content-between align-items-center gap-2 mb-2">
@@ -3126,7 +3174,8 @@ export class PanelsUI {
         Object.assign(fx, FILTER_PRESETS[0].fx, {
           blur: 0, sharpen: 0, grain: 0, outlineWidth: 0, outlineColor: '#FFFFFF',
           hsl: Array.from({ length: 8 }, () => [0, 0, 0]),
-          chromaEnabled: false, chromaColor: '#00FF00', chromaSimilarity: 0.35, chromaSmoothness: 0.12, chromaSpill: 0.5
+          chromaEnabled: false, chromaColor: '#00FF00', chromaSimilarity: 0.35, chromaSmoothness: 0.12, chromaSpill: 0.5,
+          removeBgMode: 'none', autoBgSensitivity: 0.48, autoBgFeather: 0.35, autoBgInvert: false
         });
         layer.blendMode = 'normal';
       });
@@ -3166,14 +3215,58 @@ export class PanelsUI {
       this.app.mutateProject(() => { fx.outlineColor = e.target.value; });
     });
 
-    body.querySelector('#fxChromaOn')?.addEventListener('change', (e) => {
-      this.app.mutateProject(() => { fx.chromaEnabled = e.target.checked; });
+    body.querySelectorAll('[data-rbg-mode]').forEach((btn) => {
+      btn.onclick = () => {
+        const mode = btn.dataset.rbgMode;
+        this.app.mutateProject(() => {
+          fx.removeBgMode = mode;
+          fx.chromaEnabled = mode === 'chroma';
+          if (mode === 'auto') {
+            fx.autoBgSensitivity = fx.autoBgSensitivity ?? 0.48;
+            fx.autoBgFeather = fx.autoBgFeather ?? 0.35;
+            this.app.renderer?.autoBgCache?.delete(layer.id);
+          }
+        });
+        this.renderAdjustPanel({ force: true });
+      };
+    });
+    body.querySelector('#btnAutoBgRefresh')?.addEventListener('click', () => {
+      this.app.renderer?.autoBgCache?.delete(layer.id);
+      this.app.renderPreview();
+      this.app.showToast('Re-analyzed subject & background');
+    });
+    body.querySelector('#fxAutoBgInvert')?.addEventListener('change', (e) => {
+      this.app.mutateProject(() => {
+        fx.autoBgInvert = e.target.checked;
+        this.app.renderer?.autoBgCache?.delete(layer.id);
+      });
+    });
+    this.bindLiveRange(body.querySelector('#fxAutoBgSens'), body.querySelector('#lblAutoBgSens'), fx, 'autoBgSensitivity', (v) => `${Math.round(v * 100)}%`);
+    this.bindLiveRange(body.querySelector('#fxAutoBgFeather'), body.querySelector('#lblAutoBgFeather'), fx, 'autoBgFeather', (v) => `${Math.round(v * 100)}%`);
+
+    body.querySelector('#btnChromaEyedropper')?.addEventListener('click', () => {
+      this.app.startChromaColorPicker(layer.id);
+    });
+    body.querySelectorAll('[data-chroma-preset]').forEach((dot) => {
+      dot.onclick = () => {
+        this.app.mutateProject(() => {
+          fx.removeBgMode = 'chroma';
+          fx.chromaEnabled = true;
+          fx.chromaColor = dot.dataset.chromaPreset;
+        });
+        this.renderAdjustPanel({ force: true });
+      };
     });
     body.querySelector('#fxChromaColor')?.addEventListener('change', (e) => {
-      this.app.mutateProject(() => { fx.chromaColor = e.target.value; });
+      this.app.mutateProject(() => {
+        fx.removeBgMode = 'chroma';
+        fx.chromaEnabled = true;
+        fx.chromaColor = e.target.value;
+      });
+      this.renderAdjustPanel({ force: true });
     });
-    this.bindLiveRange(body.querySelector('#fxChromaSim'), body.querySelector('#lblChromaSim'), fx, 'chromaSimilarity', (v) => v.toFixed(2));
-    this.bindLiveRange(body.querySelector('#fxChromaSm'), body.querySelector('#lblChromaSm'), fx, 'chromaSmoothness', (v) => v.toFixed(2));
+    this.bindLiveRange(body.querySelector('#fxChromaSim'), body.querySelector('#lblChromaSim'), fx, 'chromaSimilarity', (v) => `${Math.round(v * 100)}%`);
+    this.bindLiveRange(body.querySelector('#fxChromaSm'), body.querySelector('#lblChromaSm'), fx, 'chromaSmoothness', (v) => `${Math.round(v * 100)}%`);
     this.bindLiveRange(body.querySelector('#fxChromaSp'), body.querySelector('#lblChromaSp'), fx, 'chromaSpill', (v) => `${Math.round(v * 100)}%`);
     this.bindLayerMotionBlurEvents(body, layer);
   }
@@ -4770,8 +4863,9 @@ export class PanelsUI {
         <div class="col-3">
           <label class="form-label small text-secondary mb-0">On Exit</label>
           <select id="trkExitMode" class="form-select form-select-sm" ${tr.isTracking ? 'disabled' : ''}>
-            <option value="fadeTrim" ${tr.exitMode === 'fadeTrim' ? 'selected' : ''}>Fade+Trim</option>
-            <option value="slideTrim" ${tr.exitMode === 'slideTrim' ? 'selected' : ''}>Slide+Trim</option>
+            <option value="passBy" ${tr.exitMode === 'passBy' ? 'selected' : ''}>Pass-By Fade</option>
+            <option value="fadeTrim" ${tr.exitMode === 'fadeTrim' ? 'selected' : ''}>Gradual Fade</option>
+            <option value="slideTrim" ${tr.exitMode === 'slideTrim' ? 'selected' : ''}>Slide + Fade</option>
             <option value="none" ${tr.exitMode === 'none' ? 'selected' : ''}>Keep Visible</option>
           </select>
         </div>
@@ -4792,7 +4886,7 @@ export class PanelsUI {
             <label class="form-check-label small" for="trkDepthZChk">True Depth (Z)</label>
           </div>
         </div>
-        <span class="small text-secondary">3D X/Y/Z + Tilt · Drag <span class="text-warning">[+]</span></span>
+        <span class="small text-secondary">World Lock · Drag <span class="text-warning">[+]</span></span>
       </div>
 
       ${tr.isTracking ? `
@@ -4824,8 +4918,8 @@ export class PanelsUI {
             <button id="btnTrkClear" class="btn btn-xs btn-outline-danger py-0 px-2">Clear</button>
           </div>
           <div class="input-group input-group-sm mb-2">
-            <input id="trkNewTextVal" type="text" class="form-control" placeholder="Text label (e.g. Tikungan Tajam)" value="LANDMARK" />
-            <input id="trkOffsetY" type="number" class="form-control" style="max-width:68px;" value="-65" title="Y Offset (px)" />
+            <input id="trkNewTextVal" type="text" class="form-control" placeholder="e.g. Pinggir Jalan / Lokasi" value="LANDMARK" />
+            <input id="trkOffsetY" type="number" class="form-control" style="max-width:68px;" value="0" title="Y Offset (0 = Right on Mark)" />
             <button id="btnPinNewText" class="btn mf-btn-accent fw-semibold"><i class="bi bi-pin-angle-fill me-1"></i>Pin Text</button>
           </div>
           ${pinnableLayers.length > 0 ? `
@@ -4900,7 +4994,7 @@ export class PanelsUI {
     body.querySelector('#btnPinNewText')?.addEventListener('click', () => {
       const txt = body.querySelector('#trkNewTextVal')?.value?.trim() || 'LANDMARK';
       const offY = Number(body.querySelector('#trkOffsetY')?.value);
-      this.app.pinNewTrackedText(srcLayer, txt, isFinite(offY) ? offY : -65);
+      this.app.pinNewTrackedText(srcLayer, txt, isFinite(offY) ? offY : 0);
     });
 
     body.querySelector('#btnPinExistingLayer')?.addEventListener('click', () => {

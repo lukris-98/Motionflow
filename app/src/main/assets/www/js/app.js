@@ -63,11 +63,12 @@ class MotionFlowApp {
       document.getElementById('previewCanvas'),
       document.getElementById('overlayCanvas')
     );
-    this.renderer.onMediaFrameReady = () => {
-      if (this.isPlaying || this._mediaRafId) return;
+    this.renderer.onMediaFrameReady = (mediaItem) => {
+      if (this._mediaRafId) return;
+      if (this.isPlaying && mediaItem?.type !== 'video') return;
       this._mediaRafId = requestAnimationFrame(() => {
         this._mediaRafId = null;
-        if (!this.isPlaying) this.renderPreview();
+        this.renderPreview();
       });
     };
     this.exportEngine = new ExportEngine(this.renderer, this.audioEngine);
@@ -101,11 +102,20 @@ class MotionFlowApp {
       patchRadius: 28,
       searchRadius: 95,
       trackScale: true,
-      trackTilt3D: true,
+      trackTilt3D: false,
       use3DDepth: true,
-      exitMode: 'fadeTrim',
+      exitMode: 'passBy',
       progressPct: 0,
       progressDetail: ''
+    };
+    this.chromaPickerState = {
+      active: false,
+      layerId: null,
+      pointerX: null,
+      pointerY: null,
+      sampledHex: '#00FF00',
+      dragging: false,
+      undoPushed: false
     };
     this.voiceoverState = {
       recording: false,
@@ -118,6 +128,7 @@ class MotionFlowApp {
     this.panels = new PanelsUI(this);
     this.timelineView = new TimelineView({
       onSeekFrame: (f) => this.seekToFrame(f),
+      onScrollSeekFrame: (f) => this.seekFromTimelineScroll(f),
       isPlaying: () => this.isPlaying,
       onScrubStart: () => { if (this.isPlaying) this.pause(); },
       onScrubEnd: () => {
@@ -137,6 +148,9 @@ class MotionFlowApp {
         TimelineEngine.moveLayerToIndex(this.project, id, idx);
         TimelineEngine.normalizeTrackZOrder(this.project);
       }),
+      onReorderTrackZone: (sourceZone, targetZone, insertBefore) => {
+        this.reorderTrackZone(sourceZone, targetZone, insertBefore);
+      },
       onMoveKeyframeFrame: (layerId, oldF, newF) => {
         const layer = this.project.layers.find((l) => l.id === layerId);
         if (!layer) return;
@@ -218,6 +232,7 @@ class MotionFlowApp {
       onToggleRippleMode: () => this.toggleRippleMode(),
       onToggleMainTrackProp: (prop) => this.toggleMainTrackProp(prop),
       onMainTrackThumbClick: () => this.handleMainTrackThumbClick(),
+      onMainTrackCoverClick: () => this.handleMainTrackCoverPick(),
       onQuickAddMainClip: () => {
         this.mediaPickerContext = null;
         if (this.mediaItems.some((m) => m.type === 'video' || m.type === 'image')) {
@@ -327,6 +342,82 @@ class MotionFlowApp {
       return;
     }
     this.captureCoverFrame();
+  }
+
+  handleMainTrackCoverPick() {
+    this.importIntent = 'project_cover';
+    if (window.AndroidBridge?.pickVisualMedia) {
+      window.AndroidBridge.pickVisualMedia('image');
+    } else {
+      const inp = document.getElementById('coverImageFileInput');
+      if (inp) {
+        inp.value = '';
+        inp.click();
+      } else {
+        this.captureCoverFrame();
+      }
+    }
+  }
+
+  async _applyProjectCoverFromImageUrl(url, fallbackThumbUrl = '') {
+    const buildCoverDataUrl = () => new Promise((resolve) => {
+      if (!url) return resolve(fallbackThumbUrl || '');
+      const img = new Image();
+      img.crossOrigin = 'anonymous';
+      img.onload = () => {
+        try {
+          const nw = img.naturalWidth || 256;
+          const nh = img.naturalHeight || 256;
+          const maxSide = 512;
+          const scale = Math.min(1, maxSide / Math.max(1, nw, nh));
+          const c = document.createElement('canvas');
+          c.width = Math.max(1, Math.round(nw * scale));
+          c.height = Math.max(1, Math.round(nh * scale));
+          c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+          resolve(c.toDataURL('image/jpeg', 0.85));
+        } catch {
+          resolve(fallbackThumbUrl || url);
+        }
+      };
+      img.onerror = () => resolve(fallbackThumbUrl || url);
+      img.src = url;
+    });
+
+    const dataUrl = await buildCoverDataUrl();
+    if (!dataUrl) {
+      this.showToast('Gagal memuat gambar cover');
+      return false;
+    }
+    this.mutateProject(() => {
+      this.project.coverDataUrl = dataUrl;
+    });
+    await ProjectStorage.saveProject(this.project);
+    await this.panels.renderProjectsList();
+    this.showToast('Cover thumbnail diperbarui');
+    return true;
+  }
+
+  reorderTrackZone(sourceZone, targetZone, insertBefore) {
+    const def = ['overlay', 'main', 'audio'];
+    if (!def.includes(sourceZone) || !def.includes(targetZone) || sourceZone === targetZone) return;
+    const saved = Array.isArray(this.project?.settings?.zoneOrder) ? this.project.settings.zoneOrder : def;
+    const order = [];
+    for (const z of saved) {
+      if (def.includes(z) && !order.includes(z)) order.push(z);
+    }
+    for (const z of def) {
+      if (!order.includes(z)) order.push(z);
+    }
+    const withoutSrc = order.filter((z) => z !== sourceZone);
+    const tgtIdx = withoutSrc.indexOf(targetZone);
+    if (tgtIdx === -1) return;
+    const insertIdx = insertBefore ? tgtIdx : tgtIdx + 1;
+    withoutSrc.splice(insertIdx, 0, sourceZone);
+    if (withoutSrc.every((z, i) => z === order[i])) return;
+    this.mutateProject(() => {
+      if (!this.project.settings) this.project.settings = {};
+      this.project.settings.zoneOrder = withoutSrc;
+    });
   }
 
   rebuildMediaMap() {
@@ -962,6 +1053,35 @@ class MotionFlowApp {
     if (!this.timelineView.isScrubbing) {
       this.panels.refreshAll();
     }
+  }
+
+  seekFromTimelineScroll(frame) {
+    if (this.isPlaying) {
+      this.pause();
+    }
+    const maxF = Math.max(0, this.project?.durationFrames || 0);
+    const clamped = Math.max(0, Math.min(maxF, Math.round(frame)));
+    if (clamped === this.currentFrame) return;
+
+    this.stopTemplateLivePreview({ skipRender: true });
+    if ((this._pending3DLayerPose && this._pending3DLayerPose.frame !== clamped) ||
+        (this._pending3DCamPose && this._pending3DCamPose.frame !== clamped)) {
+      this.clearPending3DPose(false);
+    }
+
+    this.currentFrame = clamped;
+    this.updateTransportLabels();
+    this.syncViewport3DUI();
+    this.renderer.seekVideosForFrame(this.project, this.currentFrame, this.mediaMap, false).catch(() => {});
+    this.renderPreview();
+
+    if (this._scrollPanelRefreshTimer) clearTimeout(this._scrollPanelRefreshTimer);
+    this._scrollPanelRefreshTimer = setTimeout(() => {
+      this._scrollPanelRefreshTimer = null;
+      if (!this.timelineView?.isScrubbing && !this.isPlaying) {
+        this.panels.refreshAll();
+      }
+    }, 120);
   }
 
   togglePlay() {
@@ -2913,7 +3033,7 @@ class MotionFlowApp {
         ['bi-palette-fill text-success', 'Filters', () => this.openSheet('sheetFilters')],
         ['bi-sliders2', 'Adjust', () => this.openSheet('sheetAdjust', null, 'adjust')],
         ['bi-scissors text-warning', 'Cutout', () => this.openCutoutBrushForSelected()],
-        ['bi-person-bounding-box text-success', 'Chroma', () => this.openSheet('sheetAdjust', null, 'chroma')],
+        ['bi-person-bounding-box text-success', 'Remove BG', () => this.openSheet('sheetAdjust', null, 'chroma')],
         ['bi-pip text-info', 'PIP/Split', () => this.openSheet('sheetMask')],
         ['bi-crop text-warning', 'Crop/Rot', () => this.openSheet('sheetMask')],
         ['bi-camera-reels text-info', 'Stabilize', () => this.openStabilizerUI(layer.id)],
@@ -2946,7 +3066,7 @@ class MotionFlowApp {
         ['bi-palette-fill text-success', 'Filters', () => this.openSheet('sheetFilters')],
         ['bi-sliders2', 'Adjust', () => this.openSheet('sheetAdjust', null, 'adjust')],
         ['bi-scissors text-warning', 'Cutout', () => this.openCutoutBrushForSelected()],
-        ['bi-person-bounding-box text-success', 'Chroma', () => this.openSheet('sheetAdjust', null, 'chroma')],
+        ['bi-person-bounding-box text-success', 'Remove BG', () => this.openSheet('sheetAdjust', null, 'chroma')],
         ['bi-pip text-info', 'PIP/Split', () => this.openSheet('sheetMask')],
         ['bi-crop text-warning', 'Crop/Rot', () => this.openSheet('sheetMask')],
         ['bi-snow text-info', 'Freeze', () => this.freezeSelectedFrame()],
@@ -3251,7 +3371,93 @@ class MotionFlowApp {
     this.panels.renderTrackerPanel();
   }
 
-  pinNewTrackedText(srcLayer, textContent, offsetY = -65) {
+  startChromaColorPicker(layerId = null) {
+    const layer = (layerId && this.project.layers.find((l) => l.id === layerId)) || this.getSelectedLayer();
+    if (!layer || (layer.type !== 'video' && layer.type !== 'image')) {
+      return this.showToast('Select a Video or Image layer first');
+    }
+    this.pause();
+    const fx = this.panels.ensureLayerFx(layer);
+    this.chromaPickerState = {
+      active: true,
+      layerId: layer.id,
+      pointerX: null,
+      pointerY: null,
+      sampledHex: fx.chromaColor || '#00FF00',
+      dragging: false,
+      undoPushed: false
+    };
+    this.renderer.setChromaPickerOverlay(this.chromaPickerState);
+    this.hideOpenSheets();
+    this.syncChromaPickerHud();
+    this.renderPreview();
+    this.showToast('Tap or drag on video to pick background color');
+  }
+
+  stopChromaColorPicker(reopenSheet = true) {
+    if (!this.chromaPickerState?.active) return;
+    const wasUndoPushed = Boolean(this.chromaPickerState.undoPushed);
+    this.chromaPickerState.active = false;
+    this.chromaPickerState.dragging = false;
+    this.chromaPickerState.undoPushed = false;
+    this.renderer.setChromaPickerOverlay(null);
+    this.syncChromaPickerHud();
+    if (wasUndoPushed) {
+      this.onTimelineMutated();
+    } else {
+      this.renderPreview();
+    }
+    if (reopenSheet) {
+      this.openSheet('sheetAdjust', null, 'chroma');
+    }
+  }
+
+  syncChromaPickerHud() {
+    const hud = document.getElementById('chromaPickerHud');
+    const swatch = document.getElementById('chromaPickerSwatch');
+    const lbl = document.getElementById('chromaPickerHexLbl');
+    if (!hud) return;
+    const active = Boolean(this.chromaPickerState?.active);
+    hud.classList.toggle('d-none', !active);
+    hud.classList.toggle('d-flex', active);
+    if (active) {
+      const hex = this.chromaPickerState.sampledHex || '#00FF00';
+      if (swatch) swatch.style.background = hex;
+      if (lbl) lbl.textContent = `${hex} · Tap/Drag Video`;
+    }
+  }
+
+  _sampleChromaColorAt(px, py) {
+    const cp = this.chromaPickerState;
+    if (!cp?.active || !cp.layerId) return;
+    const layer = this.project.layers.find((l) => l.id === cp.layerId);
+    if (!layer) return;
+    cp.pointerX = px;
+    cp.pointerY = py;
+    const sample = this.renderer.sampleLayerColorAtOverlayPoint(
+      this.project,
+      this.currentFrame,
+      this.mediaMap,
+      layer.id,
+      px,
+      py
+    );
+    if (sample?.hex) {
+      if (!cp.undoPushed) {
+        this.pushUndo();
+        cp.undoPushed = true;
+      }
+      const fx = this.panels.ensureLayerFx(layer);
+      fx.removeBgMode = 'chroma';
+      fx.chromaEnabled = true;
+      fx.chromaColor = sample.hex;
+      cp.sampledHex = sample.hex;
+      this.syncChromaPickerHud();
+    }
+    this.renderPreview();
+  }
+
+  pinNewTrackedText(srcLayer, textContent, offsetY = 0) {
     if (!srcLayer?.trackData?.points?.length) return this.showToast('Track the video target first');
     const startF = srcLayer.trackData.startFrame;
     this.mutateProject(() => {
@@ -3267,6 +3473,7 @@ class MotionFlowApp {
         use3DDepth: this.trackerState.use3DDepth,
         applyTilt3D: this.trackerState.trackTilt3D,
         autoTrim: true,
+        maxEndFrame: srcLayer.endFrame,
         exitMode: this.trackerState.exitMode
       });
       this.selectedLayerId = txtLayer.id;
@@ -3291,11 +3498,12 @@ class MotionFlowApp {
     this.mutateProject(() => {
       TrackerEngine.applyTrackToLayer(target, srcLayer.trackData, {
         offsetX: keepOffset ? dx : 0,
-        offsetY: keepOffset ? dy : -65,
+        offsetY: keepOffset ? dy : 0,
         applyScale: this.trackerState.trackScale,
         use3DDepth: this.trackerState.use3DDepth,
         applyTilt3D: this.trackerState.trackTilt3D,
         autoTrim: true,
+        maxEndFrame: srcLayer.endFrame,
         exitMode: this.trackerState.exitMode
       });
       this.selectedLayerId = target.id;
@@ -3525,6 +3733,13 @@ class MotionFlowApp {
 
       if (pointers.size > 1) return;
 
+      if (this.chromaPickerState?.active) {
+        this.chromaPickerState.dragging = true;
+        gesture = { mode: 'chroma_pick', undoPushed: false, dragStarted: true };
+        this._sampleChromaColorAt(px, py);
+        return;
+      }
+
       const hit = this.renderer.hitTestOverlay(px, py);
 
       if (hit === 'tracker') {
@@ -3632,6 +3847,11 @@ class MotionFlowApp {
         pointers.set(e.pointerId, { x: px, y: py });
       }
       if (!gesture) return;
+
+      if (gesture.mode === 'chroma_pick') {
+        this._sampleChromaColorAt(px, py);
+        return;
+      }
 
       if (gesture.mode === 'cam_pinch_pan' && pointers.size >= 2) {
         const pts = [...pointers.values()];
@@ -3855,6 +4075,11 @@ class MotionFlowApp {
           this.setCameraProp('x', g.lastX, false, true);
           this.setCameraProp('y', g.lastY, false, true);
         }
+        if (g.mode === 'chroma_pick') {
+          this.chromaPickerState.dragging = false;
+          this.renderPreview();
+          return;
+        }
         if (g.mode === 'tracker') {
           this.trackerState.dragging = false;
           this.renderPreview();
@@ -3877,6 +4102,10 @@ class MotionFlowApp {
     window.__mfNative = {
       getPixabayApiKey: () => window.AndroidBridge?.getPixabayApiKey?.() || '',
       handleBack: () => {
+        if (this.chromaPickerState?.active) {
+          this.stopChromaColorPicker(true);
+          return true;
+        }
         const openModal = document.querySelector('.modal.show');
         if (openModal) {
           bootstrap.Modal.getInstance(openModal)?.hide();
@@ -3923,6 +4152,17 @@ class MotionFlowApp {
       },
       onMediaImported: async (items) => {
         if (!Array.isArray(items) || items.length === 0) return;
+        const intent = this.importIntent || 'library';
+        this.importIntent = 'library';
+
+        if (intent === 'project_cover') {
+          const firstImg = items.find((m) => m?.type === 'image') || items[0];
+          if (firstImg) {
+            await this._applyProjectCoverFromImageUrl(firstImg.url || firstImg.thumbUrl || '', firstImg.thumbUrl || '');
+          }
+          return;
+        }
+
         const imported = [];
         for (const raw of items) {
           const item = { ...raw, addedAt: Date.now() };
@@ -3934,9 +4174,6 @@ class MotionFlowApp {
           }
         }
         this.rebuildMediaMap();
-
-        const intent = this.importIntent || 'library';
-        this.importIntent = 'library';
 
         if (intent === 'replace_selected' && this.getSelectedLayer()) {
           this.replaceSelectedWithMedia(imported[0]);
@@ -4094,7 +4331,8 @@ class MotionFlowApp {
       this.stopTemplateLivePreview();
     });
 
-    document.getElementById('btnGroupChecked').onclick = () => this.groupSelectedLayersAction();
+    const btnGroupChecked = document.getElementById('btnGroupChecked');
+    if (btnGroupChecked) btnGroupChecked.onclick = () => this.groupSelectedLayersAction();
 
     // Top Toolbar
     document.getElementById('btnProjects').onclick = async () => {
@@ -4206,6 +4444,9 @@ class MotionFlowApp {
     document.getElementById('btnOpenTrackerQuick').onclick = () => {
       this.openTrackerUI();
     };
+    document.getElementById('btnChromaPickerDone')?.addEventListener('click', () => {
+      this.stopChromaColorPicker(true);
+    });
     document.getElementById('btnToggleGrid').onclick = () => {
       this.project.settings.showGrid = !this.project.settings.showGrid;
       this.onTimelineMutated();
@@ -4545,6 +4786,19 @@ class MotionFlowApp {
       e.target.value = '';
       window.__mfNative.onMediaImported(imported);
     };
+
+    document.getElementById('coverImageFileInput')?.addEventListener('change', async (e) => {
+      const f = e.target.files?.[0];
+      e.target.value = '';
+      this.importIntent = 'library';
+      if (!f) return;
+      const objUrl = URL.createObjectURL(f);
+      try {
+        await this._applyProjectCoverFromImageUrl(objUrl);
+      } finally {
+        URL.revokeObjectURL(objUrl);
+      }
+    });
 
     // Add Layer Sheet buttons
     const addAndSelect = (layer) => {

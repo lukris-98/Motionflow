@@ -16,7 +16,19 @@ import { parseSrtOrLyrics, FILTER_PRESETS, VIDEO_EFFECT_PRESETS, TRANSITION_PRES
 import { ExportEngine } from '../src/main/assets/www/js/export/exportEngine.js';
 import { createEmptyProject, deserializeProject, serializeProject } from '../src/main/assets/www/js/storage/projectStorage.js';
 import { RendererEngine } from '../src/main/assets/www/js/engine/rendererEngine.js';
-import { extractGrayscale, extractTemplatePatch, matchTemplateCoarseToFine } from '../src/main/assets/www/js/engine/trackerEngine.js';
+import {
+  extractGrayscale,
+  extractTemplatePatch,
+  matchTemplateCoarseToFine,
+  smoothTrackedPoints,
+  TrackerEngine
+} from '../src/main/assets/www/js/engine/trackerEngine.js';
+import {
+  pickChromaSampleFromRgba,
+  computeAutoBgMask,
+  applyAlphaMaskToRgba,
+  applyChromaKeyToRgba
+} from '../src/main/assets/www/js/engine/bgRemovalEngine.js';
 import {
   analyzeRgbaPalette,
   analyzeShapePalette,
@@ -27,6 +39,13 @@ import {
   setLayerColorMatchIntensity,
   toggleLayerColorMatch
 } from '../src/main/assets/www/js/engine/colorMatchEngine.js';
+import {
+  computeCenterPadLeft,
+  frameToTimelineX,
+  timelineXToFrame,
+  frameToCenterScrollLeft,
+  scrollLeftToCenterFrame
+} from '../src/main/assets/www/js/ui/timelineView.js';
 
 test('KeyframeEngine smooth Catmull-Rom spline & smoothCameraKeyframes', () => {
   assert.ok(EASING_TYPES.some((e) => e.key === 'smooth'));
@@ -1761,6 +1780,225 @@ test('RendererEngine getOrCreateTexture dirty-checks static layers and syncVideo
   assert.equal(fakeVid._wantsPlay, false);
   assert.equal(fakeVid.paused, true);
 });
+
+test('bgRemovalEngine Color Picker trimmed-mean sampling, Auto Remove BG matte, and Chroma Key despill', () => {
+  // 1. Trimmed-mean patch sampler ignores single-pixel compression/outlier spikes
+  const pw = 16;
+  const ph = 16;
+  const sampleBuf = new Uint8ClampedArray(pw * ph * 4);
+  for (let i = 0; i < pw * ph; i++) {
+    sampleBuf[i * 4] = 0;
+    sampleBuf[i * 4 + 1] = 209;
+    sampleBuf[i * 4 + 2] = 59;
+    sampleBuf[i * 4 + 3] = 255;
+  }
+  // Inject a bright white outlier right at the center pixel (8,8)
+  const centerIdx = (8 * pw + 8) * 4;
+  sampleBuf[centerIdx] = 255;
+  sampleBuf[centerIdx + 1] = 255;
+  sampleBuf[centerIdx + 2] = 255;
+
+  const picked = pickChromaSampleFromRgba(sampleBuf, pw, ph, 0.5, 0.5, 2);
+  assert.equal(picked.hex, '#00D13B');
+
+  // 2. Auto Remove BG isolates centered subject from perimeter background (even with mild gradient)
+  const w = 48;
+  const h = 48;
+  const autoBuf = new Uint8ClampedArray(w * h * 4);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const p = (y * w + x) * 4;
+      const inSubject = x >= 15 && x <= 32 && y >= 12 && y <= 37;
+      if (inSubject) {
+        // Distinct warm skin/coral subject
+        autoBuf[p] = 225;
+        autoBuf[p + 1] = 110;
+        autoBuf[p + 2] = 85;
+      } else {
+        // Cool sky/wall backdrop with slight vertical shading
+        autoBuf[p] = 30;
+        autoBuf[p + 1] = 145 + Math.round((y / h) * 18);
+        autoBuf[p + 2] = 215;
+      }
+      autoBuf[p + 3] = 255;
+    }
+  }
+
+  const matte = computeAutoBgMask(autoBuf, w, h, { sensitivity: 0.48, feather: 0.35, invert: false });
+  assert.equal(matte.alphaMask[2 * w + 2], 0, 'Corner background should be keyed out');
+  assert.ok(matte.alphaMask[24 * w + 24] >= 220, `Center subject should stay opaque, got ${matte.alphaMask[24 * w + 24]}`);
+
+  const invertedMatte = computeAutoBgMask(autoBuf, w, h, { sensitivity: 0.48, feather: 0.35, invert: true });
+  assert.equal(invertedMatte.alphaMask[2 * w + 2], 255, 'Inverted mode keeps corner background');
+  assert.ok(invertedMatte.alphaMask[24 * w + 24] <= 35, 'Inverted mode removes center subject');
+
+  const composited = new Uint8ClampedArray(autoBuf);
+  applyAlphaMaskToRgba(composited, matte.alphaMask, w, h, matte.dominantBgRgb, 0.45);
+  assert.equal(composited[(2 * w + 2) * 4 + 3], 0);
+  assert.ok(composited[(24 * w + 24) * 4 + 3] >= 220);
+
+  // 3. Chroma Key removes matched background, preserves foreground, and despills fringe pixels
+  const cw = 8;
+  const ch = 1;
+  const chromaBuf = new Uint8ClampedArray(cw * ch * 4);
+  // Pixel 0: pure green key (#00FF00)
+  chromaBuf.set([0, 255, 0, 255], 0);
+  // Pixel 1: green-spill fringe pixel near key boundary
+  chromaBuf.set([105, 195, 105, 255], 4);
+  // Pixel 2: pure foreground red subject
+  chromaBuf.set([220, 40, 40, 255], 8);
+
+  applyChromaKeyToRgba(chromaBuf, cw, ch, [0, 255, 0], 0.32, 0.14, 0.85);
+  assert.equal(chromaBuf[3], 0, 'Exact chroma key pixel alpha becomes 0');
+  assert.equal(chromaBuf[8 + 3], 255, 'Foreground red pixel remains fully opaque');
+  assert.ok(chromaBuf[4 + 1] < 195, `Fringe green channel should be despilled (< 195), got ${chromaBuf[4 + 1]}`);
+});
+
+test('TrackerEngine smoothTrackedPoints & passBy 3D roadside text fade-out', () => {
+  const noisyPts = [];
+  for (let i = 0; i <= 20; i++) {
+    const jitter = i % 2 === 0 ? 8 : -8;
+    const isEndpointOrAnchor = i === 0 || i === 10 || i === 20;
+    noisyPts.push({
+      frame: i,
+      x: i * 12 + (isEndpointOrAnchor ? 0 : jitter),
+      y: 40 + (isEndpointOrAnchor ? 0 : -jitter),
+      z: i * 15 + (isEndpointOrAnchor ? 0 : jitter * 0.8),
+      scale: 1 + i * 0.03 + (isEndpointOrAnchor ? 0 : (i % 2 === 0 ? 0.04 : -0.04)),
+      rotation: 0,
+      rotX: 0,
+      rotY: 0,
+      score: 0.92
+    });
+  }
+
+  const smoothed = smoothTrackedPoints(noisyPts, 10, 0.65);
+  assert.equal(smoothed.length, noisyPts.length);
+  // Anchor frame and endpoints must stay exact
+  assert.equal(smoothed[0].x, noisyPts[0].x);
+  assert.equal(smoothed[10].x, noisyPts[10].x);
+  assert.equal(smoothed[10].y, noisyPts[10].y);
+  assert.equal(smoothed[20].x, noisyPts[20].x);
+
+  // Interior jitter deviation vs ideal trend (i * 12) should drop substantially
+  const rawErr = Math.abs(noisyPts[5].x - 60);
+  const smoothErr = Math.abs(smoothed[5].x - 60);
+  assert.ok(smoothErr < rawErr * 0.5, `Expected jitter reduction: raw=${rawErr}, smooth=${smoothErr}`);
+
+  // Pass-by 3D perspective text exit test
+  const proj = createEmptyProject('RoadsideTrack', { width: 1280, height: 720, fps: 30, durationSec: 5 });
+  const textLayer = TimelineEngine.createTextLayer(proj, 'Kafe Pinggir Jalan', 0, {
+    startFrame: 0,
+    endFrame: 120
+  });
+  const trackResult = {
+    sourceLayerId: 'vid-src',
+    anchorFrame: 15,
+    startFrame: 15,
+    endFrame: 55,
+    avgConfidence: 0.91,
+    points: Array.from({ length: 41 }, (_, i) => {
+      const f = 15 + i;
+      const sc = 1 + i * 0.02;
+      return {
+        frame: f,
+        x: 120 + i * 7.5,
+        y: 60 + i * 2.1,
+        z: Number((650 * (1 - 1 / sc)).toFixed(1)),
+        scale: Number(sc.toFixed(3)),
+        rotation: 0,
+        rotX: 0,
+        rotY: 0,
+        score: 0.91
+      };
+    })
+  };
+
+  const applied = TrackerEngine.applyTrackToLayer(textLayer, trackResult, {
+    offsetX: 0,
+    offsetY: 0,
+    applyScale: true,
+    use3DDepth: true,
+    applyTilt3D: false,
+    autoTrim: true,
+    maxEndFrame: 90,
+    exitMode: 'passBy'
+  });
+
+  assert.equal(applied, true);
+  assert.equal(textLayer.startFrame, 15);
+  // 40-frame track tail ~10 frames => endFrame extends past 55 up to <= 90
+  assert.ok(textLayer.endFrame > 55 && textLayer.endFrame <= 90, `Unexpected endFrame ${textLayer.endFrame}`);
+  // 3D depth Z keyframes created and increasing as camera approaches
+  assert.ok(textLayer.keyframes.z.length >= 41);
+  assert.ok(textLayer.keyframes.z[textLayer.keyframes.z.length - 1].value > textLayer.keyframes.z[0].value);
+  // Smooth multi-point fade out spanning >= 12 frames down to 0
+  const opKfs = textLayer.keyframes.opacity;
+  assert.ok(opKfs.length === 3, `Expected 3-point smooth opacity fade, got ${opKfs.length}`);
+  assert.equal(opKfs[0].value, 1);
+  assert.ok(opKfs[1].value > 0.3 && opKfs[1].value < 0.7);
+  assert.equal(opKfs[2].value, 0);
+  assert.ok(opKfs[2].frame - opKfs[0].frame >= 12, 'Fade-out should span at least 12 frames');
+  assert.equal(textLayer.pinnedSourceLayerId, 'vid-src');
+});
+
+test('Timeline center-locked playhead & pixel-locked ruler/clip alignment across scroll, zoom, and viewport widths', () => {
+  const fps = 30;
+  // Exact scenario: 2s 20f (F80) to 5s 13f (F163)
+  const itemStartFrame = 2 * fps + 20; // 80
+  const itemEndFrame = 5 * fps + 13;   // 163
+
+  const viewports = [292, 360, 412, 768];
+  const zooms = [0.5, 1.5, 2.5, 6.0, 14.0];
+
+  for (const vw of viewports) {
+    const padLeft = computeCenterPadLeft(vw);
+    assert.equal(padLeft, Math.round(vw * 0.5));
+
+    for (const pxPerFrame of zooms) {
+      const clipLeftContentX = frameToTimelineX(itemStartFrame, pxPerFrame, padLeft);
+      const clipWidthPx = Math.max(4, (itemEndFrame - itemStartFrame) * pxPerFrame);
+      const clipRightContentX = clipLeftContentX + clipWidthPx;
+
+      // Test at various scrolled frames (including start=0, itemStart=80, midpoint=121, itemEnd=163)
+      for (const playheadFrame of [0, 45, itemStartFrame, 121, itemEndFrame, 240]) {
+        const scrollLeft = frameToCenterScrollLeft(playheadFrame, pxPerFrame);
+        assert.equal(scrollLeftToCenterFrame(scrollLeft, pxPerFrame), playheadFrame);
+
+        // Viewport-local X of playhead frame must coincide identically with fixed center line padLeft
+        const playheadViewportX = frameToTimelineX(playheadFrame, pxPerFrame, padLeft) - scrollLeft;
+        assert.ok(Math.abs(playheadViewportX - padLeft) < 1e-6, `Playhead drifted: ${playheadViewportX} vs ${padLeft}`);
+
+        // Ruler tick X and clip start/end X must stay 100% locked across scroll & zoom
+        const rulerStartViewportX = frameToTimelineX(itemStartFrame, pxPerFrame, padLeft) - scrollLeft;
+        const rulerEndViewportX = frameToTimelineX(itemEndFrame, pxPerFrame, padLeft) - scrollLeft;
+        const clipStartViewportX = clipLeftContentX - scrollLeft;
+        const clipEndViewportX = clipRightContentX - scrollLeft;
+
+        assert.ok(Math.abs(clipStartViewportX - rulerStartViewportX) < 1e-6);
+        assert.ok(Math.abs(clipEndViewportX - rulerEndViewportX) < 1e-6);
+        assert.equal(Math.round(timelineXToFrame(clipLeftContentX, pxPerFrame, padLeft)), itemStartFrame);
+        assert.equal(Math.round(timelineXToFrame(clipRightContentX, pxPerFrame, padLeft)), itemEndFrame);
+      }
+    }
+  }
+});
+
+test('ProjectStorage preserves normalized track zoneOrder across serialize/deserialize', () => {
+  const proj = createEmptyProject('ZoneOrderProj', { fps: 30 });
+  assert.deepEqual(proj.settings.zoneOrder, ['overlay', 'main', 'audio']);
+
+  proj.settings.zoneOrder = ['audio', 'main', 'overlay'];
+  const restored = deserializeProject(serializeProject(proj));
+  assert.deepEqual(restored.settings.zoneOrder, ['audio', 'main', 'overlay']);
+
+  // Invalid / partial zoneOrder entries are sanitized cleanly
+  const corrupted = JSON.parse(serializeProject(proj));
+  corrupted.settings.zoneOrder = ['main', 'bogus', 'main'];
+  const sanitized = deserializeProject(corrupted);
+  assert.deepEqual(sanitized.settings.zoneOrder, ['main', 'overlay', 'audio']);
+});
+
 
 
 

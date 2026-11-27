@@ -187,15 +187,23 @@ export function matchTemplateCoarseToFine(tpl, frameGray, fw, fh, predX, predY, 
   const finalY = fineY + subY;
 
   let bestScale = 1.0;
-  if (trackScale && fineScore >= 0.45) {
+  if (trackScale && fineScore >= 0.42) {
     let bestScaleScore = fineScore;
-    const scaleCandidates = [0.97, 0.985, 1.0, 1.015, 1.03, 1.05];
+    const scaleCandidates = [0.94, 0.965, 0.985, 1.0, 1.015, 1.035, 1.06, 1.09];
     for (const sc of scaleCandidates) {
       const s = evalZNCCAt(tpl, frameGray, fw, fh, finalX, finalY, sc);
-      if (s > bestScaleScore + 0.002) {
+      if (s > bestScaleScore + 0.0015) {
         bestScaleScore = s;
         bestScale = sc;
       }
+    }
+    // Fine sub-scale parabolic refinement for smooth approach zoom
+    const sMinus = evalZNCCAt(tpl, frameGray, fw, fh, finalX, finalY, bestScale - 0.01);
+    const sPlus = evalZNCCAt(tpl, frameGray, fw, fh, finalX, finalY, bestScale + 0.01);
+    const sDenom = 2 * (sMinus - 2 * bestScaleScore + sPlus);
+    if (Math.abs(sDenom) > 1e-4) {
+      const subSc = clamp((sMinus - sPlus) / sDenom, -0.5, 0.5) * 0.01;
+      bestScale = clamp(bestScale + subSc, 0.92, 1.12);
     }
     fineScore = Math.max(fineScore, bestScaleScore);
   }
@@ -206,6 +214,50 @@ export function matchTemplateCoarseToFine(tpl, frameGray, fw, fh, predX, predY, 
     score: fineScore,
     relScale: bestScale
   };
+}
+
+/**
+ * Temporal Gaussian smoothing for tracked motion paths to suppress walking footstep jitter
+ * while keeping the anchor frame locked exactly at the marked spot.
+ */
+export function smoothTrackedPoints(points, anchorFrame = null, strength = 0.55) {
+  if (!Array.isArray(points) || points.length < 4) return points || [];
+  const s = clamp(Number(strength) || 0.55, 0, 0.95);
+  if (s <= 0.01) return points;
+
+  const weights = [0.12, 0.22, 0.32, 0.22, 0.12];
+  const smoothed = points.map((pt, idx) => {
+    if (idx === 0 || idx === points.length - 1 || (anchorFrame !== null && pt.frame === anchorFrame)) {
+      return { ...pt };
+    }
+    let wx = 0, wy = 0, wz = 0, wsc = 0, wrot = 0, wrx = 0, wry = 0, wSum = 0;
+    for (let k = -2; k <= 2; k++) {
+      const ni = clamp(idx + k, 0, points.length - 1);
+      const np = points[ni];
+      const w = weights[k + 2] * (0.5 + 0.5 * (np.score ?? 1));
+      wx += np.x * w;
+      wy += np.y * w;
+      wz += (np.z || 0) * w;
+      wsc += (np.scale || 1) * w;
+      wrot += (np.rotation || 0) * w;
+      wrx += (np.rotX || 0) * w;
+      wry += (np.rotY || 0) * w;
+      wSum += w;
+    }
+    if (wSum <= 1e-5) return { ...pt };
+    const mix = (orig, avg) => orig * (1 - s) + avg * s;
+    return {
+      ...pt,
+      x: Number(mix(pt.x, wx / wSum).toFixed(1)),
+      y: Number(mix(pt.y, wy / wSum).toFixed(1)),
+      z: Number(mix(pt.z || 0, wz / wSum).toFixed(1)),
+      scale: Number(mix(pt.scale || 1, wsc / wSum).toFixed(3)),
+      rotation: Number(mix(pt.rotation || 0, wrot / wSum).toFixed(2)),
+      rotX: Number(mix(pt.rotX || 0, wrx / wSum).toFixed(2)),
+      rotY: Number(mix(pt.rotY || 0, wry / wSum).toFixed(2))
+    };
+  });
+  return smoothed;
 }
 
 /**
@@ -358,9 +410,11 @@ export class TrackerEngine {
       let curAx = ax0;
       let curAy = ay0;
       let curScale = 1.0;
+      let prevStepScale = 1.0;
       let vx = 0;
       let vy = 0;
       let lowConfStreak = 0;
+      let framesSinceRefresh = 0;
 
       const limitFrame = stepDir > 0 ? videoLayer.endFrame : videoLayer.startFrame;
       for (let f = startF + stepDir; stepDir > 0 ? f <= limitFrame : f >= limitFrame; f += stepDir) {
@@ -369,9 +423,16 @@ export class TrackerEngine {
         const gray = await captureGrayAtFrame(f);
         if (!gray) break;
 
-        const predAx = clamp(curAx + vx, 2, aw - 3);
-        const predAy = clamp(curAy + vy, 2, ah - 3);
-        const match = matchTemplateCoarseToFine(curTpl, gray, aw, ah, predAx, predAy, searchR, trackScale);
+        // Expansion-aware prediction for approaching/receding walking camera footage
+        const radialBoost = prevStepScale > 1.004 ? 1.08 : 1.0;
+        const predAx = clamp(curAx + vx * radialBoost, 2, aw - 3);
+        const predAy = clamp(curAy + vy * radialBoost, 2, ah - 3);
+        const effSearchR = clamp(
+          Math.round(searchR + Math.hypot(vx, vy) * 1.45),
+          searchR,
+          Math.max(searchR, Math.round(aw * 0.28))
+        );
+        const match = matchTemplateCoarseToFine(curTpl, gray, aw, ah, predAx, predAy, effSearchR, trackScale);
 
         const edgeMargin = 4;
         const hitEdge =
@@ -388,13 +449,14 @@ export class TrackerEngine {
 
         if (lowConfStreak >= 2 || (hitEdge && match.score < 0.72)) {
           const speed = Math.hypot(vx, vy);
-          if (speed >= 1.2 && (hitEdge || predAx < aw * 0.14 || predAx > aw * 0.86 || predAy < ah * 0.14 || predAy > ah * 0.86)) {
+          if (speed >= 1.0 && (hitEdge || predAx < aw * 0.16 || predAx > aw * 0.84 || predAy < ah * 0.16 || predAy > ah * 0.84)) {
             for (let ex = 0; ex < 2; ex++) {
               const exFrame = f + ex * stepDir;
               if (exFrame > videoLayer.endFrame || exFrame < videoLayer.startFrame) break;
-              const exAx = curAx + vx * (ex + 1);
-              const exAy = curAy + vy * (ex + 1);
-              const exScale = clamp(curScale * Math.pow(match.relScale || 1, ex + 1), 0.35, 4.0);
+              const accel = 1 + 0.08 * (ex + 1);
+              const exAx = curAx + vx * (ex + 1) * accel;
+              const exAy = curAy + vy * (ex + 1) * accel;
+              const exScale = clamp(curScale * Math.pow(prevStepScale || 1, ex + 1), 0.35, 4.5);
               const exZ = camDist * (1 - 1 / exScale);
               pointMap.set(exFrame, {
                 frame: exFrame,
@@ -417,7 +479,9 @@ export class TrackerEngine {
         vy = vy * 0.35 + (match.y - curAy) * 0.65;
         curAx = match.x;
         curAy = match.y;
-        let stepScale = match.relScale || 1.0;
+        const rawStepScale = clamp(match.relScale || 1.0, 0.93, 1.09);
+        const stepScale = prevStepScale * 0.25 + rawStepScale * 0.75;
+        prevStepScale = stepScale;
 
         // Track satellite patches to measure 3D planar roll/tilt & reinforce depth expansion
         if (trackTilt3D && curSatR && curSatB) {
@@ -443,12 +507,16 @@ export class TrackerEngine {
           }
         }
 
-        curScale = clamp(curScale * stepScale, 0.35, 4.0);
+        curScale = clamp(curScale * stepScale, 0.35, 4.5);
         const depthZ = camDist * (1 - 1 / curScale);
 
-        if (match.score >= 0.76) {
+        framesSinceRefresh++;
+        if (match.score >= 0.80 && framesSinceRefresh >= 2) {
           const refreshed = extractTemplatePatch(gray, aw, ah, curAx, curAy, patchR);
-          if (refreshed.stdNorm >= 5) curTpl = refreshed;
+          if (refreshed.stdNorm >= 5) {
+            curTpl = refreshed;
+            framesSinceRefresh = 0;
+          }
         }
 
         const pt = {
@@ -485,7 +553,8 @@ export class TrackerEngine {
       await runSweep(-1);
     }
 
-    const points = Array.from(pointMap.values()).sort((a, b) => a.frame - b.frame);
+    const rawPoints = Array.from(pointMap.values()).sort((a, b) => a.frame - b.frame);
+    const points = smoothTrackedPoints(rawPoints, startF, 0.55);
     const avgScore =
       points.length > 0
         ? points.reduce((acc, p) => acc + (p.score || 0), 0) / points.length
@@ -509,12 +578,13 @@ export class TrackerEngine {
     if (!targetLayer || !trackResult?.points?.length) return false;
     const {
       offsetX = 0,
-      offsetY = -65,
+      offsetY = 0,
       applyScale = true,
       use3DDepth = false,
       applyTilt3D = false,
       autoTrim = true,
-      exitMode = 'fadeTrim' // 'fadeTrim' | 'slideTrim' | 'none'
+      maxEndFrame = null,
+      exitMode = 'passBy' // 'passBy' | 'fadeTrim' | 'slideTrim' | 'none'
     } = options;
 
     const pts = trackResult.points;
@@ -563,38 +633,109 @@ export class TrackerEngine {
       }
     }
 
+    let finalEndF = lastF;
     if (autoTrim && lastF > firstF) {
       targetLayer.startFrame = firstF;
       targetLayer.endFrame = lastF;
     }
 
-    if (exitMode === 'fadeTrim' && lastF - firstF >= 8) {
+    const span = Math.max(1, lastF - firstF);
+    const applySmoothFadeOut = (fadeStartF, fadeEndF) => {
       targetLayer.keyframes.opacity = [];
       const baseOp = targetLayer.transform?.opacity ?? 1;
-      const fadeFrames = Math.min(8, Math.max(3, Math.floor((lastF - firstF) * 0.2)));
-      KeyframeEngine.setKeyframe(targetLayer, 'opacity', Math.max(firstF, lastF - fadeFrames), baseOp, 'easeIn');
-      KeyframeEngine.setKeyframe(targetLayer, 'opacity', lastF, 0, 'linear');
-    } else if (exitMode === 'slideTrim' && pts.length >= 2 && lastF - firstF >= 6) {
-      const pPrev = pts[Math.max(0, pts.length - 3)];
+      const clampedStart = Math.max(firstF, Math.round(fadeStartF));
+      const clampedEnd = Math.max(clampedStart + 2, Math.round(fadeEndF));
+      const midF = Math.round(clampedStart + (clampedEnd - clampedStart) * 0.58);
+      KeyframeEngine.setKeyframe(targetLayer, 'opacity', clampedStart, baseOp, 'smooth');
+      if (midF > clampedStart && midF < clampedEnd) {
+        KeyframeEngine.setKeyframe(targetLayer, 'opacity', midF, Number((baseOp * 0.48).toFixed(3)), 'smooth');
+      }
+      KeyframeEngine.setKeyframe(targetLayer, 'opacity', clampedEnd, 0, 'linear');
+    };
+
+    if (exitMode === 'passBy' && pts.length >= 2 && span >= 4) {
+      // Natural roadside/world pass-by: continue perspective motion + expansion past exit while fading smoothly
+      const lookbackIdx = Math.max(0, pts.length - Math.min(6, pts.length));
+      const pPrev = pts[lookbackIdx];
       const pLast = pts[pts.length - 1];
       const df = Math.max(1, pLast.frame - pPrev.frame);
       const vx = (pLast.x - pPrev.x) / df;
       const vy = (pLast.y - pPrev.y) / df;
-      const exitSpan = Math.min(8, Math.max(3, Math.floor((lastF - firstF) * 0.2)));
+      const prevSc = Math.max(0.2, pPrev.scale || 1);
+      const lastSc = Math.max(0.2, pLast.scale || 1);
+      const scaleRate = clamp(Math.pow(lastSc / prevSc, 1 / df), 0.985, 1.045);
+
+      const rawTail = clamp(Math.round(span * 0.25), 10, 22);
+      const availTail = maxEndFrame != null ? Math.max(0, Math.round(maxEndFrame) - lastF) : rawTail;
+      const tailFrames = Math.min(rawTail, availTail);
+      finalEndF = lastF + tailFrames;
+
+      if (tailFrames >= 2) {
+        const lastX = KeyframeEngine.getValueAtFrame(targetLayer, 'x', lastF, pLast.x);
+        const lastY = KeyframeEngine.getValueAtFrame(targetLayer, 'y', lastF, pLast.y);
+        const lastZ = use3DDepth ? KeyframeEngine.getValueAtFrame(targetLayer, 'z', lastF, baseZ + (pLast.z || 0)) : 0;
+        const speed = Math.hypot(vx, vy);
+        // If object was nearly stationary at clip end, gently sweep outward toward its quadrant
+        const fallbackDirX = Math.abs(pLast.x) > 10 ? Math.sign(pLast.x) : 1;
+        const effVx = speed >= 0.35 ? vx : fallbackDirX * 1.4;
+        const effVy = speed >= 0.35 ? vy : 0.35;
+        const passScaleRate = scaleRate > 1.002 ? scaleRate : 1.012;
+
+        // Add pass-by tail keyframes (two checkpoints for smooth perspective curve)
+        const midT = Math.max(1, Math.round(tailFrames * 0.5));
+        for (const t of [midT, tailFrames]) {
+          const kfFrame = lastF + t;
+          const accel = 1 + 0.045 * t;
+          const endSc = clamp(lastSc * Math.pow(passScaleRate, t), 0.35, 5.0);
+          if (use3DDepth) {
+            const pScreenX = pLast.x + effVx * t * accel;
+            const pScreenY = pLast.y + effVy * t * accel;
+            const wx = (pScreenX + offsetX * endSc) / endSc;
+            const wy = (pScreenY + offsetY * endSc) / endSc;
+            const zDelta = (endSc - lastSc) * 140;
+            KeyframeEngine.setKeyframe(targetLayer, 'x', kfFrame, Number(wx.toFixed(1)), 'smooth');
+            KeyframeEngine.setKeyframe(targetLayer, 'y', kfFrame, Number(wy.toFixed(1)), 'smooth');
+            KeyframeEngine.setKeyframe(targetLayer, 'z', kfFrame, Number((lastZ + zDelta).toFixed(1)), 'smooth');
+          } else {
+            KeyframeEngine.setKeyframe(targetLayer, 'x', kfFrame, Number((lastX + effVx * t * accel).toFixed(1)), 'smooth');
+            KeyframeEngine.setKeyframe(targetLayer, 'y', kfFrame, Number((lastY + effVy * t * accel).toFixed(1)), 'smooth');
+            if (applyScale) {
+              KeyframeEngine.setKeyframe(targetLayer, 'scaleX', kfFrame, Number((baseSX * endSc).toFixed(3)), 'smooth');
+              KeyframeEngine.setKeyframe(targetLayer, 'scaleY', kfFrame, Number((baseSY * endSc).toFixed(3)), 'smooth');
+            }
+          }
+        }
+        if (autoTrim) targetLayer.endFrame = finalEndF;
+      }
+
+      const totalSpan = Math.max(4, finalEndF - firstF);
+      const fadeFrames = clamp(Math.round(totalSpan * 0.42), Math.min(12, totalSpan - 1), 40);
+      applySmoothFadeOut(finalEndF - fadeFrames, finalEndF);
+    } else if (exitMode === 'fadeTrim' && span >= 6) {
+      const fadeFrames = clamp(Math.round(span * 0.35), Math.min(10, span - 1), 32);
+      applySmoothFadeOut(lastF - fadeFrames, lastF);
+    } else if (exitMode === 'slideTrim' && pts.length >= 2 && span >= 6) {
+      const pPrev = pts[Math.max(0, pts.length - 4)];
+      const pLast = pts[pts.length - 1];
+      const df = Math.max(1, pLast.frame - pPrev.frame);
+      const vx = (pLast.x - pPrev.x) / df;
+      const vy = (pLast.y - pPrev.y) / df;
+      const rawTail = clamp(Math.round(span * 0.25), 6, 18);
+      const availTail = maxEndFrame != null ? Math.max(0, Math.round(maxEndFrame) - lastF) : rawTail;
+      const exitSpan = Math.min(rawTail, availTail);
       const slideEndF = lastF + exitSpan;
       const mag = Math.hypot(vx, vy);
       const dirX = mag > 0.4 ? vx / mag : 1;
       const dirY = mag > 0.4 ? vy / mag : 0;
-      const extraDist = Math.max(180, mag * exitSpan * 2.2);
+      const extraDist = Math.max(160, mag * exitSpan * 2.1);
       const lastX = KeyframeEngine.getValueAtFrame(targetLayer, 'x', lastF, pLast.x);
       const lastY = KeyframeEngine.getValueAtFrame(targetLayer, 'y', lastF, pLast.y);
-      KeyframeEngine.setKeyframe(targetLayer, 'x', slideEndF, Number((lastX + dirX * extraDist).toFixed(1)), 'easeIn');
-      KeyframeEngine.setKeyframe(targetLayer, 'y', slideEndF, Number((lastY + dirY * extraDist).toFixed(1)), 'easeIn');
-
-      targetLayer.keyframes.opacity = [];
-      const baseOp = targetLayer.transform?.opacity ?? 1;
-      KeyframeEngine.setKeyframe(targetLayer, 'opacity', lastF, baseOp, 'easeIn');
-      KeyframeEngine.setKeyframe(targetLayer, 'opacity', slideEndF, 0, 'linear');
+      if (exitSpan >= 2) {
+        KeyframeEngine.setKeyframe(targetLayer, 'x', slideEndF, Number((lastX + dirX * extraDist).toFixed(1)), 'easeIn');
+        KeyframeEngine.setKeyframe(targetLayer, 'y', slideEndF, Number((lastY + dirY * extraDist).toFixed(1)), 'easeIn');
+      }
+      const fadeSpan = Math.max(exitSpan, Math.min(16, Math.round(span * 0.3)));
+      applySmoothFadeOut(slideEndF - fadeSpan, slideEndF);
       if (autoTrim) targetLayer.endFrame = slideEndF;
     }
 

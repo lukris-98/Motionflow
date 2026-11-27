@@ -102,6 +102,10 @@ export function createBaseLayer(type, name, project, overrides = {}) {
       chromaSimilarity: 0.35,
       chromaSmoothness: 0.12,
       chromaSpill: 0.5,
+      removeBgMode: overrides.fx?.chromaEnabled ? 'chroma' : 'none',
+      autoBgSensitivity: 0.48,
+      autoBgFeather: 0.35,
+      autoBgInvert: false,
       ...(overrides.fx || {})
     },
     mask: {
@@ -1166,7 +1170,7 @@ export const TimelineEngine = {
       Math.abs(fx.sharpen || 0) > 0.01;
     if (hasAdj && (!layer.filterId || layer.filterId === 'normal')) count++;
     if (layer.mask?.type && layer.mask.type !== 'none') count++;
-    if (fx.chromaEnabled) count++;
+    if (fx.chromaEnabled || fx.removeBgMode === 'auto' || fx.removeBgMode === 'chroma') count++;
     if (layer.colorMatch?.enabled) count++;
     return count;
   },

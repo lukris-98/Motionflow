@@ -2,6 +2,12 @@ import { KeyframeEngine } from './keyframeEngine.js';
 import { TimelineEngine } from './timelineEngine.js';
 import { getStabilizerAtFrame } from './stabilizerEngine.js';
 import { MASK_PRESETS, VIDEO_EFFECT_PRESETS } from './capcutCatalog.js';
+import {
+  pickChromaSampleFromRgba,
+  computeAutoBgMask,
+  applyChromaKeyToRgba,
+  hexToRgb255
+} from './bgRemovalEngine.js';
 import { decodeAnimatedGif } from '../utils/gifDecoder.js';
 import { Mat4 } from '../utils/mat4.js';
 
@@ -17,9 +23,13 @@ export class RendererEngine {
     this.videoLastFrameCache = new Map(); // mediaId -> { canvas, width, height }
     this.videoThumbFallbackCache = new Map(); // mediaId -> HTMLImageElement
     this.rasterCache = new Map();      // layerId -> { key, canvas }
+    this.autoBgCache = new Map();      // layerId -> { key, outCanvas, maskCanvas, scratchCanvas, version, dominantBgHex }
     this.bgGradientCache = { key: '', canvas: null };
     this._videoHostEl = null;
     this._safeTexCanvas = null;
+    this._videoScratchCanvas = null;
+    this._samplePatchCanvas = null;
+    this._chroma2dCanvas = null;
     this.onMediaFrameReady = null;
 
     this.glPreview = this.createWebGLCompositor(this.canvas);
@@ -30,9 +40,14 @@ export class RendererEngine {
     this.lastGizmoHandles = null;
     this.renderedLayerQuads = [];
     this.trackerOverlay = null;
+    this.chromaPickerOverlay = null;
     this.viewport3D = { enabled: false, tool: 'move' }; // 'move' | 'rotate' | 'scale' | 'camera'
     this.pending3DLayerPose = null;
     this.pending3DCamPose = null;
+  }
+
+  setChromaPickerOverlay(state) {
+    this.chromaPickerOverlay = state;
   }
 
   setTrackerOverlay(state) {
@@ -118,11 +133,22 @@ export class RendererEngine {
     for (const lid of [...this.rasterCache.keys()]) {
       if (!activeLayerIds.has(lid)) {
         this.rasterCache.delete(lid);
+        this.autoBgCache.delete(lid);
         if (this.glPreview?.textures?.has(lid)) {
           this.glPreview.gl.deleteTexture(this.glPreview.textures.get(lid));
           this.glPreview.textures.delete(lid);
         }
+        if (this.glPreview?.textures?.has(`${lid}__autobg`)) {
+          this.glPreview.gl.deleteTexture(this.glPreview.textures.get(`${lid}__autobg`));
+          this.glPreview.textures.delete(`${lid}__autobg`);
+        }
         this.glPreview?.textureMeta?.delete(lid);
+        this.glPreview?.textureMeta?.delete(`${lid}__autobg`);
+      }
+    }
+    for (const lid of [...this.autoBgCache.keys()]) {
+      if (!activeLayerIds.has(lid)) {
+        this.autoBgCache.delete(lid);
       }
     }
     for (const mid of [...this.videoCache.keys()]) {
@@ -404,15 +430,22 @@ export class RendererEngine {
         if (uChromaOn > 0.5) {
           c.a = evalChromaAlpha(c);
           if (uChromaSpill > 0.005) {
-            if (uChromaKey.g >= uChromaKey.r && uChromaKey.g >= uChromaKey.b) {
-              float sp = max(0.0, c.g - (c.r + c.b) * 0.5);
-              c.g -= sp * uChromaSpill;
-            } else if (uChromaKey.b >= uChromaKey.r && uChromaKey.b > uChromaKey.g) {
-              float sp = max(0.0, c.b - (c.r + c.g) * 0.5);
-              c.b -= sp * uChromaSpill;
-            } else {
-              float sp = max(0.0, c.r - (c.g + c.b) * 0.5);
-              c.r -= sp * uChromaSpill;
+            float cy = 0.299 * c.r + 0.587 * c.g + 0.114 * c.b;
+            float ccb = -0.168736 * c.r - 0.331264 * c.g + 0.5 * c.b;
+            float ccr = 0.5 * c.r - 0.418688 * c.g - 0.081312 * c.b;
+            float kcb = -0.168736 * uChromaKey.r - 0.331264 * uChromaKey.g + 0.5 * uChromaKey.b;
+            float kcr = 0.5 * uChromaKey.r - 0.418688 * uChromaKey.g - 0.081312 * uChromaKey.b;
+            float kMagSq = kcb * kcb + kcr * kcr;
+            if (kMagSq > 0.0002) {
+              float proj = (ccb * kcb + ccr * kcr) / kMagSq;
+              if (proj > 0.0) {
+                float spillAmt = uChromaSpill * clamp(1.15 - c.a, 0.12, 1.0);
+                float ncb = ccb - kcb * proj * spillAmt;
+                float ncr = ccr - kcr * proj * spillAmt;
+                c.r = clamp(cy + 1.402 * ncr, 0.0, 1.0);
+                c.g = clamp(cy - 0.344136 * ncb - 0.714136 * ncr, 0.0, 1.0);
+                c.b = clamp(cy + 1.772 * ncb, 0.0, 1.0);
+              }
             }
           }
         }
@@ -812,6 +845,22 @@ export class RendererEngine {
 
     try {
       const maxTex = Math.min(2048, Number(gl.getParameter(gl.MAX_TEXTURE_SIZE)) || 2048);
+      const nowMs = typeof performance !== 'undefined' ? performance.now() : Date.now();
+      const vfcStalled = Boolean(
+        isVideo &&
+        sourceEl._vfcSupported &&
+        sourceEl._wantsPlay &&
+        !sourceEl.paused &&
+        (sourceEl._vfcCount || 0) === 0 &&
+        (nowMs - (sourceEl._wantsPlaySinceMs || nowMs)) > 320
+      );
+      const useVideoScratch = Boolean(
+        isVideo &&
+        typeof document !== 'undefined' &&
+        sw > 0 &&
+        sh > 0 &&
+        (sourceEl._forceScratchCopy || (sourceEl._stallCount || 0) >= 2 || vfcStalled)
+      );
       if (sw > maxTex || sh > maxTex) {
         const scale = Math.min(maxTex / sw, maxTex / sh);
         const tw = Math.max(2, Math.round(sw * scale));
@@ -825,6 +874,16 @@ export class RendererEngine {
         sctx.clearRect(0, 0, tw, th);
         sctx.drawImage(sourceEl, 0, 0, tw, th);
         gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, this._safeTexCanvas);
+      } else if (useVideoScratch) {
+        if (!this._videoScratchCanvas) this._videoScratchCanvas = document.createElement('canvas');
+        if (this._videoScratchCanvas.width !== sw || this._videoScratchCanvas.height !== sh) {
+          this._videoScratchCanvas.width = sw;
+          this._videoScratchCanvas.height = sh;
+        }
+        const vctx = this._videoScratchCanvas.getContext('2d');
+        vctx.clearRect(0, 0, sw, sh);
+        vctx.drawImage(sourceEl, 0, 0, sw, sh);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, this._videoScratchCanvas);
       } else {
         gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, sourceEl);
       }
@@ -928,15 +987,21 @@ export class RendererEngine {
 
   _ensureHiddenVideoHost() {
     if (typeof document === 'undefined' || !document.body) return null;
-    if (this._videoHostEl && this._videoHostEl.isConnected) return this._videoHostEl;
+    const stageParent = document.getElementById('previewStage') || document.body;
+    if (this._videoHostEl && this._videoHostEl.isConnected && this._videoHostEl.parentElement === stageParent) {
+      return this._videoHostEl;
+    }
     let host = document.getElementById('mfHiddenVideoHost');
     if (!host) {
       host = document.createElement('div');
       host.id = 'mfHiddenVideoHost';
-      // Keep inside viewport bounds behind preview so Android WebView Chromium compositor always decodes active frames
-      host.style.cssText = 'position:fixed;left:0;top:0;width:2px;height:2px;opacity:0.004;pointer-events:none;overflow:hidden;z-index:-1;';
       host.setAttribute('aria-hidden', 'true');
-      document.body.appendChild(host);
+    }
+    // Place inside previewStage at z-index:2 (above opaque previewCanvas z-index:1, below overlayCanvas z-index:3)
+    // so Chromium/Android WebView compositor never treats <video> as occluded and keeps decoding live frames.
+    host.style.cssText = 'position:absolute;right:0;bottom:0;width:24px;height:24px;opacity:0.01;pointer-events:none;overflow:hidden;z-index:2;';
+    if (host.parentElement !== stageParent) {
+      stageParent.appendChild(host);
     }
     this._videoHostEl = host;
     return host;
@@ -997,13 +1062,65 @@ export class RendererEngine {
     vid.muted = true;
     vid.defaultMuted = true;
     vid.playsInline = true;
+    vid.setAttribute('muted', '');
     vid.setAttribute('playsinline', '');
     vid.setAttribute('webkit-playsinline', '');
     vid.preload = 'auto';
+    vid.style.cssText = 'width:100%;height:100%;object-fit:fill;display:block;pointer-events:none;';
     vid.dataset.srcUrl = urlStr;
     vid._wantsPlay = false;
     vid._pendingPlayTargetTime = null;
     vid._lastSyncSeekMs = 0;
+    vid._playInFlight = false;
+    vid._stallCount = 0;
+    vid._forceScratchCopy = false;
+    vid._wantsPlaySinceMs = 0;
+    vid._lastProgressWallMs = 0;
+    vid._lastObservedMediaTime = undefined;
+    vid._lastObservedTargetTime = undefined;
+    vid._lastObservedVfcCount = 0;
+    vid._vfcSupported = typeof vid.requestVideoFrameCallback === 'function';
+    vid._vfcCount = 0;
+    vid._vfcArmed = false;
+
+    const armVfc = () => {
+      if (!vid._vfcSupported || vid._vfcArmed || !vid._wantsPlay) return;
+      vid._vfcArmed = true;
+      try {
+        vid.requestVideoFrameCallback(() => {
+          vid._vfcArmed = false;
+          vid._vfcCount = (vid._vfcCount || 0) + 1;
+          vid._stallCount = 0;
+          vid._forceScratchCopy = false;
+          if (vid._wantsPlay && !vid.paused) armVfc();
+        });
+      } catch {
+        vid._vfcArmed = false;
+        vid._vfcSupported = false;
+      }
+    };
+    vid._armVfc = armVfc;
+
+    const safePlay = () => {
+      if (vid._playInFlight || !vid._wantsPlay) return;
+      vid._playInFlight = true;
+      try {
+        const p = vid.play?.();
+        if (p && typeof p.then === 'function') {
+          p.then(() => {
+            vid._playInFlight = false;
+            armVfc();
+          }).catch(() => {
+            vid._playInFlight = false;
+          });
+        } else {
+          vid._playInFlight = false;
+          armVfc();
+        }
+      } catch {
+        vid._playInFlight = false;
+      }
+    };
 
     const notifyReady = (captureFallback = false) => {
       if (captureFallback && vid.readyState >= 2 && vid.videoWidth > 0) {
@@ -1022,7 +1139,9 @@ export class RendererEngine {
         }
       }
       if (vid.paused && vid.readyState >= 1) {
-        vid.play().catch(() => {});
+        safePlay();
+      } else if (!vid.paused) {
+        armVfc();
       }
     };
 
@@ -1043,11 +1162,14 @@ export class RendererEngine {
       maybeResumePendingPlay();
       notifyReady(false);
     });
-    vid.addEventListener('playing', () => notifyReady(false));
+    vid.addEventListener('playing', () => {
+      armVfc();
+      notifyReady(false);
+    });
     vid.addEventListener('seeked', () => {
       if (vid._wantsPlay) {
         vid._pendingSeekTime = null;
-        if (vid.paused) vid.play().catch(() => {});
+        if (vid.paused) safePlay();
         notifyReady(false);
         return;
       }
@@ -1094,6 +1216,27 @@ export class RendererEngine {
     const nowMs = typeof performance !== 'undefined' ? performance.now() : Date.now();
     const maxConcurrentDecoders = 4;
 
+    const triggerSafePlay = (vid) => {
+      if (vid._playInFlight) return;
+      vid._playInFlight = true;
+      try {
+        const p = vid.play?.();
+        if (p && typeof p.then === 'function') {
+          p.then(() => {
+            vid._playInFlight = false;
+            vid._armVfc?.();
+          }).catch(() => {
+            vid._playInFlight = false;
+          });
+        } else {
+          vid._playInFlight = false;
+          vid._armVfc?.();
+        }
+      } catch {
+        vid._playInFlight = false;
+      }
+    };
+
     if (isPlaying && shuttleRate > 0 && project && Array.isArray(project.layers)) {
       for (const layer of project.layers) {
         if (layer.type !== 'video' || !layer.visible || !layer.mediaId) continue;
@@ -1122,7 +1265,15 @@ export class RendererEngine {
           Math.min(4.0, shuttleRate * (layer.speed || 1) * TimelineEngine.evaluateLayerSpeedFactor(layer, normT))
         );
         vid.muted = true;
-        vid._wantsPlay = true;
+        if (!vid._wantsPlay) {
+          vid._wantsPlay = true;
+          vid._wantsPlaySinceMs = nowMs;
+          vid._lastProgressWallMs = nowMs;
+          vid._lastObservedMediaTime = vid.currentTime;
+          vid._lastObservedTargetTime = targetTime;
+          vid._lastObservedVfcCount = vid._vfcCount || 0;
+        }
+        vid._armVfc?.();
         if (Math.abs((vid.playbackRate || 1) - rate) > 0.04) {
           try { vid.playbackRate = rate; } catch {}
         }
@@ -1132,25 +1283,81 @@ export class RendererEngine {
           if (vid.networkState === 0) {
             try { vid.load(); } catch {}
           }
-          vid.play?.().catch?.(() => {});
+          triggerSafePlay(vid);
         } else if (vid.paused) {
           vid._pendingPlayTargetTime = null;
           if (!vid.seeking && Math.abs(vid.currentTime - targetTime) > 0.08) {
             vid._lastSyncSeekMs = nowMs;
             try { vid.currentTime = targetTime; } catch {}
           }
-          vid.play?.().catch?.(() => {});
+          triggerSafePlay(vid);
         } else if (vid.ended && targetTime < (vid.duration || targetTime) - 0.12) {
           vid._lastSyncSeekMs = nowMs;
           try { vid.currentTime = targetTime; } catch {}
-          vid.play?.().catch?.(() => {});
-        } else if (
-          !vid.seeking &&
-          Math.abs(vid.currentTime - targetTime) > 0.75 &&
-          nowMs - (vid._lastSyncSeekMs || 0) > 900
-        ) {
-          vid._lastSyncSeekMs = nowMs;
-          try { vid.currentTime = targetTime; } catch {}
+          triggerSafePlay(vid);
+        } else {
+          // Track real frame/media progression to detect WebView SurfaceTexture/decoder stalls
+          const mediaAdvanced = vid._lastObservedMediaTime === undefined ||
+            Math.abs(vid.currentTime - vid._lastObservedMediaTime) > 0.004;
+          const vfcAdvanced = (vid._vfcCount || 0) > (vid._lastObservedVfcCount || 0);
+          if (mediaAdvanced || vfcAdvanced) {
+            vid._lastObservedMediaTime = vid.currentTime;
+            vid._lastObservedTargetTime = targetTime;
+            vid._lastObservedVfcCount = vid._vfcCount || 0;
+            vid._lastProgressWallMs = nowMs;
+            if (mediaAdvanced && (!vid._vfcSupported || vfcAdvanced)) {
+              vid._stallCount = 0;
+              vid._forceScratchCopy = false;
+            }
+          } else if (
+            vid.readyState >= 2 &&
+            !vid.seeking &&
+            (nowMs - (vid._lastProgressWallMs || nowMs)) > 170 &&
+            Math.abs(targetTime - (vid._lastObservedTargetTime ?? targetTime)) > 0.08
+          ) {
+            vid._stallCount = (vid._stallCount || 0) + 1;
+            vid._lastProgressWallMs = nowMs;
+            vid._lastObservedTargetTime = targetTime;
+            if (vid._stallCount >= 2) {
+              vid._forceScratchCopy = true;
+            }
+          }
+
+          if ((vid._stallCount || 0) >= 2) {
+            // Decoder stalled: step-seek cleanly at ~24fps to guarantee live frame progression
+            if (!vid.seeking && Math.abs(vid.currentTime - targetTime) > 0.04 && nowMs - (vid._lastSyncSeekMs || 0) > 40) {
+              vid._lastSyncSeekMs = nowMs;
+              try { vid.currentTime = targetTime; } catch {}
+            }
+          } else if (
+            !vid.seeking &&
+            Math.abs(vid.currentTime - targetTime) > 0.75 &&
+            nowMs - (vid._lastSyncSeekMs || 0) > 700
+          ) {
+            vid._lastSyncSeekMs = nowMs;
+            try { vid.currentTime = targetTime; } catch {}
+          }
+        }
+      }
+
+      // Pre-warm upcoming video clips starting within 1.5s ahead (so Image -> Video cuts render immediately)
+      const lookaheadFrames = Math.round(fps * 1.5);
+      for (const layer of project.layers) {
+        if (layer.type !== 'video' || !layer.visible || !layer.mediaId) continue;
+        if (layer.startFrame <= frame || layer.startFrame > frame + lookaheadFrames) continue;
+        const mediaItem = mediaMap.get(layer.mediaId);
+        if (!mediaItem || activeMediaIds.has(mediaItem.id)) continue;
+        if (activeMediaIds.size >= maxConcurrentDecoders) break;
+        const vid = this.getVideoElement(mediaItem);
+        if (!vid) continue;
+        activeMediaIds.add(mediaItem.id);
+        vid._wantsPlay = false;
+        if (!vid.paused) {
+          try { vid.pause(); } catch {}
+        }
+        const entryTarget = this._computeVideoTargetTime(layer, layer.startFrame, fps, vid, mediaItem);
+        if (vid.readyState >= 1 && !vid.seeking && Math.abs(vid.currentTime - entryTarget) > 0.05) {
+          try { vid.currentTime = entryTarget; } catch {}
         }
       }
     }
@@ -1159,7 +1366,10 @@ export class RendererEngine {
       if (!activeMediaIds.has(id)) {
         const wasPlaying = vid._wantsPlay || !vid.paused;
         vid._wantsPlay = false;
+        vid._wantsPlaySinceMs = 0;
         vid._pendingPlayTargetTime = null;
+        vid._stallCount = 0;
+        vid._forceScratchCopy = false;
         if (!vid.paused) {
           try { vid.pause(); } catch {}
         }
@@ -1181,6 +1391,10 @@ export class RendererEngine {
       if (!mediaItem) continue;
       const vid = this.getVideoElement(mediaItem);
       if (!vid) continue;
+      if (!awaitSeek) {
+        vid._wantsPlay = false;
+        vid._wantsPlaySinceMs = 0;
+      }
       if (!awaitSeek && !vid.paused) {
         if (vid.readyState >= 2 && vid.videoWidth > 0) {
           this.captureVideoFallbackFrame(mediaItem.id, vid);
@@ -1507,6 +1721,214 @@ export class RendererEngine {
     return null;
   }
 
+  hasAny3DContentAtFrame(project, frame, allowPending = false) {
+    if (!project) return false;
+    if (project.camera?.enabled) return true;
+    for (let i = 0; i < (project.layers?.length || 0); i++) {
+      const l = project.layers[i];
+      if (!l.visible || l.type === 'audio' || l.type === 'group' || l.type === 'camera') continue;
+      if (frame < l.startFrame || frame > l.endFrame) continue;
+      const tf = this.resolveEffectiveTransform(l, frame, allowPending);
+      if (Math.abs(tf.z || 0) > 0.5 || Math.abs(tf.rotX || 0) > 0.5 || Math.abs(tf.rotY || 0) > 0.5) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  resolveProcessedDrawable(layer, frame, projectFps, mediaMap, isExport = false) {
+    const drawable = this.resolveLayerDrawable(layer, frame, projectFps, mediaMap);
+    if (!drawable || !drawable.el) return null;
+
+    const fx = layer.fx || {};
+    const isAutoBg = (layer.type === 'video' || layer.type === 'image') && fx.removeBgMode === 'auto';
+    if (!isAutoBg) return drawable;
+
+    const sens = Math.round((fx.autoBgSensitivity ?? 0.48) * 100);
+    const feather = Math.round((fx.autoBgFeather ?? 0.35) * 100);
+    const invert = fx.autoBgInvert ? 1 : 0;
+    const spill = Math.round((fx.chromaSpill ?? 0.35) * 100);
+    const frameBucket = layer.type === 'video'
+      ? (isExport ? Math.round(frame) : Math.floor(frame / 2))
+      : (drawable.token || 0);
+    const key = `${layer.mediaId || layer.id}_${frameBucket}_${sens}_${feather}_${invert}_${spill}_${isExport ? 1 : 0}`;
+
+    let entry = this.autoBgCache.get(layer.id);
+    if (entry && entry.key === key && entry.outCanvas) {
+      return {
+        el: entry.outCanvas,
+        w: drawable.w,
+        h: drawable.h,
+        token: entry.version,
+        cacheKey: `${layer.id}__autobg`,
+        dominantBgHex: entry.dominantBgHex
+      };
+    }
+
+    if (!entry) {
+      entry = {
+        key: '',
+        outCanvas: document.createElement('canvas'),
+        maskCanvas: document.createElement('canvas'),
+        scratchCanvas: document.createElement('canvas'),
+        version: 1,
+        dominantBgHex: '#000000'
+      };
+      this.autoBgCache.set(layer.id, entry);
+    }
+
+    const srcW = Math.max(2, drawable.el.videoWidth || drawable.el.naturalWidth || drawable.el.width || drawable.w || 320);
+    const srcH = Math.max(2, drawable.el.videoHeight || drawable.el.naturalHeight || drawable.el.height || drawable.h || 180);
+
+    // Downsampled analysis canvas for fast low-end CPU execution
+    const analysisMax = isExport ? 184 : 120;
+    const aScale = Math.min(1, analysisMax / Math.max(srcW, srcH));
+    const aw = Math.max(24, Math.round(srcW * aScale));
+    const ah = Math.max(24, Math.round(srcH * aScale));
+
+    if (entry.scratchCanvas.width !== aw || entry.scratchCanvas.height !== ah) {
+      entry.scratchCanvas.width = aw;
+      entry.scratchCanvas.height = ah;
+    }
+    const sctx = entry.scratchCanvas.getContext('2d', { willReadFrequently: true });
+    sctx.clearRect(0, 0, aw, ah);
+    sctx.drawImage(drawable.el, 0, 0, aw, ah);
+    const imgData = sctx.getImageData(0, 0, aw, ah);
+
+    const { alphaMask, dominantBgHex } = computeAutoBgMask(imgData.data, aw, ah, {
+      sensitivity: fx.autoBgSensitivity ?? 0.48,
+      feather: fx.autoBgFeather ?? 0.35,
+      invert: Boolean(fx.autoBgInvert)
+    });
+
+    if (entry.maskCanvas.width !== aw || entry.maskCanvas.height !== ah) {
+      entry.maskCanvas.width = aw;
+      entry.maskCanvas.height = ah;
+    }
+    const mctx = entry.maskCanvas.getContext('2d');
+    const mData = mctx.createImageData(aw, ah);
+    for (let i = 0; i < alphaMask.length; i++) {
+      const p = i * 4;
+      mData.data[p] = 255;
+      mData.data[p + 1] = 255;
+      mData.data[p + 2] = 255;
+      mData.data[p + 3] = alphaMask[i];
+    }
+    mctx.putImageData(mData, 0, 0);
+
+    const outMax = isExport ? 1280 : 720;
+    const oScale = Math.min(1, outMax / Math.max(srcW, srcH));
+    const ow = Math.max(16, Math.round(srcW * oScale));
+    const oh = Math.max(16, Math.round(srcH * oScale));
+    if (entry.outCanvas.width !== ow || entry.outCanvas.height !== oh) {
+      entry.outCanvas.width = ow;
+      entry.outCanvas.height = oh;
+    }
+    const octx = entry.outCanvas.getContext('2d');
+    octx.clearRect(0, 0, ow, oh);
+    octx.globalCompositeOperation = 'source-over';
+    octx.imageSmoothingEnabled = true;
+    octx.drawImage(drawable.el, 0, 0, ow, oh);
+    octx.globalCompositeOperation = 'destination-in';
+    octx.drawImage(entry.maskCanvas, 0, 0, ow, oh);
+    octx.globalCompositeOperation = 'source-over';
+
+    entry.key = key;
+    entry.version = (entry.version || 0) + 1;
+    entry.dominantBgHex = dominantBgHex;
+
+    return {
+      el: entry.outCanvas,
+      w: drawable.w,
+      h: drawable.h,
+      token: entry.version,
+      cacheKey: `${layer.id}__autobg`,
+      dominantBgHex
+    };
+  }
+
+  sampleLayerColorAtOverlayPoint(project, frame, mediaMap, layerId, px, py) {
+    const layer = project?.layers?.find((l) => l.id === layerId);
+    if (!layer) return null;
+    const drawable = this.resolveLayerDrawable(layer, frame, project.fps || 30, mediaMap);
+    if (!drawable || !drawable.el) return null;
+
+    const ow = Math.max(1, this.overlay.clientWidth || this.overlay.width || project.width);
+    const oh = Math.max(1, this.overlay.clientHeight || this.overlay.height || project.height);
+    const ox = px * (this.overlay.width / ow);
+    const oy = py * (this.overlay.height / oh);
+
+    // Map overlay pixel into layer normalized [0..1] UV
+    const use3D = Boolean(this.viewport3D?.enabled) || this.hasAny3DContentAtFrame(project, frame, true);
+    const mats = this.computeCameraMatrices(project, frame, !use3D, true);
+    const tf = this.resolveEffectiveTransform(layer, frame, true);
+
+    let model = Mat4.identity();
+    if (layer.parentId) {
+      const parent = project.layers.find((p) => p.id === layer.parentId);
+      if (parent) {
+        const ptf = this.resolveEffectiveTransform(parent, frame, true);
+        model = Mat4.translate(model, ptf.x, -ptf.y, use3D ? (ptf.z || 0) : 0);
+        model = Mat4.rotateZ(model, (-ptf.rotation * Math.PI) / 180);
+        model = Mat4.scale(model, ptf.scaleX, ptf.scaleY, 1);
+      }
+    }
+    model = Mat4.translate(model, tf.x, -tf.y, use3D ? (tf.z || 0) : 0);
+    model = Mat4.rotateZ(model, (-tf.rotation * Math.PI) / 180);
+    if (use3D) {
+      model = Mat4.rotateX(model, ((tf.rotX || 0) * Math.PI) / 180);
+      model = Mat4.rotateY(model, ((tf.rotY || 0) * Math.PI) / 180);
+    }
+    model = Mat4.scale(model, tf.scaleX * (layer.flipX ? -1 : 1), tf.scaleY * (layer.flipY ? -1 : 1), 1);
+    model = Mat4.translate(model, -tf.anchorX, tf.anchorY, 0);
+
+    const mvp = Mat4.multiply(mats.pvMat, model);
+    const hw = drawable.w / 2;
+    const hh = drawable.h / 2;
+    const pTL = this.projectMatPoint(mvp, -hw, hh, 0, this.overlay.width, this.overlay.height);
+    const pTR = this.projectMatPoint(mvp, hw, hh, 0, this.overlay.width, this.overlay.height);
+    const pBL = this.projectMatPoint(mvp, -hw, -hh, 0, this.overlay.width, this.overlay.height);
+
+    let normX = ox / this.overlay.width;
+    let normY = oy / this.overlay.height;
+    if (pTL && pTR && pBL) {
+      const ux = pTR.x - pTL.x;
+      const uy = pTR.y - pTL.y;
+      const vx = pBL.x - pTL.x;
+      const vy = pBL.y - pTL.y;
+      const det = ux * vy - uy * vx;
+      if (Math.abs(det) > 1e-3) {
+        const dx = ox - pTL.x;
+        const dy = oy - pTL.y;
+        normX = (dx * vy - dy * vx) / det;
+        normY = (ux * dy - uy * dx) / det;
+      }
+    }
+    normX = Math.max(0, Math.min(1, normX));
+    normY = Math.max(0, Math.min(1, normY));
+
+    const srcW = Math.max(4, drawable.el.videoWidth || drawable.el.naturalWidth || drawable.el.width || drawable.w);
+    const srcH = Math.max(4, drawable.el.videoHeight || drawable.el.naturalHeight || drawable.el.height || drawable.h);
+    const patchSize = 15;
+    if (!this._samplePatchCanvas) this._samplePatchCanvas = document.createElement('canvas');
+    this._samplePatchCanvas.width = patchSize;
+    this._samplePatchCanvas.height = patchSize;
+    const sctx = this._samplePatchCanvas.getContext('2d', { willReadFrequently: true });
+
+    const cx = Math.max(0, Math.min(srcW - 1, normX * (srcW - 1)));
+    const cy = Math.max(0, Math.min(srcH - 1, normY * (srcH - 1)));
+    const cropR = Math.max(4, Math.min(srcW, srcH) * 0.025);
+    const sx = Math.max(0, Math.min(srcW - cropR * 2, cx - cropR));
+    const sy = Math.max(0, Math.min(srcH - cropR * 2, cy - cropR));
+    const sw = Math.max(2, Math.min(srcW - sx, cropR * 2));
+    const sh = Math.max(2, Math.min(srcH - sy, cropR * 2));
+
+    sctx.clearRect(0, 0, patchSize, patchSize);
+    sctx.drawImage(drawable.el, sx, sy, sw, sh, 0, 0, patchSize, patchSize);
+    const rgba = sctx.getImageData(0, 0, patchSize, patchSize).data;
+    return pickChromaSampleFromRgba(rgba, patchSize, patchSize, 0.5, 0.5, 2);
+  }
+
   hexToRgb01(hex) {
     const clean = (hex || '#05070B').replace('#', '');
     if (clean.length !== 6) return [0.02, 0.03, 0.04];
@@ -1533,7 +1955,8 @@ export class RendererEngine {
 
     const w = targetW || project.width;
     const h = targetH || project.height;
-    const isFlat2DPreview = !targetCanvas && !this.viewport3D?.enabled;
+    const has3D = this.hasAny3DContentAtFrame(project, frame, !targetCanvas);
+    const isFlat2DPreview = !targetCanvas && !this.viewport3D?.enabled && !has3D;
     const allowPending = !targetCanvas;
 
     if (compositor) {
@@ -1875,7 +2298,7 @@ export class RendererEngine {
             ? this.resolveEffectiveTransform(layersById.get(layer.parentId), effFrame, allowPending)
             : parentTf;
 
-          const drawable = isAdjustment ? null : this.resolveLayerDrawable(layer, effFrame, fps, mediaMap);
+          const drawable = isAdjustment ? null : this.resolveProcessedDrawable(layer, effFrame, fps, mediaMap, !allowPending);
           if (!isAdjustment && !drawable) continue;
 
           const tf = this.resolveEffectiveTransform(layer, effFrame, allowPending);
@@ -1919,7 +2342,7 @@ export class RendererEngine {
             model = Mat4.scale(model, drawable.w, drawable.h, 1);
 
             mvp = Mat4.multiply(projMat, Mat4.multiply(viewMat, model));
-            this.getOrCreateTexture(compositor, layer.mediaId || layer.id, drawable.el, drawable.token ?? null);
+            this.getOrCreateTexture(compositor, drawable.cacheKey || layer.mediaId || layer.id, drawable.el, drawable.token ?? null);
             texelW = Math.max(1, drawable.w);
             texelH = Math.max(1, drawable.h);
           }
@@ -1956,7 +2379,7 @@ export class RendererEngine {
           this.ensureFxPingPong(compositor, passW, passH);
           const srcTex = isAdjustment
             ? compositor.adjTex
-            : compositor.textures.get(layer.mediaId || layer.id);
+            : compositor.textures.get(drawable.cacheKey || layer.mediaId || layer.id);
           this._resetDefaultShaderUniforms(compositor);
           this.bindCompositorQuadBuffer(compositor, compositor.fboPosBuf);
           gl.disable(gl.BLEND);
@@ -2013,7 +2436,9 @@ export class RendererEngine {
         gl.uniform1f(uVignette, (Number(fx.vignette) || 0) * adjScale);
         gl.uniform1f(uGrain, (Number(fx.grain) || 0) * adjScale);
         gl.uniform2f(uTexel, 1 / texelW, 1 / texelH);
-        gl.uniform1f(uChromaOn, isAdjustment ? 0 : (fx.chromaEnabled ? 1 : 0));
+        const chromaActive = !isAdjustment && fx.removeBgMode !== 'auto' && fx.removeBgMode !== 'none' &&
+          (fx.removeBgMode === 'chroma' || Boolean(fx.chromaEnabled));
+        gl.uniform1f(uChromaOn, chromaActive ? 1 : 0);
         gl.uniform3f(uChromaKey, keyRgb[0], keyRgb[1], keyRgb[2]);
         gl.uniform1f(uChromaSim, fx.chromaSimilarity ?? 0.35);
         gl.uniform1f(uChromaSmooth, fx.chromaSmoothness ?? 0.12);
@@ -2212,7 +2637,7 @@ export class RendererEngine {
           ? this.resolveEffectiveTransform(layersById.get(layer.parentId), effFrame, allowPending)
           : parentTf;
 
-        const drawable = this.resolveLayerDrawable(layer, effFrame, project.fps || 30, mediaMap);
+        const drawable = this.resolveProcessedDrawable(layer, effFrame, project.fps || 30, mediaMap, !allowPending);
         if (!drawable) continue;
         const tf = this.resolveEffectiveTransform(layer, effFrame, allowPending);
         const trState = this.computeTransitionState(layer, effFrame, project.width, project.height);
@@ -2236,11 +2661,14 @@ export class RendererEngine {
           ctx.rotate((layerParentTf.rotation * Math.PI) / 180);
           ctx.scale(layerParentTf.scaleX, layerParentTf.scaleY);
         }
-        ctx.translate(tf.x + trState.dx, tf.y + trState.dy);
+        const zPersp = !isFlat2DPreview && Math.abs(tf.z || 0) > 0.5
+          ? Math.max(0.15, Math.min(8, ((project.height / 2) / Math.tan((45 * Math.PI) / 360)) / Math.max(40, ((project.height / 2) / Math.tan((45 * Math.PI) / 360)) - (tf.z || 0))))
+          : 1;
+        ctx.translate((tf.x + trState.dx) * zPersp, (tf.y + trState.dy) * zPersp);
         ctx.rotate(((tf.rotation + (trState.rotDelta || 0)) * Math.PI) / 180);
         ctx.scale(
-          tf.scaleX * trState.scaleMul * (layer.flipX ? -1 : 1),
-          tf.scaleY * trState.scaleMul * (layer.flipY ? -1 : 1)
+          tf.scaleX * trState.scaleMul * zPersp * (layer.flipX ? -1 : 1),
+          tf.scaleY * trState.scaleMul * zPersp * (layer.flipY ? -1 : 1)
         );
         ctx.translate(-tf.anchorX, -tf.anchorY);
         ctx.globalAlpha = alpha;
@@ -2275,7 +2703,34 @@ export class RendererEngine {
           ctx.rotate(stab.rot);
           ctx.translate(stab.dx, stab.dy);
         }
-        if (layer.type !== 'text' && layer.type !== 'shape' && layer.keyframes?.color?.length > 0) {
+        const fx = layer.fx || {};
+        const chroma2dOn = fx.removeBgMode !== 'auto' && fx.removeBgMode !== 'none' &&
+          (fx.removeBgMode === 'chroma' || Boolean(fx.chromaEnabled));
+        if (chroma2dOn && (layer.type === 'video' || layer.type === 'image')) {
+          const cScale = Math.min(1, 256 / Math.max(1, drawable.w, drawable.h));
+          const cw = Math.max(8, Math.round(drawable.w * cScale));
+          const ch = Math.max(8, Math.round(drawable.h * cScale));
+          if (!this._chroma2dCanvas) this._chroma2dCanvas = document.createElement('canvas');
+          if (this._chroma2dCanvas.width !== cw || this._chroma2dCanvas.height !== ch) {
+            this._chroma2dCanvas.width = cw;
+            this._chroma2dCanvas.height = ch;
+          }
+          const cctx = this._chroma2dCanvas.getContext('2d', { willReadFrequently: true });
+          cctx.clearRect(0, 0, cw, ch);
+          cctx.drawImage(drawable.el, 0, 0, cw, ch);
+          const idata = cctx.getImageData(0, 0, cw, ch);
+          applyChromaKeyToRgba(
+            idata.data,
+            cw,
+            ch,
+            hexToRgb255(fx.chromaColor || '#00FF00'),
+            fx.chromaSimilarity ?? 0.35,
+            fx.chromaSmoothness ?? 0.12,
+            fx.chromaSpill ?? 0.5
+          );
+          cctx.putImageData(idata, 0, 0);
+          ctx.drawImage(this._chroma2dCanvas, -drawable.w / 2, -drawable.h / 2, drawable.w, drawable.h);
+        } else if (layer.type !== 'text' && layer.type !== 'shape' && layer.keyframes?.color?.length > 0) {
           const tintHex = KeyframeEngine.getColorAtFrame(layer, effFrame, layer.fx?.tintColor || '#FFFFFF');
           const tw = Math.max(2, Math.min(1024, Math.round(drawable.w)));
           const th = Math.max(2, Math.min(1024, Math.round(drawable.h)));
@@ -2453,7 +2908,8 @@ export class RendererEngine {
     }
 
     const is3DMode = Boolean(this.viewport3D?.enabled);
-    const mats = this.computeCameraMatrices(project, frame, !is3DMode, true);
+    const usePerspectiveOverlay = is3DMode || this.hasAny3DContentAtFrame(project, frame, true);
+    const mats = this.computeCameraMatrices(project, frame, !usePerspectiveOverlay, true);
     if (is3DMode) {
       this.drawBlender3DFloorAndTriad(octx, project, mats, ow, oh);
     }
@@ -2488,17 +2944,17 @@ export class RendererEngine {
 
       let model = Mat4.identity();
       if (parentTf) {
-        model = Mat4.translate(model, parentTf.x, -parentTf.y, is3DMode ? (parentTf.z || 0) : 0);
+        model = Mat4.translate(model, parentTf.x, -parentTf.y, usePerspectiveOverlay ? (parentTf.z || 0) : 0);
         model = Mat4.rotateZ(model, (-parentTf.rotation * Math.PI) / 180);
-        if (is3DMode) {
+        if (usePerspectiveOverlay) {
           model = Mat4.rotateX(model, ((parentTf.rotX || 0) * Math.PI) / 180);
           model = Mat4.rotateY(model, ((parentTf.rotY || 0) * Math.PI) / 180);
         }
         model = Mat4.scale(model, parentTf.scaleX, parentTf.scaleY, 1);
       }
-      model = Mat4.translate(model, tf.x, -tf.y, is3DMode ? (tf.z || 0) : 0);
+      model = Mat4.translate(model, tf.x, -tf.y, usePerspectiveOverlay ? (tf.z || 0) : 0);
       model = Mat4.rotateZ(model, (-tf.rotation * Math.PI) / 180);
-      if (is3DMode) {
+      if (usePerspectiveOverlay) {
         model = Mat4.rotateX(model, ((tf.rotX || 0) * Math.PI) / 180);
         model = Mat4.rotateY(model, ((tf.rotY || 0) * Math.PI) / 180);
       }
@@ -2564,6 +3020,9 @@ export class RendererEngine {
         octx.textBaseline = 'middle';
         octx.fillText(camTag, cx, cy - half - 14);
         octx.restore();
+      }
+      if (this.chromaPickerOverlay?.active) {
+        this.drawChromaPickerLoupe(octx, ow, oh);
       }
       return;
     }
@@ -2648,6 +3107,61 @@ export class RendererEngine {
       octx.strokeStyle = '#FFFFFF';
       octx.stroke();
     }
+    octx.restore();
+
+    if (this.chromaPickerOverlay?.active) {
+      this.drawChromaPickerLoupe(octx, ow, oh);
+    }
+  }
+
+  drawChromaPickerLoupe(octx, ow, oh) {
+    const cp = this.chromaPickerOverlay;
+    if (!cp?.active) return;
+    const scaleX = ow / Math.max(1, this.overlay.clientWidth || ow);
+    const scaleY = oh / Math.max(1, this.overlay.clientHeight || oh);
+    const px = cp.pointerX != null ? cp.pointerX * scaleX : ow * 0.5;
+    const py = cp.pointerY != null ? cp.pointerY * scaleY : oh * 0.5;
+    const hex = cp.sampledHex || '#00FF00';
+
+    octx.save();
+    // Crosshair at exact sample point
+    octx.strokeStyle = '#FFFFFF';
+    octx.lineWidth = 2;
+    octx.beginPath();
+    octx.arc(px, py, 10, 0, Math.PI * 2);
+    octx.stroke();
+    octx.strokeStyle = '#071018';
+    octx.lineWidth = 1;
+    octx.beginPath();
+    octx.moveTo(px - 6, py); octx.lineTo(px + 6, py);
+    octx.moveTo(px, py - 6); octx.lineTo(px, py + 6);
+    octx.stroke();
+
+    // Floating CapCut-style color ring loupe above finger
+    const loupeY = Math.max(36, py - 46);
+    const loupeX = Math.max(36, Math.min(ow - 36, px));
+    octx.beginPath();
+    octx.arc(loupeX, loupeY, 22, 0, Math.PI * 2);
+    octx.fillStyle = hex;
+    octx.fill();
+    octx.lineWidth = 4;
+    octx.strokeStyle = '#FFFFFF';
+    octx.stroke();
+    octx.lineWidth = 1.5;
+    octx.strokeStyle = 'rgba(0,0,0,0.65)';
+    octx.stroke();
+
+    // Hex label pill
+    const lbl = hex;
+    octx.font = 'bold 10px system-ui, sans-serif';
+    const tw = octx.measureText(lbl).width + 10;
+    const pillY = loupeY + 26;
+    octx.fillStyle = 'rgba(11, 14, 20, 0.88)';
+    octx.fillRect(loupeX - tw / 2, pillY, tw, 15);
+    octx.fillStyle = '#FFFFFF';
+    octx.textAlign = 'center';
+    octx.textBaseline = 'middle';
+    octx.fillText(lbl, loupeX, pillY + 7.5);
     octx.restore();
   }
 

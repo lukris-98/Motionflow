@@ -16,6 +16,28 @@ const LAYER_ICONS = {
   camera: 'bi-camera-video-fill text-info'
 };
 
+export function computeCenterPadLeft(viewportWidth) {
+  return Math.max(0, Math.round((Number(viewportWidth) || 0) * 0.5));
+}
+
+export function frameToTimelineX(frame, pxPerFrame, padLeft = 0) {
+  return (Number(padLeft) || 0) + (Number(frame) || 0) * (Number(pxPerFrame) || 0);
+}
+
+export function timelineXToFrame(x, pxPerFrame, padLeft = 0) {
+  return ((Number(x) || 0) - (Number(padLeft) || 0)) / Math.max(MIN_PX_PER_FRAME, Number(pxPerFrame) || MIN_PX_PER_FRAME);
+}
+
+export function frameToCenterScrollLeft(frame, pxPerFrame, maxScrollLeft = Infinity) {
+  const raw = Math.max(0, (Number(frame) || 0) * (Number(pxPerFrame) || 0));
+  return Number.isFinite(maxScrollLeft) ? Math.max(0, Math.min(maxScrollLeft, raw)) : raw;
+}
+
+export function scrollLeftToCenterFrame(scrollLeft, pxPerFrame, totalFrames = Infinity) {
+  const raw = Math.round(Math.max(0, Number(scrollLeft) || 0) / Math.max(MIN_PX_PER_FRAME, Number(pxPerFrame) || MIN_PX_PER_FRAME));
+  return Number.isFinite(totalFrames) ? Math.max(0, Math.min(totalFrames, raw)) : Math.max(0, raw);
+}
+
 export function computeRulerLodSpec(pxPerFrame, fps = 30) {
   const safeFps = Math.max(1, Math.round(fps || 30));
   const wasmTier = WasmBridge.getRulerLodTier(pxPerFrame, safeFps);
@@ -265,6 +287,7 @@ export class TimelineView {
     this.cb = callbacks;
     this.pxPerFrame = 0.72; // Default overview (~21.6 px/s @ 30fps): 0s, 5s, 10s...; pinch zoom smoothly opens 1s, 2s, 3s...10s then frames
     this.scrollEl = document.getElementById('timelineScroll');
+    this.viewportEl = document.getElementById('timelineViewport');
     this.contentEl = document.getElementById('timelineContent');
     this.rulerCanvas = document.getElementById('rulerCanvas');
     this.headersList = document.getElementById('trackHeadersList');
@@ -290,7 +313,9 @@ export class TimelineView {
     this.pinchPivotFrame = 0;
     this.pinchPivotScreenX = 0;
     this._suppressBgTapUntil = 0;
+    this._suppressScrollSeekUntil = 0;
     this._pendingScrollLeft = null;
+    this._padLeft = computeCenterPadLeft(this.scrollEl?.clientWidth || this.viewportEl?.clientWidth || 360);
     this._lastRulerParams = null;
     this._lastTimelineMarkers = [];
     this._lastBeatMarkers = [];
@@ -319,6 +344,25 @@ export class TimelineView {
     this._bindModifierListeners();
     this.bindRulerAndScroll();
     this.bindPinchZoom();
+  }
+
+  _getPadLeft() {
+    const w = this.scrollEl?.clientWidth || this.viewportEl?.clientWidth || 360;
+    this._padLeft = computeCenterPadLeft(w);
+    return this._padLeft;
+  }
+
+  _syncPlayheadOverlayPosition() {
+    const padLeft = this._getPadLeft();
+    if (this.playheadEl) {
+      this.playheadEl.style.left = `${padLeft}px`;
+    }
+    return padLeft;
+  }
+
+  _computeTimelineContentWidth(totalFrames, pxPerFrame, viewportW, padLeft) {
+    const trailPad = Math.max(120, (viewportW - padLeft) + 24);
+    return Math.max(viewportW, Math.ceil(padLeft + totalFrames * pxPerFrame + trailPad));
   }
 
   _bindModifierListeners() {
@@ -355,7 +399,8 @@ export class TimelineView {
       this._hideSnapGuide();
       return;
     }
-    this.snapGuideEl.style.left = `${snapInfo.guideFrame * this.pxPerFrame}px`;
+    const padLeft = this._getPadLeft();
+    this.snapGuideEl.style.left = `${frameToTimelineX(snapInfo.guideFrame, this.pxPerFrame, padLeft)}px`;
     this.snapGuideEl.classList.remove('d-none', 'kind-clip', 'kind-playhead', 'kind-marker', 'kind-beat', 'kind-zero');
     const kind = snapInfo.kind || 'playhead';
     this.snapGuideEl.classList.add(`kind-${kind}`);
@@ -572,6 +617,7 @@ export class TimelineView {
     const oldPx = Math.max(MIN_PX_PER_FRAME, this.pxPerFrame);
     const clamped = Math.max(MIN_PX_PER_FRAME, Math.min(MAX_PX_PER_FRAME, Number(nextPx.toFixed(3))));
     const vw = Math.max(200, this.scrollEl?.clientWidth || 360);
+    const padLeft = computeCenterPadLeft(vw);
     const curScroll = this.scrollEl?.scrollLeft || 0;
 
     let pivotFrame;
@@ -580,14 +626,14 @@ export class TimelineView {
       pivotFrame = anchorFrame;
       pivotScreenX = explicitScreenX;
     } else {
-      const playheadX = (anchorFrame ?? 0) * oldPx;
+      const playheadX = frameToTimelineX(anchorFrame ?? 0, oldPx, padLeft);
       const inView = anchorFrame !== null && playheadX >= curScroll && playheadX <= curScroll + vw;
-      pivotScreenX = inView ? (playheadX - curScroll) : vw * 0.5;
-      pivotFrame = inView ? anchorFrame : (curScroll + pivotScreenX) / oldPx;
+      pivotScreenX = inView ? (playheadX - curScroll) : padLeft;
+      pivotFrame = inView ? anchorFrame : Math.max(0, timelineXToFrame(curScroll + pivotScreenX, oldPx, padLeft));
     }
 
     this.pxPerFrame = clamped;
-    this._pendingScrollLeft = Math.max(0, pivotFrame * clamped - pivotScreenX);
+    this._pendingScrollLeft = Math.max(0, frameToTimelineX(pivotFrame, clamped, padLeft) - pivotScreenX);
   }
 
   zoomIn(anchorFrame = null) {
@@ -609,12 +655,14 @@ export class TimelineView {
     if (!proj) return;
     const fps = Math.max(1, proj.fps || 30);
     const contentEnd = Math.max(fps * 2, TimelineEngine.getProjectContentEndFrame(proj));
-    const vw = Math.max(240, (this.scrollEl?.clientWidth || 360) - 44);
-    const fitPx = Math.max(MIN_PX_PER_FRAME, Math.min(MAX_PX_PER_FRAME, vw / contentEnd));
+    const vw = Math.max(240, this.scrollEl?.clientWidth || 360);
+    const padLeft = computeCenterPadLeft(vw);
+    const fitSpan = Math.max(120, vw - padLeft - 24);
+    const fitPx = Math.max(MIN_PX_PER_FRAME, Math.min(MAX_PX_PER_FRAME, fitSpan / contentEnd));
     this.pxPerFrame = Number(fitPx.toFixed(3));
     this.pinchTargetPx = this.pxPerFrame;
     this._pendingScrollLeft = 0;
-    this._applyFastZoomLayout();
+    this._applyFastZoomLayout({ preservePendingScroll: true });
     this._scheduleCrispRedraw(40);
   }
 
@@ -627,7 +675,7 @@ export class TimelineView {
           ? this.pinchTargetPx
           : this.pxPerFrame + diff * 0.42;
         this._setZoomAnchored(nextPx, this.pinchPivotFrame, this.pinchPivotScreenX);
-        this._applyFastZoomLayout();
+        this._applyFastZoomLayout({ preservePendingScroll: true });
         if (Math.abs(this.pinchTargetPx - this.pxPerFrame) >= 0.0025) {
           this._zoomRafId = requestAnimationFrame(step);
           return;
@@ -640,30 +688,36 @@ export class TimelineView {
     this._zoomRafId = requestAnimationFrame(step);
   }
 
-  _applyFastZoomLayout() {
+  _applyFastZoomLayout(opts = {}) {
     const ctx = this._lastRenderContext;
     const project = ctx?.project;
     if (!project) return;
     const fps = Math.max(1, project.fps || 30);
     const totalFrames = Math.max(project.durationFrames, fps * 5);
-    const totalWidth = Math.max(this.scrollEl.clientWidth || 360, Math.ceil(totalFrames * this.pxPerFrame) + 120);
+    const vw = Math.max(200, this.scrollEl?.clientWidth || 360);
+    const padLeft = this._syncPlayheadOverlayPosition();
+    const totalWidth = this._computeTimelineContentWidth(totalFrames, this.pxPerFrame, vw, padLeft);
 
     this.contentEl.style.width = `${totalWidth}px`;
-    if (this._pendingScrollLeft !== null) {
-      const maxScroll = Math.max(0, totalWidth - (this.scrollEl.clientWidth || 0));
+    const appliedPendingScroll = this._pendingScrollLeft !== null;
+    if (appliedPendingScroll) {
+      const maxScroll = Math.max(0, totalWidth - vw);
+      this._suppressScrollSeekUntil = performance.now() + 100;
       this.scrollEl.scrollLeft = Math.min(maxScroll, Math.max(0, this._pendingScrollLeft));
       this._pendingScrollLeft = null;
     }
 
     const px = this.pxPerFrame;
+    if (!opts.preservePendingScroll && !appliedPendingScroll && !this._isPinching) {
+      this.updatePlayhead(this.cb.getPlayheadFrame?.() ?? 0);
+    }
     this.drawRuler(totalWidth, fps, totalFrames);
-    this.updatePlayhead(this.cb.getPlayheadFrame?.() ?? 0);
     this._syncOverlayLineHeights();
 
     for (const ref of this._zoomRefs.clips) {
       const l = ref.layer;
-      const leftPx = l.startFrame * px;
-      const widthPx = Math.max(24, (l.endFrame - l.startFrame) * px);
+      const leftPx = frameToTimelineX(l.startFrame, px, padLeft);
+      const widthPx = Math.max(4, (l.endFrame - l.startFrame) * px);
       ref.clip.style.left = `${leftPx}px`;
       ref.clip.style.width = `${widthPx}px`;
 
@@ -684,30 +738,30 @@ export class TimelineView {
     }
 
     for (const s of this._zoomRefs.seams) {
-      s.el.style.left = `${s.frame * px}px`;
+      s.el.style.left = `${frameToTimelineX(s.frame, px, padLeft)}px`;
     }
     for (const ts of (this._zoomRefs.transSpans || [])) {
-      ts.el.style.left = `${ts.frame * px}px`;
+      ts.el.style.left = `${frameToTimelineX(ts.frame, px, padLeft)}px`;
       ts.el.style.width = `${Math.max(8, ts.durationFrames * px)}px`;
     }
     for (const g of this._zoomRefs.gaps) {
-      g.el.style.left = `${g.frame * px}px`;
+      g.el.style.left = `${frameToTimelineX(g.frame, px, padLeft)}px`;
     }
     for (const b of this._zoomRefs.addBtns) {
-      b.el.style.left = `${b.frame * px + 8}px`;
+      b.el.style.left = `${frameToTimelineX(b.frame, px, padLeft) + 8}px`;
     }
     for (const sp of this._zoomRefs.kfSpans) {
-      sp.el.style.left = `${sp.layer.startFrame * px}px`;
-      sp.el.style.width = `${Math.max(16, (sp.layer.endFrame - sp.layer.startFrame) * px)}px`;
+      sp.el.style.left = `${frameToTimelineX(sp.layer.startFrame, px, padLeft)}px`;
+      sp.el.style.width = `${Math.max(4, (sp.layer.endFrame - sp.layer.startFrame) * px)}px`;
     }
     for (const cn of this._zoomRefs.kfConnectors) {
-      const x1 = cn.fromFrame * px;
-      const x2 = cn.toFrame * px;
+      const x1 = frameToTimelineX(cn.fromFrame, px, padLeft);
+      const x2 = frameToTimelineX(cn.toFrame, px, padLeft);
       cn.el.style.left = `${x1}px`;
       cn.el.style.width = `${Math.max(0, x2 - x1)}px`;
     }
     for (const kd of this._zoomRefs.kfDiamonds) {
-      kd.el.style.left = `${kd.frame * px}px`;
+      kd.el.style.left = `${frameToTimelineX(kd.frame, px, padLeft)}px`;
     }
   }
 
@@ -715,16 +769,17 @@ export class TimelineView {
     clearTimeout(this._pinchEndTimer);
     this._pinchEndTimer = setTimeout(() => {
       if (this._isPinching) return;
+      const padLeft = this._getPadLeft();
       for (const entry of this._waveEntries) {
-        entry.leftPx = entry.layer.startFrame * this.pxPerFrame;
-        entry.widthPx = Math.max(24, (entry.layer.endFrame - entry.layer.startFrame) * this.pxPerFrame);
+        entry.leftPx = frameToTimelineX(entry.layer.startFrame, this.pxPerFrame, padLeft);
+        entry.widthPx = Math.max(4, (entry.layer.endFrame - entry.layer.startFrame) * this.pxPerFrame);
         entry.renderedStart = -1;
         entry.renderedEnd = -1;
       }
       for (const entry of this._filmstripEntries) {
         if (entry.layer) {
-          entry.leftPx = entry.layer.startFrame * this.pxPerFrame;
-          entry.widthPx = Math.max(24, (entry.layer.endFrame - entry.layer.startFrame) * this.pxPerFrame);
+          entry.leftPx = frameToTimelineX(entry.layer.startFrame, this.pxPerFrame, padLeft);
+          entry.widthPx = Math.max(4, (entry.layer.endFrame - entry.layer.startFrame) * this.pxPerFrame);
         }
         entry.renderedStart = -1;
         entry.renderedEnd = -1;
@@ -748,9 +803,10 @@ export class TimelineView {
     this.pinchStartPx = this.pxPerFrame;
     this.pinchTargetPx = this.pxPerFrame;
     const rect = this.scrollEl.getBoundingClientRect();
+    const padLeft = this._getPadLeft();
     const midScreenX = Math.max(0, ((x1 + x2) * 0.5) - rect.left);
     this.pinchPivotScreenX = midScreenX;
-    this.pinchPivotFrame = (this.scrollEl.scrollLeft + midScreenX) / Math.max(MIN_PX_PER_FRAME, this.pxPerFrame);
+    this.pinchPivotFrame = Math.max(0, timelineXToFrame(this.scrollEl.scrollLeft + midScreenX, this.pxPerFrame, padLeft));
   }
 
   _updatePinchSession(x1, y1, x2, y2) {
@@ -772,8 +828,11 @@ export class TimelineView {
       this._suppressBgTapUntil = performance.now() + 280;
       if (Math.abs(this.pinchTargetPx - this.pxPerFrame) >= 0.002) {
         this._setZoomAnchored(this.pinchTargetPx, this.pinchPivotFrame, this.pinchPivotScreenX);
-        this._applyFastZoomLayout();
+        this._applyFastZoomLayout({ preservePendingScroll: true });
       }
+      const maxF = this._lastRulerParams?.totalFrames ?? Infinity;
+      const centerFrame = scrollLeftToCenterFrame(this.scrollEl?.scrollLeft || 0, this.pxPerFrame, maxF);
+      this.cb.onScrollSeekFrame?.(centerFrame);
       this._scheduleCrispRedraw(70);
     }
   }
@@ -839,21 +898,45 @@ export class TimelineView {
   }
 
   bindRulerAndScroll() {
+    const clearProgrammaticLock = () => { this._suppressScrollSeekUntil = 0; };
+    this.scrollEl.addEventListener('pointerdown', clearProgrammaticLock, { passive: true });
+    this.scrollEl.addEventListener('touchstart', clearProgrammaticLock, { passive: true });
+    this.scrollEl.addEventListener('wheel', (e) => {
+      if (!e.ctrlKey && !e.metaKey) clearProgrammaticLock();
+    }, { passive: true });
+
     this.scrollEl.addEventListener('scroll', () => {
       this._cancelHoverTooltip();
       this.headersList.scrollTop = this.scrollEl.scrollTop;
-      if (this._lastRulerParams && Math.abs(this.scrollEl.scrollLeft - this._lastDrawnScrollLeft) >= 1) {
+      if (this._lastRulerParams && Math.abs(this.scrollEl.scrollLeft - this._lastDrawnScrollLeft) >= 0.5) {
         this.redrawRulerOnly();
         this.redrawVisibleClipCanvases();
+      }
+      if (
+        performance.now() >= (this._suppressScrollSeekUntil || 0) &&
+        !this._isPinching &&
+        !this.isScrubbing
+      ) {
+        const maxF = this._lastRulerParams?.totalFrames ?? Infinity;
+        const centerFrame = scrollLeftToCenterFrame(this.scrollEl.scrollLeft, this.pxPerFrame, maxF);
+        this.cb.onScrollSeekFrame?.(centerFrame);
       }
     });
     this.headersList.addEventListener('scroll', () => {
       this.scrollEl.scrollTop = this.headersList.scrollTop;
     });
     if (typeof ResizeObserver !== 'undefined' && this.scrollEl) {
+      let lastObservedW = this.scrollEl.clientWidth || 0;
       this._rulerResizeObs = new ResizeObserver(() => {
+        const curW = this.scrollEl?.clientWidth || 0;
+        const widthChanged = Math.abs(curW - lastObservedW) >= 1;
+        lastObservedW = curW;
+        this._syncPlayheadOverlayPosition();
         this._syncOverlayLineHeights();
-        if (this._lastRulerParams) {
+        if (widthChanged && this._lastRenderContext?.project) {
+          this._applyFastZoomLayout();
+          this.redrawVisibleClipCanvases();
+        } else if (this._lastRulerParams) {
           this.redrawRulerOnly();
           this.redrawVisibleClipCanvases();
         }
@@ -867,9 +950,10 @@ export class TimelineView {
     let lastScrubShowTip = false;
     const seekFromPointer = (clientX, showTip = false) => {
       const rect = this.scrollEl.getBoundingClientRect();
-      const x = Math.max(0, (clientX - rect.left) + this.scrollEl.scrollLeft);
+      const padLeft = this._getPadLeft();
+      const x = (clientX - rect.left) + this.scrollEl.scrollLeft;
       const maxFrame = this._lastRulerParams?.totalFrames ?? 99999;
-      const frame = Math.max(0, Math.min(maxFrame, Math.round(x / Math.max(MIN_PX_PER_FRAME, this.pxPerFrame))));
+      const frame = Math.max(0, Math.min(maxFrame, Math.round(timelineXToFrame(x, this.pxPerFrame, padLeft))));
       if (showTip && this.dragTooltipEl) {
         const fps = Math.max(1, this._lastRulerParams?.fps || 30);
         const sec = (frame / fps).toFixed(2);
@@ -887,6 +971,7 @@ export class TimelineView {
       const maxScroll = Math.max(0, this.scrollEl.scrollWidth - this.scrollEl.clientWidth);
       const nextScroll = Math.max(0, Math.min(maxScroll, this.scrollEl.scrollLeft + step));
       if (nextScroll === this.scrollEl.scrollLeft) return;
+      this._suppressScrollSeekUntil = performance.now() + 90;
       this.scrollEl.scrollLeft = nextScroll;
       this.redrawRulerOnly();
       this.redrawVisibleClipCanvases();
@@ -936,12 +1021,13 @@ export class TimelineView {
     this.rulerCanvas.addEventListener('pointerdown', (e) => {
       rulerDownX = e.clientX;
       const rect = this.scrollEl.getBoundingClientRect();
+      const padLeft = this._getPadLeft();
       const x = (e.clientX - rect.left) + this.scrollEl.scrollLeft;
       rulerDownMarker = null;
       for (const m of (this._lastTimelineMarkers || [])) {
         const mf = typeof m === 'number' ? m : Number(m?.frame);
         if (!Number.isFinite(mf)) continue;
-        if (Math.abs(mf * this.pxPerFrame - x) <= 10) {
+        if (Math.abs(frameToTimelineX(mf, this.pxPerFrame, padLeft) - x) <= 10) {
           rulerDownMarker = m;
           break;
         }
@@ -963,10 +1049,47 @@ export class TimelineView {
     });
 
     if (this.playheadEl) {
-      this.playheadEl.addEventListener('pointerdown', (e) => startScrub(this.playheadEl, e, true));
-      this.playheadEl.addEventListener('pointermove', (e) => moveScrub(e, true));
-      this.playheadEl.addEventListener('pointerup', endScrub);
-      this.playheadEl.addEventListener('pointercancel', endScrub);
+      let phDragging = false;
+      let phLastX = 0;
+      const onPhMove = (e) => {
+        if (!phDragging || !this.scrollEl) return;
+        const dx = phLastX - e.clientX;
+        phLastX = e.clientX;
+        const maxScroll = Math.max(0, this.scrollEl.scrollWidth - this.scrollEl.clientWidth);
+        const nextScroll = Math.max(0, Math.min(maxScroll, this.scrollEl.scrollLeft + dx));
+        this._suppressScrollSeekUntil = performance.now() + 90;
+        this.scrollEl.scrollLeft = nextScroll;
+        const maxF = this._lastRulerParams?.totalFrames ?? 99999;
+        const frame = scrollLeftToCenterFrame(nextScroll, this.pxPerFrame, maxF);
+        if (this.dragTooltipEl) {
+          const fps = Math.max(1, this._lastRulerParams?.fps || 30);
+          this.dragTooltipEl.textContent = `Playhead · ${(frame / fps).toFixed(2)}s (F${frame})`;
+          this.dragTooltipEl.classList.remove('d-none');
+        }
+        this.cb.onScrollSeekFrame?.(frame);
+      };
+      const endPh = () => {
+        if (!phDragging) return;
+        phDragging = false;
+        this.isScrubbing = false;
+        this.playheadEl?.classList.remove('dragging');
+        this.dragTooltipEl?.classList.add('d-none');
+        this.cb.onScrubEnd?.();
+      };
+      this.playheadEl.addEventListener('pointerdown', (e) => {
+        if (this._isPinching || this.activePointers.size >= 2) return;
+        e.stopPropagation();
+        e.preventDefault();
+        phDragging = true;
+        phLastX = e.clientX;
+        this.isScrubbing = true;
+        this.playheadEl.classList.add('dragging');
+        try { this.playheadEl.setPointerCapture(e.pointerId); } catch {}
+        this.cb.onScrubStart?.();
+      });
+      this.playheadEl.addEventListener('pointermove', onPhMove);
+      this.playheadEl.addEventListener('pointerup', endPh);
+      this.playheadEl.addEventListener('pointercancel', endPh);
     }
 
     // Ctrl/Cmd + Wheel zoom anchored under cursor
@@ -974,12 +1097,15 @@ export class TimelineView {
       if (!e.ctrlKey && !e.metaKey) return;
       e.preventDefault();
       const rect = this.scrollEl.getBoundingClientRect();
+      const padLeft = this._getPadLeft();
       const cursorX = Math.max(0, e.clientX - rect.left);
-      const cursorFrame = (this.scrollEl.scrollLeft + cursorX) / Math.max(MIN_PX_PER_FRAME, this.pxPerFrame);
+      const cursorFrame = Math.max(0, timelineXToFrame(this.scrollEl.scrollLeft + cursorX, this.pxPerFrame, padLeft));
       const factor = Math.exp(-e.deltaY * 0.0026);
       this._setZoomAnchored(this.pxPerFrame * factor, cursorFrame, cursorX);
       this.pinchTargetPx = this.pxPerFrame;
-      this._applyFastZoomLayout();
+      this._applyFastZoomLayout({ preservePendingScroll: true });
+      const maxF = this._lastRulerParams?.totalFrames ?? Infinity;
+      this.cb.onScrollSeekFrame?.(scrollLeftToCenterFrame(this.scrollEl.scrollLeft, this.pxPerFrame, maxF));
       this._scheduleCrispRedraw(70);
     }, { passive: false });
 
@@ -1080,16 +1206,22 @@ export class TimelineView {
   render(project, currentFrame, selectedLayerId, audioEngine, mediaMap = null) {
     const fps = Math.max(1, project.fps || 30);
     const totalFrames = Math.max(project.durationFrames, fps * 5);
-    const totalWidth = Math.max(this.scrollEl.clientWidth || 360, Math.ceil(totalFrames * this.pxPerFrame) + 120);
+    const vw = Math.max(200, this.scrollEl.clientWidth || 360);
+    const padLeft = this._syncPlayheadOverlayPosition();
+    const totalWidth = this._computeTimelineContentWidth(totalFrames, this.pxPerFrame, vw, padLeft);
 
     this.contentEl.style.width = `${totalWidth}px`;
-    if (this._pendingScrollLeft !== null) {
-      const maxScroll = Math.max(0, totalWidth - (this.scrollEl.clientWidth || 0));
+    const hasPendingScroll = this._pendingScrollLeft !== null;
+    if (hasPendingScroll) {
+      const maxScroll = Math.max(0, totalWidth - vw);
+      this._suppressScrollSeekUntil = performance.now() + 90;
       this.scrollEl.scrollLeft = Math.min(maxScroll, Math.max(0, this._pendingScrollLeft));
       this._pendingScrollLeft = null;
     }
 
-    this.layerCountEl.textContent = String(project.layers.length);
+    if (this.layerCountEl) {
+      this.layerCountEl.textContent = String(project.layers.length);
+    }
 
     // Prune checked ids no longer in project
     const validIds = new Set(project.layers.map((l) => l.id));
@@ -1100,8 +1232,10 @@ export class TimelineView {
     this._lastTimelineMarkers = Array.isArray(project.markers) ? project.markers : [];
     this._lastBeatMarkers = Array.isArray(project.beatMarkers) ? project.beatMarkers : [];
 
+    if (!hasPendingScroll) {
+      this.updatePlayhead(currentFrame);
+    }
     this.drawRuler(totalWidth, fps, totalFrames);
-    this.updatePlayhead(currentFrame);
     this.renderHeadersAndLanes(project, selectedLayerId, audioEngine, mediaMap);
     this._syncOverlayLineHeights();
     this._renderKfFloatingBar(project);
@@ -1114,7 +1248,6 @@ export class TimelineView {
     const targetH = Math.max(viewportH, rulerH + lanesH);
     if (targetH > 0) {
       if (this.contentEl) this.contentEl.style.height = `${targetH}px`;
-      if (this.playheadEl) this.playheadEl.style.height = `${targetH}px`;
       if (this.snapGuideEl) this.snapGuideEl.style.height = `${targetH}px`;
     }
   }
@@ -1130,7 +1263,8 @@ export class TimelineView {
     this._lastRulerParams = { totalWidth, fps: safeFps, totalFrames };
 
     const canvas = this.rulerCanvas;
-    const viewportW = Math.max(300, Math.ceil(this.scrollEl?.clientWidth || totalWidth || 360));
+    const viewportW = Math.max(200, Math.ceil(this.scrollEl?.clientWidth || totalWidth || 360));
+    const padLeft = this._getPadLeft();
     const scrollLeft = Math.max(0, this.scrollEl?.scrollLeft || 0);
     this._lastDrawnScrollLeft = scrollLeft;
 
@@ -1152,17 +1286,24 @@ export class TimelineView {
     ctx.fillStyle = isLight ? '#f8fafc' : '#131822';
     ctx.fillRect(0, 0, viewportW, 28);
 
+    // Subtle pre-0s lead-in area to the left of frame 0 when scrolled near the start
+    const zeroLocalX = frameToTimelineX(0, this.pxPerFrame, padLeft) - scrollLeft;
+    if (zeroLocalX > 0) {
+      ctx.fillStyle = isLight ? 'rgba(15, 23, 42, 0.05)' : 'rgba(4, 7, 13, 0.45)';
+      ctx.fillRect(0, 0, Math.min(viewportW, zeroLocalX), 28);
+    }
+
     const spec = computeDynamicRulerTicks(this.pxPerFrame, safeFps);
     const minorStep = Math.max(1, spec.minorFrames);
-    const startFrame = Math.max(0, Math.floor(Math.max(0, scrollLeft - 90) / this.pxPerFrame / minorStep) * minorStep);
-    const endFrame = Math.ceil((scrollLeft + viewportW + 90) / Math.max(MIN_PX_PER_FRAME, this.pxPerFrame));
+    const startFrame = Math.max(0, Math.floor(Math.max(0, (scrollLeft - padLeft - 90) / this.pxPerFrame) / minorStep) * minorStep);
+    const endFrame = Math.max(0, Math.ceil((scrollLeft - padLeft + viewportW + 90) / Math.max(MIN_PX_PER_FRAME, this.pxPerFrame)));
 
     ctx.font = '10px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
     ctx.textBaseline = 'top';
     let lastLabelRight = -100;
 
     for (let f = startFrame; f <= endFrame; f += minorStep) {
-      const localX = f * this.pxPerFrame - scrollLeft;
+      const localX = frameToTimelineX(f, this.pxPerFrame, padLeft) - scrollLeft;
       if (localX < -80 || localX > viewportW + 80) continue;
       const x = Math.round(localX) + 0.5;
 
@@ -1204,7 +1345,7 @@ export class TimelineView {
     }
 
     // Subtle marker showing project content duration boundary along the continuous ruler
-    const durX = Math.round(totalFrames * this.pxPerFrame - scrollLeft) + 0.5;
+    const durX = Math.round(frameToTimelineX(totalFrames, this.pxPerFrame, padLeft) - scrollLeft) + 0.5;
     if (durX >= 0 && durX <= viewportW) {
       ctx.save();
       ctx.strokeStyle = isLight ? 'rgba(2, 132, 199, 0.55)' : 'rgba(0, 229, 255, 0.45)';
@@ -1222,7 +1363,7 @@ export class TimelineView {
       for (const m of this._lastTimelineMarkers) {
         const mf = typeof m === 'number' ? m : Number(m?.frame);
         if (!Number.isFinite(mf)) continue;
-        const mx = mf * this.pxPerFrame - scrollLeft;
+        const mx = frameToTimelineX(mf, this.pxPerFrame, padLeft) - scrollLeft;
         if (mx < -12 || mx > viewportW + 12) continue;
         const color = (typeof m === 'object' && m?.color) ? m.color : '#34d399';
         ctx.strokeStyle = color;
@@ -1249,7 +1390,7 @@ export class TimelineView {
     if (this._lastBeatMarkers.length > 0) {
       ctx.save();
       for (const bf of this._lastBeatMarkers) {
-        const bx = bf * this.pxPerFrame - scrollLeft;
+        const bx = frameToTimelineX(bf, this.pxPerFrame, padLeft) - scrollLeft;
         if (bx < -10 || bx > viewportW + 10) continue;
         ctx.fillStyle = '#ffab40';
         ctx.strokeStyle = '#071018';
@@ -1268,13 +1409,24 @@ export class TimelineView {
   }
 
   updatePlayhead(currentFrame) {
-    const x = Math.max(0, currentFrame * this.pxPerFrame);
-    this.playheadEl.style.transform = `translateX(${x}px)`;
+    this._syncPlayheadOverlayPosition();
+    if (!this.scrollEl) return;
+    const maxScroll = Math.max(0, this.scrollEl.scrollWidth - this.scrollEl.clientWidth);
+    const targetScroll = frameToCenterScrollLeft(currentFrame, this.pxPerFrame, maxScroll);
+    if (Math.abs(this.scrollEl.scrollLeft - targetScroll) >= 0.5) {
+      this._suppressScrollSeekUntil = performance.now() + 90;
+      this.scrollEl.scrollLeft = targetScroll;
+      if (this._lastRulerParams && Math.abs(this.scrollEl.scrollLeft - this._lastDrawnScrollLeft) >= 0.5) {
+        this.redrawRulerOnly();
+        this.redrawVisibleClipCanvases();
+      }
+    }
   }
 
   _buildClipElement(project, layer, isSelected, audioEngine, mediaMap) {
-    const leftPx = layer.startFrame * this.pxPerFrame;
-    const widthPx = Math.max(24, (layer.endFrame - layer.startFrame) * this.pxPerFrame);
+    const padLeft = this._getPadLeft();
+    const leftPx = frameToTimelineX(layer.startFrame, this.pxPerFrame, padLeft);
+    const widthPx = Math.max(4, (layer.endFrame - layer.startFrame) * this.pxPerFrame);
     const isMulti = !isSelected && this.selectedLayerIds.has(layer.id);
 
     let adjClass = '';
@@ -1426,7 +1578,7 @@ export class TimelineView {
 
     const cx = 108;
     const cy = 108;
-    const radius = actions.length <= 4 ? 66 : 72;
+    const radius = actions.length >= 7 ? 76 : actions.length <= 4 ? 66 : 72;
     actions.forEach((act, idx) => {
       const angle = -Math.PI / 2 + (2 * Math.PI * idx) / Math.max(1, actions.length);
       const nx = cx + Math.cos(angle) * radius;
@@ -1523,13 +1675,91 @@ export class TimelineView {
     this._renderActiveWheelNodes();
   }
 
+  _resolveZoneOrder(project) {
+    const saved = Array.isArray(project?.settings?.zoneOrder) ? project.settings.zoneOrder : null;
+    const def = ['overlay', 'main', 'audio'];
+    if (!saved) return def;
+    const filtered = saved.filter((z) => def.includes(z));
+    for (const z of def) {
+      if (!filtered.includes(z)) filtered.push(z);
+    }
+    return filtered;
+  }
+
+  _bindTrackHeaderDrag(dragHandle, sourceZone, layerIndex = null, layerId = null) {
+    let draggingRow = false;
+    let allRows = [];
+    let activeTarget = null;
+
+    const resolveTarget = (clientY) => {
+      if (allRows.length === 0) return null;
+      let best = allRows[0];
+      let bestDist = Infinity;
+      for (const r of allRows) {
+        const d = Math.abs(clientY - r.midY);
+        if (d < bestDist) {
+          bestDist = d;
+          best = r;
+        }
+      }
+      return best;
+    };
+
+    dragHandle.addEventListener('pointerdown', (e) => {
+      e.stopPropagation();
+      e.preventDefault();
+      draggingRow = true;
+      allRows = [...this.headersList.querySelectorAll('.mf-track-header-item[data-zone]')].map((el) => {
+        const rect = el.getBoundingClientRect();
+        return {
+          el,
+          zone: el.dataset.zone,
+          layerId: el.dataset.layerId || null,
+          layerIndex: el.dataset.index !== undefined ? Number(el.dataset.index) : null,
+          midY: rect.top + rect.height * 0.5
+        };
+      });
+      activeTarget = null;
+      try { dragHandle.setPointerCapture(e.pointerId); } catch {}
+    });
+
+    dragHandle.addEventListener('pointermove', (e) => {
+      if (!draggingRow) return;
+      activeTarget = resolveTarget(e.clientY);
+      this.headersList.querySelectorAll('.mf-track-header-item').forEach((el) => {
+        const isSelf = layerId ? el.dataset.layerId === layerId : (el.dataset.zone === 'main' && sourceZone === 'main');
+        const isMatch = activeTarget && el === activeTarget.el && !isSelf;
+        el.classList.toggle('drag-over', Boolean(isMatch));
+      });
+    });
+
+    const finishReorder = (e) => {
+      if (!draggingRow) return;
+      draggingRow = false;
+      const tgt = resolveTarget(e.clientY) || activeTarget;
+      this.headersList.querySelectorAll('.mf-track-header-item').forEach((el) => el.classList.remove('drag-over'));
+      if (!tgt) return;
+
+      if (sourceZone !== 'main' && tgt.zone === sourceZone && layerId && tgt.layerIndex !== null && tgt.layerIndex !== layerIndex) {
+        this.cb.onReorderLayerToIndex?.(layerId, tgt.layerIndex);
+      } else if (tgt.zone && tgt.zone !== sourceZone) {
+        const curZones = this._resolveZoneOrder(this._lastRenderContext?.project);
+        const srcPos = curZones.indexOf(sourceZone);
+        const tgtPos = curZones.indexOf(tgt.zone);
+        const insertBefore = e.clientY <= tgt.midY;
+        if (srcPos !== -1 && tgtPos !== -1) {
+          this.cb.onReorderTrackZone?.(sourceZone, tgt.zone, insertBefore);
+        }
+      }
+    };
+    dragHandle.addEventListener('pointerup', finishReorder);
+    dragHandle.addEventListener('pointercancel', finishReorder);
+  }
+
   _appendSingleLayerRow(project, layer, selectedLayerId, audioEngine, mediaMap, junctionByLeftId) {
     const layerIndex = project.layers.findIndex((l) => l.id === layer.id);
     const isSelected = layer.id === selectedLayerId;
-    const isChecked = this.checkedLayerIds.has(layer.id);
     const isCompact = Boolean(layer.trackCompact);
-    const isSticker = Boolean(layer.mediaId?.startsWith('stk_'));
-    const hasMuteControl = layer.type === 'audio' || layer.type === 'video';
     const isMuted = Boolean(layer.audioProps?.muted);
     const zone = layer.type === 'audio' ? 'audio' : 'overlay';
 
@@ -1539,22 +1769,7 @@ export class TimelineView {
     hdr.dataset.layerId = layer.id;
     hdr.dataset.layerType = layer.type;
     hdr.dataset.zone = zone;
-    const roleHint = layer.type === 'camera'
-      ? 'CAM · '
-      : layer.type === 'adjustment'
-        ? 'FX · '
-        : isSticker
-          ? 'STK · '
-          : layer.type === 'video' || layer.type === 'image'
-            ? 'PIP · '
-            : layer.type === 'text'
-              ? 'TXT · '
-              : layer.type === 'shape'
-                ? 'SHP · '
-                : '';
-    const iconCls = isSticker ? 'bi-emoji-smile text-warning' : (LAYER_ICONS[layer.type] || 'bi-layers');
 
-    const hasKfs = KeyframeEngine.getAllKeyframeFrames(layer).length > 0;
     const isKfExpanded = Boolean(layer.kfExpanded);
     const hasTrackStatusAlert = isMuted || !layer.visible || layer.locked || isKfExpanded;
     const wheelDotClass = layer.locked
@@ -1568,76 +1783,17 @@ export class TimelineView {
             : '';
 
     hdr.innerHTML = `
-      <div class="d-flex align-items-center gap-1 min-w-0 flex-grow-1 overflow-hidden">
-        <span class="mf-drag-handle flex-shrink-0" title="Drag to Reorder Z-Stack"><i class="bi bi-grip-vertical"></i></span>
-        ${layer.type !== 'group' ? `<input type="checkbox" class="form-check-input m-0 flex-shrink-0" style="width:11px;height:11px;" ${isChecked ? 'checked' : ''} aria-label="Select for Group" />` : ''}
-        <i class="bi ${iconCls} small flex-shrink-0"></i>
-        <span class="mf-track-title min-w-0">${roleHint}${this.escapeHtml(layer.name)}</span>
-      </div>
-      <div class="d-flex align-items-center flex-shrink-0">
-        <button type="button" class="mf-track-wheel-btn ${hasTrackStatusAlert ? 'has-alert' : ''}" data-act="open-wheel" title="Buka Kontrol Track" aria-label="Buka Roda Kontrol Track ${this.escapeHtml(layer.name)}">
-          <i class="bi bi-sliders"></i>
-          ${wheelDotClass ? `<span class="mf-wheel-status-dot ${wheelDotClass}"></span>` : ''}
-        </button>
-      </div>
+      <button type="button" class="mf-drag-handle flex-shrink-0" title="Geser naik/turun urutan track (${this.escapeHtml(layer.name)})" aria-label="Geser urutan track ${this.escapeHtml(layer.name)}">
+        <i class="bi bi-grip-vertical"></i>
+      </button>
+      <button type="button" class="mf-track-wheel-btn flex-shrink-0 ${hasTrackStatusAlert ? 'has-alert' : ''}" data-act="open-wheel" title="${this.escapeHtml(layer.name)} · Buka Roda Kontrol" aria-label="Buka Roda Kontrol Track ${this.escapeHtml(layer.name)}">
+        <i class="bi bi-sliders"></i>
+        ${wheelDotClass ? `<span class="mf-wheel-status-dot ${wheelDotClass}"></span>` : ''}
+      </button>
     `;
 
-    const cbEl = hdr.querySelector('input[type="checkbox"]');
-    if (cbEl) {
-      cbEl.addEventListener('click', (e) => {
-        e.stopPropagation();
-        if (cbEl.checked) this.checkedLayerIds.add(layer.id);
-        else this.checkedLayerIds.delete(layer.id);
-        this.btnGroupChecked?.classList.toggle('d-none', this.checkedLayerIds.size < 2);
-      });
-    }
-
     const dragHandle = hdr.querySelector('.mf-drag-handle');
-    let draggingRow = false;
-    let zoneRows = [];
-    let currentTargetIdx = layerIndex;
-    const resolveTargetRowIdx = (clientY) => {
-      if (zoneRows.length === 0) return layerIndex;
-      let best = zoneRows[0];
-      let bestDist = Infinity;
-      for (const r of zoneRows) {
-        const d = Math.abs(clientY - r.midY);
-        if (d < bestDist) {
-          bestDist = d;
-          best = r;
-        }
-      }
-      return best.layerIndex;
-    };
-    dragHandle.addEventListener('pointerdown', (e) => {
-      e.stopPropagation();
-      draggingRow = true;
-      currentTargetIdx = layerIndex;
-      zoneRows = [...this.headersList.querySelectorAll(`.mf-track-header-item[data-layer-id][data-zone="${zone}"]`)].map((el) => {
-        const rect = el.getBoundingClientRect();
-        return { el, layerIndex: Number(el.dataset.index), midY: rect.top + rect.height * 0.5 };
-      });
-      dragHandle.setPointerCapture(e.pointerId);
-    });
-    dragHandle.addEventListener('pointermove', (e) => {
-      if (!draggingRow) return;
-      currentTargetIdx = resolveTargetRowIdx(e.clientY);
-      this.headersList.querySelectorAll('.mf-track-header-item[data-layer-id]').forEach((el) => {
-        const elIdx = Number(el.dataset.index);
-        el.classList.toggle('drag-over', elIdx === currentTargetIdx && elIdx !== layerIndex);
-      });
-    });
-    const finishReorder = (e) => {
-      if (!draggingRow) return;
-      draggingRow = false;
-      const targetIdx = resolveTargetRowIdx(e.clientY);
-      this.headersList.querySelectorAll('.mf-track-header-item').forEach((el) => el.classList.remove('drag-over'));
-      if (targetIdx !== layerIndex) {
-        this.cb.onReorderLayerToIndex(layer.id, targetIdx);
-      }
-    };
-    dragHandle.addEventListener('pointerup', finishReorder);
-    dragHandle.addEventListener('pointercancel', finishReorder);
+    this._bindTrackHeaderDrag(dragHandle, zone, layerIndex, layer.id);
 
     hdr.addEventListener('click', (e) => {
       const btn = e.target.closest('button[data-act="open-wheel"]');
@@ -1724,12 +1880,13 @@ export class TimelineView {
   }
 
   _appendSeamButton(lane, junc) {
+    const padLeft = this._getPadLeft();
     const hasTr = junc.type && junc.type !== 'none';
     let spanEl = null;
     if (hasTr) {
       spanEl = document.createElement('div');
       spanEl.className = 'mf-trans-span';
-      spanEl.style.left = `${junc.seamFrame * this.pxPerFrame}px`;
+      spanEl.style.left = `${frameToTimelineX(junc.seamFrame, this.pxPerFrame, padLeft)}px`;
       spanEl.style.width = `${Math.max(8, junc.durationFrames * this.pxPerFrame)}px`;
       lane.appendChild(spanEl);
       this._zoomRefs.transSpans.push({ el: spanEl, frame: junc.seamFrame, durationFrames: junc.durationFrames });
@@ -1740,7 +1897,7 @@ export class TimelineView {
     seamBtn.className = `mf-trans-seam-btn ${hasTr ? 'has-trans' : ''}`;
     seamBtn.dataset.leftId = junc.leftId;
     seamBtn.dataset.rightId = junc.rightId;
-    seamBtn.style.left = `${junc.seamFrame * this.pxPerFrame}px`;
+    seamBtn.style.left = `${frameToTimelineX(junc.seamFrame, this.pxPerFrame, padLeft)}px`;
     seamBtn.title = hasTr
       ? `Transition (${junc.type} · ${junc.durationFrames}f) — Drag horizontal to resize from center`
       : `Add transition between ${junc.left.name} & ${junc.right.name}`;
@@ -1797,6 +1954,7 @@ export class TimelineView {
   }
 
   _appendMainTrackRow(project, mainClips, selectedLayerId, audioEngine, mediaMap, junctionByLeftId) {
+    const padLeft = this._getPadLeft();
     const anySelected = mainClips.some((c) => c.id === selectedLayerId);
     const rippleOn = project.settings?.rippleMode !== false;
     const isMainCompact = Boolean(project.settings?.mainTrackCompact);
@@ -1824,33 +1982,23 @@ export class TimelineView {
               ? 'is-magnet'
               : '';
 
-    const thumbSrc = resolveMainTrackThumbSrc(project, mediaMap);
     const hdr = document.createElement('div');
     hdr.className = `mf-track-header-item main-track d-flex align-items-center justify-content-between ${anySelected ? 'selected' : ''} ${isMainCompact ? 'compact' : ''}`.trim();
     hdr.dataset.zone = 'main';
     hdr.innerHTML = `
-      <div class="d-flex align-items-center gap-1 min-w-0 flex-grow-1 overflow-hidden">
-        <button type="button" class="mf-main-thumb-box ${thumbSrc ? 'has-thumb' : 'is-empty'} ${isMainCompact ? 'compact' : ''}" data-act="main-thumb" title="${thumbSrc ? 'Cover / Thumbnail Main Track (Ketuk untuk perbarui)' : 'Tambah Thumbnail / Media Main Track'}" aria-label="${thumbSrc ? 'Thumbnail Main Track' : 'Tambah Thumbnail atau Media Main Track'}">
-          ${thumbSrc ? `<img src="${thumbSrc}" alt="Main Cover" loading="lazy" decoding="async" />` : `<i class="bi bi-plus-lg"></i>`}
-        </button>
-        <span class="mf-track-title text-info min-w-0">Main</span>
-        <span class="badge bg-info bg-opacity-25 text-info px-1 flex-shrink-0" style="font-size:0.54rem;">${mainClips.length}</span>
-      </div>
-      <div class="d-flex align-items-center flex-shrink-0">
-        <button type="button" class="mf-track-wheel-btn ${mainDotClass ? 'has-alert' : ''}" data-act="open-wheel" title="Buka Kontrol Main Track" aria-label="Buka Roda Kontrol Main Track">
-          <i class="bi bi-sliders"></i>
-          ${mainDotClass ? `<span class="mf-wheel-status-dot ${mainDotClass}"></span>` : ''}
-        </button>
-      </div>
+      <button type="button" class="mf-drag-handle main-handle flex-shrink-0" title="Geser naik/turun posisi Track Utama" aria-label="Geser posisi Track Utama">
+        <i class="bi bi-grip-vertical"></i>
+      </button>
+      <button type="button" class="mf-track-wheel-btn flex-shrink-0 ${mainDotClass ? 'has-alert' : ''}" data-act="open-wheel" title="Track Utama · Buka Roda Kontrol & Cover" aria-label="Buka Roda Kontrol Track Utama">
+        <i class="bi bi-sliders"></i>
+        ${mainDotClass ? `<span class="mf-wheel-status-dot ${mainDotClass}"></span>` : ''}
+      </button>
     `;
 
+    const mainDragHandle = hdr.querySelector('.mf-drag-handle');
+    this._bindTrackHeaderDrag(mainDragHandle, 'main', null, null);
+
     hdr.addEventListener('click', (e) => {
-      const thumbBtn = e.target.closest('button[data-act="main-thumb"]');
-      if (thumbBtn) {
-        e.stopPropagation();
-        this.cb.onMainTrackThumbClick?.();
-        return;
-      }
       const btn = e.target.closest('button[data-act="open-wheel"]');
       if (btn) {
         e.stopPropagation();
@@ -1869,8 +2017,19 @@ export class TimelineView {
           const liveMuted = liveAud.length > 0 && liveAud.every((c) => c.audioProps.muted);
           const liveKfs = liveMain.some((c) => KeyframeEngine.getAllKeyframeFrames(c).length > 0);
           const liveKfExp = Boolean(liveActive?.kfExpanded);
+          const hasCover = Boolean(curProject?.coverDataUrl);
 
           return [
+            {
+              icon: hasCover ? 'bi-image-fill' : 'bi-image',
+              label: hasCover ? 'Ganti Cover' : 'Cover',
+              stateClass: hasCover ? 'is-active' : '',
+              title: 'Input Gambar Cover Thumbnail Project',
+              onClick: () => {
+                this.closeTrackWheelMenu();
+                this.cb.onMainTrackCoverClick?.();
+              }
+            },
             {
               icon: liveKfExp ? 'bi-diamond-fill' : 'bi-diamond-half',
               label: 'Keyframe',
@@ -1982,7 +2141,7 @@ export class TimelineView {
     const addBtn = document.createElement('button');
     addBtn.type = 'button';
     addBtn.className = 'mf-main-add-btn';
-    addBtn.style.left = `${mainEndFrame * this.pxPerFrame + 8}px`;
+    addBtn.style.left = `${frameToTimelineX(mainEndFrame, this.pxPerFrame, padLeft) + 8}px`;
     addBtn.title = 'Tambah Video / Gambar ke Main Track';
     addBtn.setAttribute('aria-label', 'Tambah Video atau Gambar ke Main Track');
     addBtn.innerHTML = `<i class="bi bi-plus-lg"></i>`;
@@ -1997,7 +2156,8 @@ export class TimelineView {
     if (mainClips.length === 0) {
       const hint = document.createElement('span');
       hint.className = 'mf-main-empty-hint';
-      hint.textContent = 'Track Utama · Khusus Video & Gambar';
+      hint.style.left = `${padLeft + 46}px`;
+      hint.textContent = 'Track Utama · Video & Gambar';
       lane.appendChild(hint);
     }
 
@@ -2008,10 +2168,11 @@ export class TimelineView {
   }
 
   _appendGapClosePill(lane, centerFrame) {
+    const padLeft = this._getPadLeft();
     const pill = document.createElement('button');
     pill.type = 'button';
     pill.className = 'mf-gap-pill';
-    pill.style.left = `${centerFrame * this.pxPerFrame}px`;
+    pill.style.left = `${frameToTimelineX(centerFrame, this.pxPerFrame, padLeft)}px`;
     pill.textContent = 'Close Gap';
     pill.title = 'Snap all Main Track clips tightly without gaps';
     pill.addEventListener('pointerdown', (e) => e.stopPropagation());
@@ -2041,17 +2202,19 @@ export class TimelineView {
     const nonMainOverlays = project.layers.filter((l) => l.trackRole !== 'main' && l.type !== 'audio');
     const audioLayers = project.layers.filter((l) => l.trackRole !== 'main' && l.type === 'audio');
 
-    // Zone 1 (Top): Non-audio overlays (Text, Shape, Adjustment, Overlay Video/Image, Group)
-    for (const layer of nonMainOverlays) {
-      this._appendSingleLayerRow(project, layer, selectedLayerId, audioEngine, mediaMap, junctionByLeftId);
-    }
-
-    // Zone 2 (Center): Single Main Track (ONLY Video & Image) - always visible in the middle
-    this._appendMainTrackRow(project, mainClips, selectedLayerId, audioEngine, mediaMap, junctionByLeftId);
-
-    // Zone 3 (Bottom): Audio tracks ONLY
-    for (const layer of audioLayers) {
-      this._appendSingleLayerRow(project, layer, selectedLayerId, audioEngine, mediaMap, junctionByLeftId);
+    const zoneOrder = this._resolveZoneOrder(project);
+    for (const z of zoneOrder) {
+      if (z === 'overlay') {
+        for (const layer of nonMainOverlays) {
+          this._appendSingleLayerRow(project, layer, selectedLayerId, audioEngine, mediaMap, junctionByLeftId);
+        }
+      } else if (z === 'main') {
+        this._appendMainTrackRow(project, mainClips, selectedLayerId, audioEngine, mediaMap, junctionByLeftId);
+      } else if (z === 'audio') {
+        for (const layer of audioLayers) {
+          this._appendSingleLayerRow(project, layer, selectedLayerId, audioEngine, mediaMap, junctionByLeftId);
+        }
+      }
     }
 
     if (this._activeWheel) {
@@ -2063,6 +2226,7 @@ export class TimelineView {
     const groups = KeyframeEngine.getVisibleKeyframeLanes(layer);
     const playFrame = Math.round(this.cb.getPlayheadFrame?.() ?? 0);
     const px = this.pxPerFrame;
+    const padLeft = this._getPadLeft();
 
     for (const group of groups) {
       const entries = KeyframeEngine.getLaneKeyframes(layer, group.props);
@@ -2072,10 +2236,10 @@ export class TimelineView {
       subHdr.className = 'mf-kf-lane-header';
       subHdr.dataset.layerId = layer.id;
       subHdr.dataset.laneKey = group.key;
+      subHdr.title = `${group.label} Keyframes`;
       subHdr.innerHTML = `
         <div class="d-flex align-items-center gap-1 min-w-0 flex-grow-1 overflow-hidden">
-          <i class="bi ${group.icon}" style="color:${group.color};font-size:0.65rem;flex-shrink:0;"></i>
-          <span class="mf-kf-lane-label">${group.label}</span>
+          <i class="bi ${group.icon}" style="color:${group.color};font-size:0.68rem;flex-shrink:0;"></i>
           ${entries.length > 0 ? `<span class="mf-kf-lane-count">${entries.length}</span>` : ''}
         </div>
         <button type="button" class="mf-kf-lane-add-btn ${hasAtPlayhead ? 'active' : ''}" data-act="kf-toggle" title="${hasAtPlayhead ? `Hapus Keyframe ${group.label} @ F${playFrame}` : `Tambah Keyframe ${group.label} @ F${playFrame}`}" aria-label="Toggle ${group.label} Keyframe">
@@ -2101,8 +2265,8 @@ export class TimelineView {
 
       const spanEl = document.createElement('div');
       spanEl.className = 'mf-kf-lane-span';
-      spanEl.style.left = `${layer.startFrame * px}px`;
-      spanEl.style.width = `${Math.max(16, (layer.endFrame - layer.startFrame) * px)}px`;
+      spanEl.style.left = `${frameToTimelineX(layer.startFrame, px, padLeft)}px`;
+      spanEl.style.width = `${Math.max(4, (layer.endFrame - layer.startFrame) * px)}px`;
       subLane.appendChild(spanEl);
       this._zoomRefs.kfSpans.push({ el: spanEl, layer });
 
@@ -2117,7 +2281,7 @@ export class TimelineView {
         conn.className = `mf-kf-connector ${isLinear ? 'is-linear' : isHold ? 'is-hold' : isSpring ? 'is-spring' : isSmooth ? 'is-smooth' : 'is-ease'}`;
         conn.style.color = group.color;
         if (isLinear) conn.style.backgroundColor = group.color;
-        conn.style.left = `${a.frame * px}px`;
+        conn.style.left = `${frameToTimelineX(a.frame, px, padLeft)}px`;
         conn.style.width = `${Math.max(0, (b.frame - a.frame) * px)}px`;
         subLane.appendChild(conn);
         this._zoomRefs.kfConnectors.push({ el: conn, fromFrame: a.frame, toFrame: b.frame });
@@ -2132,7 +2296,7 @@ export class TimelineView {
         dEl.dataset.layerId = layer.id;
         dEl.dataset.laneKey = group.key;
         dEl.dataset.frame = String(entry.frame);
-        dEl.style.left = `${entry.frame * px}px`;
+        dEl.style.left = `${frameToTimelineX(entry.frame, px, padLeft)}px`;
         dEl.style.backgroundColor = group.isColor && entry.colorVal ? entry.colorVal : group.color;
         dEl.title = `${group.label} @ F${entry.frame} (${entry.easing})${isOutside ? ' · Di luar batas clip' : ''} · Tap/Ctrl+Klik Multi · Drag untuk geser`;
         dEl.setAttribute('role', 'button');
@@ -2338,6 +2502,7 @@ export class TimelineView {
           }));
         }
       }
+      const padLeft = this._getPadLeft();
       if (dragBatch && dragBatch.length > 1) {
         const minBatchF = Math.min(...dragBatch.map((b) => b.origF));
         const rawDelta = Math.round(dx / this.pxPerFrame);
@@ -2347,17 +2512,17 @@ export class TimelineView {
         curDelta = Math.max(-minBatchF, desiredDelta);
         curFrame = origFrame + curDelta;
         for (const b of dragBatch) {
-          if (b.el) b.el.style.left = `${(b.origF + curDelta) * this.pxPerFrame}px`;
+          if (b.el) b.el.style.left = `${frameToTimelineX(b.origF + curDelta, this.pxPerFrame, padLeft)}px`;
         }
-        this._showSnapGuide(snapMeta.snapped ? { snapped: true, snapTargetFrame: curFrame, kind: snapMeta.kind, label: snapMeta.label } : null);
+        this._showSnapGuide(snapMeta.snapped ? { snapped: true, guideFrame: curFrame, kind: snapMeta.kind, label: snapMeta.label } : null);
         this._showTooltip(`Geser ${dragBatch.length} KF · Δ${curDelta >= 0 ? '+' : ''}${curDelta}f`, diamond, 'drag');
       } else {
         const rawNext = origFrame + Math.round(dx / this.pxPerFrame);
         const snapMeta = this._snapSingleKeyframeFrame(project, layer, group.props, rawNext);
         curFrame = snapMeta.frame;
         curDelta = curFrame - origFrame;
-        diamond.style.left = `${curFrame * this.pxPerFrame}px`;
-        this._showSnapGuide(snapMeta.snapped ? { snapped: true, snapTargetFrame: snapMeta.frame, kind: snapMeta.kind, label: snapMeta.label } : null);
+        diamond.style.left = `${frameToTimelineX(curFrame, this.pxPerFrame, padLeft)}px`;
+        this._showSnapGuide(snapMeta.snapped ? { snapped: true, guideFrame: snapMeta.frame, kind: snapMeta.kind, label: snapMeta.label } : null);
         const snapTxt = snapMeta.snapped ? ` · Snap ${snapMeta.label}` : '';
         this._showTooltip(`${group.label} · F${curFrame}${snapTxt}`, diamond, 'drag');
       }
@@ -2630,7 +2795,7 @@ export class TimelineView {
       const snapMeta = this._snapSingleKeyframeFrame(project, layer, [], rawNext);
       curFrame = snapMeta.frame;
       diamond.style.left = `${(curFrame - layer.startFrame) * this.pxPerFrame}px`;
-      this._showSnapGuide(snapMeta.snapped ? { snapped: true, snapTargetFrame: snapMeta.frame, kind: snapMeta.kind, label: snapMeta.label } : null);
+      this._showSnapGuide(snapMeta.snapped ? { snapped: true, guideFrame: snapMeta.frame, kind: snapMeta.kind, label: snapMeta.label } : null);
       const snapTxt = snapMeta.snapped ? ` · Snap ${snapMeta.label}` : '';
       this._showTooltip(`Keyframe · F${curFrame}${snapTxt}`, diamond, 'drag');
     });
@@ -2734,6 +2899,7 @@ export class TimelineView {
     };
 
     const clearDropHighlights = () => {
+      const padLeft = this._getPadLeft();
       this.lanesList.querySelectorAll('.mf-track-lane').forEach((ln) => {
         ln.classList.remove('drop-target', 'main-drop-target');
       });
@@ -2742,7 +2908,7 @@ export class TimelineView {
       if (origMainSnapshot) {
         for (const snap of origMainSnapshot) {
           if (snap.clipEl !== clip) {
-            snap.clipEl.style.left = `${snap.layer.startFrame * this.pxPerFrame}px`;
+            snap.clipEl.style.left = `${frameToTimelineX(snap.layer.startFrame, this.pxPerFrame, padLeft)}px`;
           }
         }
       }
@@ -2751,7 +2917,7 @@ export class TimelineView {
     const syncDiamondsForClip = () => {
       const list = clip._mfDiamonds;
       if (!Array.isArray(list) || list.length === 0) return;
-      const widthPx = Math.max(24, (layer.endFrame - layer.startFrame) * this.pxPerFrame);
+      const widthPx = Math.max(4, (layer.endFrame - layer.startFrame) * this.pxPerFrame);
       for (const d of list) {
         const relPx = (d.frame - layer.startFrame) * this.pxPerFrame;
         d.el.style.left = `${relPx}px`;
@@ -2782,13 +2948,14 @@ export class TimelineView {
 
     const restoreOrigState = () => {
       stopActiveGestureLoops();
+      const padLeft = this._getPadLeft();
       if (multiGroupSnapshot && multiGroupSnapshot.length > 1) {
         for (const g of multiGroupSnapshot) {
           g.layer.startFrame = g.startFrame;
           g.layer.endFrame = g.endFrame;
           g.layer.keyframes = cloneKeyframesMap(g.keyframes);
           if (g.clipEl) {
-            g.clipEl.style.left = `${g.startFrame * this.pxPerFrame}px`;
+            g.clipEl.style.left = `${frameToTimelineX(g.startFrame, this.pxPerFrame, padLeft)}px`;
           }
         }
       } else if (origMainSnapshot) {
@@ -2797,16 +2964,16 @@ export class TimelineView {
           snap.layer.endFrame = snap.endFrame;
           snap.layer.mediaOffsetFrames = snap.mediaOffsetFrames;
           snap.layer.keyframes = cloneKeyframesMap(snap.keyframes);
-          snap.clipEl.style.left = `${snap.startFrame * this.pxPerFrame}px`;
-          snap.clipEl.style.width = `${Math.max(24, (snap.endFrame - snap.startFrame) * this.pxPerFrame)}px`;
+          snap.clipEl.style.left = `${frameToTimelineX(snap.startFrame, this.pxPerFrame, padLeft)}px`;
+          snap.clipEl.style.width = `${Math.max(4, (snap.endFrame - snap.startFrame) * this.pxPerFrame)}px`;
         }
       } else {
         layer.startFrame = origStart;
         layer.endFrame = origEnd;
         layer.mediaOffsetFrames = origMediaOffset;
         layer.keyframes = cloneKeyframesMap(origKeyframes || {});
-        clip.style.left = `${origStart * this.pxPerFrame}px`;
-        clip.style.width = `${Math.max(24, (origEnd - origStart) * this.pxPerFrame)}px`;
+        clip.style.left = `${frameToTimelineX(origStart, this.pxPerFrame, padLeft)}px`;
+        clip.style.width = `${Math.max(4, (origEnd - origStart) * this.pxPerFrame)}px`;
       }
       syncDiamondsForClip();
       clip.classList.remove('mf-clip-dragging-reorder', 'is-fine-slide');
@@ -2818,6 +2985,7 @@ export class TimelineView {
 
     const applyDragStep = (clientX, clientY, fromAutoScroll = false) => {
       if (!mode || !holdActivated) return;
+      const padLeft = this._getPadLeft();
       const scrollDx = this.scrollEl.scrollLeft - startScrollLeft;
       const rawDx = (clientX - startX) + scrollDx;
       const dy = clientY - startY;
@@ -2891,7 +3059,7 @@ export class TimelineView {
           TimelineEngine.shiftLayerKeyframes(g.layer, effectiveDelta);
           TimelineEngine.ensureProjectDuration(project, g.layer.endFrame);
           if (g.clipEl) {
-            g.clipEl.style.left = `${g.layer.startFrame * this.pxPerFrame}px`;
+            g.clipEl.style.left = `${frameToTimelineX(g.layer.startFrame, this.pxPerFrame, padLeft)}px`;
           }
         }
         syncDiamondsForClip();
@@ -2932,23 +3100,22 @@ export class TimelineView {
         }
         const mainDropMarker = hoveredLane.querySelector('.mf-reorder-indicator');
         if (mainDropMarker) {
-          mainDropMarker.style.left = `${seamFrame * this.pxPerFrame}px`;
+          mainDropMarker.style.left = `${frameToTimelineX(seamFrame, this.pxPerFrame, padLeft)}px`;
           mainDropMarker.classList.remove('d-none');
         }
         clip.classList.add('mf-clip-dragging-reorder');
-        clip.style.left = `${dragStart * this.pxPerFrame}px`;
+        clip.style.left = `${frameToTimelineX(dragStart, this.pxPerFrame, padLeft)}px`;
         clip.style.transform = `translateY(${dy}px) scale(1.03)`;
         pendingDrop = { targetRole: 'main', targetStartFrame: dragStart, dragCenterFrame: centerFrame };
         this._showTooltip(`${finePrefix}Main Track #${targetSlot + 1} · ${formatDurationShort(len, fps)}`, clip, 'drag');
         return;
       }
 
-      // Case 2: Main Track clip dragged vertically off Main Track into Top Overlay zone ONLY (never Audio zone)
+      // Case 2: Main Track clip dragged vertically off Main Track into Overlay zone ONLY (never Audio zone)
       if (mode === 'move' && layer.trackRole === 'main' && Math.abs(dy) >= 26 && (!hoveredLane || (hoveredLane.dataset.laneType !== 'main' && hoveredLane.dataset.zone !== 'audio'))) {
-        const mainRect = laneEl?.getBoundingClientRect();
-        if (mainRect && clientY < mainRect.top - 10) {
+        if (hoveredLane && hoveredLane.dataset.zone === 'overlay') {
           clearDropHighlights();
-          if (hoveredLane && hoveredLane.dataset.zone === 'overlay') hoveredLane.classList.add('drop-target');
+          hoveredLane.classList.add('drop-target');
           const len = Math.max(5, origEnd - origStart);
           const rawDragStart = Math.max(0, origStart + deltaFrames);
           const snapMeta = TimelineEngine.snapFrameWithMeta(
@@ -2963,7 +3130,7 @@ export class TimelineView {
           const dragStart = snapMeta.startFrame;
           this._showSnapGuide(snapActive ? snapMeta : null);
           clip.classList.add('mf-clip-dragging-reorder');
-          clip.style.left = `${dragStart * this.pxPerFrame}px`;
+          clip.style.left = `${frameToTimelineX(dragStart, this.pxPerFrame, padLeft)}px`;
           clip.style.transform = `translateY(${dy}px) scale(1.03)`;
           const tgtIdx = hoveredLane?.dataset?.layerIndex ? Number(hoveredLane.dataset.layerIndex) : null;
           pendingDrop = { targetRole: 'overlay', targetLayerIndex: Number.isInteger(tgtIdx) ? tgtIdx : null, targetStartFrame: dragStart };
@@ -2984,7 +3151,7 @@ export class TimelineView {
         const centerFrame = dragStart + len * 0.5;
         pendingCenterFrame = centerFrame;
         clip.classList.add('mf-clip-dragging-reorder');
-        clip.style.left = `${dragStart * this.pxPerFrame}px`;
+        clip.style.left = `${frameToTimelineX(dragStart, this.pxPerFrame, padLeft)}px`;
 
         const others = TimelineEngine.getMainTrackClips(project).filter((c) => c.id !== layer.id);
         const targetSlot = TimelineEngine.computeMainTrackTargetSlot(project, layer.id, centerFrame);
@@ -3004,12 +3171,12 @@ export class TimelineView {
           if (i < others.length) {
             const sib = others[i];
             const sibRec = origMainSnapshot?.find((s) => s.layer.id === sib.id);
-            if (sibRec) sibRec.clipEl.style.left = `${cursorF * this.pxPerFrame}px`;
+            if (sibRec) sibRec.clipEl.style.left = `${frameToTimelineX(cursorF, this.pxPerFrame, padLeft)}px`;
             cursorF += Math.max(5, sib.endFrame - sib.startFrame);
           }
         }
         if (mainCtx?.dropMarker) {
-          mainCtx.dropMarker.style.left = `${seamFrame * this.pxPerFrame}px`;
+          mainCtx.dropMarker.style.left = `${frameToTimelineX(seamFrame, this.pxPerFrame, padLeft)}px`;
           mainCtx.dropMarker.classList.remove('d-none');
         }
         this._showTooltip(`${finePrefix}Slot #${targetSlot + 1} · ${formatDurationShort(len, fps)}`, clip, 'drag');
@@ -3075,19 +3242,20 @@ export class TimelineView {
 
         if (origMainSnapshot) {
           for (const snap of origMainSnapshot) {
-            const sLeft = snap.layer.startFrame * this.pxPerFrame;
-            const sWidth = Math.max(24, (snap.layer.endFrame - snap.layer.startFrame) * this.pxPerFrame);
+            const sLeft = frameToTimelineX(snap.layer.startFrame, this.pxPerFrame, padLeft);
+            const sWidth = Math.max(4, (snap.layer.endFrame - snap.layer.startFrame) * this.pxPerFrame);
             snap.clipEl.style.left = `${sLeft}px`;
             snap.clipEl.style.width = `${sWidth}px`;
           }
         }
       }
 
-      const nextLeftPx = layer.startFrame * this.pxPerFrame;
-      const nextWidthPx = Math.max(24, (layer.endFrame - layer.startFrame) * this.pxPerFrame);
+      const nextLeftPx = frameToTimelineX(layer.startFrame, this.pxPerFrame, padLeft);
+      const nextWidthPx = Math.max(4, (layer.endFrame - layer.startFrame) * this.pxPerFrame);
       const curContentW = parseFloat(this.contentEl.style.width || '0') || 0;
-      if (nextLeftPx + nextWidthPx + 140 > curContentW) {
-        this.contentEl.style.width = `${Math.ceil(nextLeftPx + nextWidthPx + 180)}px`;
+      const trailPad = Math.max(120, ((this.scrollEl?.clientWidth || 360) - padLeft) + 24);
+      if (nextLeftPx + nextWidthPx + trailPad > curContentW) {
+        this.contentEl.style.width = `${Math.ceil(nextLeftPx + nextWidthPx + trailPad + 60)}px`;
       }
       clip.style.left = `${nextLeftPx}px`;
       clip.style.width = `${nextWidthPx}px`;
