@@ -151,9 +151,10 @@ export const ProjectStorage = {
   async saveProject(project) {
     const db = await openDB();
     project.updatedAt = Date.now();
+    const payload = typeof structuredClone === 'function' ? structuredClone(project) : deepClone(project);
     return new Promise((resolve, reject) => {
       const tx = db.transaction(STORE_PROJECTS, 'readwrite');
-      tx.objectStore(STORE_PROJECTS).put(deepClone(project));
+      tx.objectStore(STORE_PROJECTS).put(payload);
       tx.oncomplete = () => resolve(project);
       tx.onerror = () => reject(tx.error);
     });
@@ -244,7 +245,7 @@ export const ProjectStorage = {
 };
 
 export class HistoryManager {
-  constructor(limit = 40) {
+  constructor(limit = 25) {
     this.limit = limit;
     this.undoStack = [];
     this.redoStack = [];

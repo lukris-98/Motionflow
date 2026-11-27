@@ -57,7 +57,7 @@ class MotionFlowApp {
     this._liveAutoRecRefreshTimer = null;
     this.exportLocation = { uri: '', displayName: '', webHandle: null };
 
-    this.history = new HistoryManager(40);
+    this.history = new HistoryManager(25);
     this.audioEngine = new AudioEngine();
     this.renderer = new RendererEngine(
       document.getElementById('previewCanvas'),
@@ -118,6 +118,7 @@ class MotionFlowApp {
     this.panels = new PanelsUI(this);
     this.timelineView = new TimelineView({
       onSeekFrame: (f) => this.seekToFrame(f),
+      isPlaying: () => this.isPlaying,
       onScrubStart: () => { if (this.isPlaying) this.pause(); },
       onScrubEnd: () => {
         this.panels.renderInspector();
@@ -216,6 +217,7 @@ class MotionFlowApp {
       },
       onToggleRippleMode: () => this.toggleRippleMode(),
       onToggleMainTrackProp: (prop) => this.toggleMainTrackProp(prop),
+      onMainTrackThumbClick: () => this.handleMainTrackThumbClick(),
       onQuickAddMainClip: () => {
         this.mediaPickerContext = null;
         if (this.mediaItems.some((m) => m.type === 'video' || m.type === 'image')) {
@@ -248,13 +250,6 @@ class MotionFlowApp {
     for (const f of this.customFonts) {
       await this.registerFontFace(f);
     }
-
-    // Decode waveforms in background for existing audio/video items
-    this.mediaItems.forEach((m) => {
-      if (m.type === 'audio' || m.type === 'video') {
-        this.audioEngine.loadBuffer(m).then(() => this.refreshTimelineOnly());
-      }
-    });
 
     const savedProjects = await ProjectStorage.listProjects();
     if (savedProjects.length > 0) {
@@ -296,9 +291,42 @@ class MotionFlowApp {
     this.bindNativeBridgeCallbacks();
 
     this.applyThemeMode(this.project?.settings?.themeMode || this._getStoredThemeMode() || 'dark');
-    this.panels.renderMediaLibrary(this.mediaItems);
     this.setSaveState(true);
     this.updateAllUI();
+    this._preloadProjectAudioBuffers();
+  }
+
+  async _preloadProjectAudioBuffers() {
+    if (!this.project?.layers?.length || !this.audioEngine) return;
+    const neededIds = new Set();
+    for (const l of this.project.layers) {
+      if ((l.type === 'audio' || l.type === 'video') && l.mediaId) {
+        neededIds.add(l.mediaId);
+      }
+    }
+    let loadedAny = false;
+    for (const mid of neededIds) {
+      if (this.audioEngine.buffers.has(mid) || this.audioEngine.failedIds.has(mid)) continue;
+      const item = this.mediaMap.get(mid);
+      if (!item) continue;
+      const buf = await this.audioEngine.loadBuffer(item);
+      if (buf) loadedAny = true;
+    }
+    if (loadedAny) this.refreshTimelineOnly();
+  }
+
+  handleMainTrackThumbClick() {
+    const mainClips = TimelineEngine.getMainTrackClips(this.project);
+    if (mainClips.length === 0) {
+      this.mediaPickerContext = null;
+      if (this.mediaItems.some((m) => m.type === 'video' || m.type === 'image')) {
+        this.openSheet('sheetMedia');
+      } else {
+        this.triggerDeviceVisualPick('main_append');
+      }
+      return;
+    }
+    this.captureCoverFrame();
   }
 
   rebuildMediaMap() {
@@ -457,7 +485,6 @@ class MotionFlowApp {
     document.getElementById('btnGroupChecked')?.classList.toggle('d-none', totalGroupCount < 2);
     this.renderPreview();
     this.panels.refreshAll();
-    this.panels.renderRatioPanel();
     this.renderBottomToolbar();
   }
 
@@ -497,7 +524,7 @@ class MotionFlowApp {
       this.syncViewport3DUI();
       this.renderPreview();
       this.panels?.renderInspector();
-      if (this.panels?.activeStyleTab === 'camera') this.panels.renderStylePanel();
+      this.panels?.renderCameraPanel();
     }
     return hadAny;
   }
@@ -933,9 +960,7 @@ class MotionFlowApp {
       this.audioEngine.startPlayback(this.project, this.currentFrame, this.mediaMap);
     }
     if (!this.timelineView.isScrubbing) {
-      this.panels.renderInspector();
-      this.panels.renderKeyframesPanel();
-      if (this.panels?.activeStyleTab === 'camera') this.panels.renderStylePanel();
+      this.panels.refreshAll();
     }
   }
 
@@ -991,7 +1016,7 @@ class MotionFlowApp {
       if (elapsed >= frameIntervalMs) {
         ticking = true;
         try {
-          const advance = Math.min(6, Math.floor(elapsed / frameIntervalMs)) * this.shuttleRate;
+          const advance = Math.floor(elapsed / frameIntervalMs) * this.shuttleRate;
           this.lastTickMs = now - (elapsed % frameIntervalMs);
           this.currentFrame += advance;
           if (this.currentFrame >= this.project.durationFrames) {
@@ -1093,7 +1118,6 @@ class MotionFlowApp {
       this.updateTransportLabels();
       this.renderPreview();
       this.panels.refreshAll();
-      this.panels.renderRatioPanel();
       this.renderBottomToolbar();
       return;
     }
@@ -1282,8 +1306,8 @@ class MotionFlowApp {
       this.renderer.setPending3DPose(this._pending3DLayerPose, this._pending3DCamPose);
       this.updateTransportLabels();
       this.syncViewport3DUI();
-      if (pushHistory && this.panels?.activeStyleTab === 'camera') {
-        this.panels.renderStylePanel();
+      if (pushHistory) {
+        this.panels?.renderCameraPanel();
       }
       this.renderPreview();
       return;
@@ -1387,7 +1411,7 @@ class MotionFlowApp {
       });
       if (this.panels) {
         this.panels.selectedVfxId = nextVfxId;
-        this.panels.renderStylePanel();
+        this.panels.renderEffectsPanel();
       }
       this.showToast(`${stackOnExisting ? 'Efek dilapis' : 'Efek timeline diperbarui'}: ${vfxPreset.label}`);
       return cur;
@@ -1415,7 +1439,7 @@ class MotionFlowApp {
       this.selectedLayerIds = new Set([created.id]);
       if (this.panels) this.panels.selectedVfxId = stack[0]?.id || null;
     });
-    if (this.panels) this.panels.renderStylePanel();
+    if (this.panels) this.panels.renderEffectsPanel();
     this.showToast(`Efek "${vfxPreset.label}" ditambahkan ke timeline — tahan pojok kiri/kanan atas untuk atur durasi`);
     return created;
   }
@@ -1441,7 +1465,7 @@ class MotionFlowApp {
     this.renderer.setViewport3DState(this.viewport3D);
     this.syncViewport3DUI();
     this.updateTransportLabels();
-    this.panels?.renderStylePanel();
+    this.panels?.renderCameraPanel();
     this.panels?.renderInspector();
     this.renderPreview();
   }
@@ -1488,7 +1512,7 @@ class MotionFlowApp {
       });
     } else {
       this.syncViewport3DUI();
-      this.panels.renderStylePanel();
+      this.panels.renderCameraPanel();
     }
     this.showToast(
       next
@@ -1784,13 +1808,13 @@ class MotionFlowApp {
       { icon: 'bi-clipboard', label: 'Copy Clip', fn: () => this.copySelectedLayers() },
       { icon: 'bi-eyedropper text-info', label: 'Copy FX', fn: () => this.copySelectedStyle() },
       ...(this.copiedClipStyle ? [{ icon: 'bi-clipboard-check text-warning', label: 'Paste FX', fn: () => this.pasteStyleToSelected() }] : []),
-      { icon: 'bi-stars text-info', label: 'Effects', fn: () => this.openSheet('sheetStyle', 'fx', 'effects') },
+      { icon: 'bi-stars text-info', label: 'Effects', fn: () => this.openSheet('sheetEffects') },
       { icon: 'bi-intersect text-info', label: 'Transition', fn: () => this.openTransitionsSheet({ layerId: layer.id }) },
       ...(layer.type === 'video'
         ? [{ icon: 'bi-music-note text-warning', label: 'Pisah Audio', fn: () => this.detachAudioFromSelected() }]
         : []),
       ...(layer.type === 'video' || layer.type === 'audio'
-        ? [{ icon: 'bi-speedometer2 text-info', label: 'Speed Curve', fn: () => this.openSheet('sheetStyle', 'layer') }]
+        ? [{ icon: 'bi-speedometer2 text-info', label: 'Speed Curve', fn: () => this.openSheet('sheetEdit') }]
         : []),
       ...(layer.type === 'video' || layer.type === 'image'
         ? [{ icon: 'bi-aspect-ratio text-info', label: 'Auto Reframe', fn: () => this.autoReframeLayer(layer.id, 'smart') }]
@@ -2161,19 +2185,54 @@ class MotionFlowApp {
   }
 
   openSheet(sheetId, styleTab = null, subTab = null) {
-    if (styleTab) this.panels.activeStyleTab = styleTab;
-    if (styleTab === 'fx' && subTab) this.panels.activeFxSubTab = subTab;
-    if (styleTab === 'layer' && subTab) this.panels.activeTextSubTab = subTab;
-    if (sheetId === 'sheetStickers' && subTab) this.panels.activeStickerSubTab = subTab;
-    if (sheetId === 'sheetAudioTools' && subTab) this.panels.activeAudioHubTab = subTab;
-    this.panels.refreshAll();
-    if (sheetId === 'sheetRatio') this.panels.renderRatioPanel();
-    if (sheetId === 'sheetMedia') this.panels.renderMediaLibrary(this.mediaItems);
-    if (sheetId === 'sheetStickers') this.panels.renderStickersPanel();
-    if (sheetId === 'sheetAudioTools') this.panels.renderAudioToolsPanel();
-    if (sheetId === 'sheetTemplates') this.panels.renderTemplatesPanel();
-    if (sheetId === 'sheetTransitions') this.panels.renderTransitionsPanel();
-    bootstrap.Offcanvas.getOrCreateInstance(document.getElementById(sheetId)).show();
+    let resolvedSheetId = sheetId;
+    if (resolvedSheetId === 'sheetStyle') {
+      if (styleTab === 'camera') resolvedSheetId = 'sheetCamera';
+      else if (styleTab === 'mask') resolvedSheetId = 'sheetMask';
+      else if (styleTab === 'tracker') resolvedSheetId = 'sheetTracker';
+      else if (styleTab === 'fx') {
+        if (subTab === 'filters') resolvedSheetId = 'sheetFilters';
+        else if (subTab === 'effects') resolvedSheetId = 'sheetEffects';
+        else resolvedSheetId = 'sheetAdjust';
+      } else {
+        resolvedSheetId = 'sheetEdit';
+      }
+    }
+    if (resolvedSheetId === 'sheetEdit' && subTab) {
+      this.panels.activeTextSubTab = subTab;
+    }
+    if (resolvedSheetId === 'sheetAdjust' && (subTab === 'adjust' || subTab === 'chroma')) {
+      this.panels.activeAdjustSubTab = subTab;
+    }
+    if (resolvedSheetId === 'sheetStickers' && subTab) this.panels.activeStickerSubTab = subTab;
+    if (resolvedSheetId === 'sheetAudioTools' && subTab) this.panels.activeAudioHubTab = subTab;
+
+    const targetEl = document.getElementById(resolvedSheetId);
+    if (!targetEl) return;
+
+    document.querySelectorAll('.offcanvas.show').forEach((el) => {
+      if (el !== targetEl) {
+        bootstrap.Offcanvas.getInstance(el)?.hide();
+      }
+    });
+
+    if (resolvedSheetId === 'sheetEdit') this.panels.renderEditPanel({ force: true });
+    else if (resolvedSheetId === 'sheetFilters') this.panels.renderFiltersPanel({ force: true });
+    else if (resolvedSheetId === 'sheetEffects') this.panels.renderEffectsPanel({ force: true });
+    else if (resolvedSheetId === 'sheetCamera') this.panels.renderCameraPanel({ force: true });
+    else if (resolvedSheetId === 'sheetAdjust') this.panels.renderAdjustPanel({ force: true });
+    else if (resolvedSheetId === 'sheetMask') this.panels.renderMaskPanel({ force: true });
+    else if (resolvedSheetId === 'sheetTracker') this.panels.renderTrackerPanel({ force: true });
+    else if (resolvedSheetId === 'sheetInspector') this.panels.renderInspector({ force: true });
+    else if (resolvedSheetId === 'sheetKeyframes') this.panels.renderKeyframesPanel({ force: true });
+    else if (resolvedSheetId === 'sheetRatio') this.panels.renderRatioPanel({ force: true });
+    else if (resolvedSheetId === 'sheetMedia') this.panels.renderMediaLibrary(this.mediaItems, { force: true });
+    else if (resolvedSheetId === 'sheetStickers') this.panels.renderStickersPanel();
+    else if (resolvedSheetId === 'sheetAudioTools') this.panels.renderAudioToolsPanel();
+    else if (resolvedSheetId === 'sheetTemplates') this.panels.renderTemplatesPanel();
+    else if (resolvedSheetId === 'sheetTransitions') this.panels.renderTransitionsPanel();
+
+    bootstrap.Offcanvas.getOrCreateInstance(targetEl).show();
   }
 
   openTransitionsSheet(opts = {}) {
@@ -2279,7 +2338,7 @@ class MotionFlowApp {
       this.selectedLayerId = layer.id;
     });
     this.hideOpenSheets();
-    this.openSheet('sheetStyle', 'layer', 'edit');
+    this.openSheet('sheetEdit', null, 'edit');
     this.showToast(`Added "${tpl.label}" text template`);
   }
 
@@ -2442,7 +2501,7 @@ class MotionFlowApp {
       return this.showToast('Select a visual clip to copy its style');
     }
     this.copiedClipStyle = TimelineEngine.copyAttributesFromLayer(layer);
-    this.panels.renderStylePanel();
+    this.panels.renderAdjustPanel();
     this.renderBottomToolbar();
     this.showToast('Copied Color, Filter, VFX & Mask style');
   }
@@ -2528,13 +2587,13 @@ class MotionFlowApp {
     if (!clean) return this.showToast('Enter some text before generating voice');
     if (!window.AndroidBridge?.synthesizeTts) {
       this.ttsStatusText = 'Android native TTS unavailable in desktop browser';
-      this.panels.renderStylePanel();
+      this.panels.renderEditPanel();
       return this.showToast(this.ttsStatusText);
     }
     this.pause();
     this.importIntent = 'audio_at_playhead';
     this.ttsStatusText = 'Synthesizing TTS speech (.wav)...';
-    this.panels.renderStylePanel();
+    this.panels.renderEditPanel();
     window.AndroidBridge.synthesizeTts(clean, voiceStyle);
   }
 
@@ -2772,15 +2831,15 @@ class MotionFlowApp {
             TimelineEngine.addLayer(this.project, t);
             this.selectedLayerId = t.id;
           });
-          this.openSheet('sheetStyle', 'layer', 'edit');
+          this.openSheet('sheetEdit', null, 'edit');
         }],
         ['bi-emoji-smile text-warning', 'Stickers', () => this.openSheet('sheetStickers', null, 'stickers')],
         ['bi-badge-cc text-info', 'Captions', () => bootstrap.Modal.getOrCreateInstance(document.getElementById('modalCaptions')).show()],
         ['bi-intersect text-info', 'Transitions', () => this.openTransitionsSheet()],
         ['bi-magic text-info', 'Templates', () => this.openSheet('sheetTemplates')],
         ['bi-brush text-info', 'Draw', () => this.openDrawModal()],
-        ['bi-stars text-info', 'Effects', () => this.openSheet('sheetStyle', 'fx', 'effects')],
-        ['bi-palette-fill text-success', 'Filters', () => this.openSheet('sheetStyle', 'fx', 'filters')],
+        ['bi-stars text-info', 'Effects', () => this.openSheet('sheetEffects')],
+        ['bi-palette-fill text-success', 'Filters', () => this.openSheet('sheetFilters')],
         ['bi-layers-half text-success', 'Overlay', () => this.triggerDeviceVisualPick('overlay_at_playhead')],
         ['bi-sliders2-vertical text-warning', 'Adj Layer', () => {
           this.mutateProject(() => {
@@ -2789,7 +2848,7 @@ class MotionFlowApp {
             TimelineEngine.normalizeTrackZOrder(this.project);
             this.selectedLayerId = adj.id;
           });
-          this.openSheet('sheetStyle', 'fx', 'adjust');
+          this.openSheet('sheetAdjust', null, 'adjust');
         }],
         ['bi-pentagon text-warning', 'Shapes', () => this.openSheet('sheetAddLayer')],
         ['bi-bookmark-plus text-success', 'Marker', () => this.toggleMarkerAtPlayhead()],
@@ -2797,7 +2856,7 @@ class MotionFlowApp {
         ['bi-aspect-ratio', 'Canvas', () => this.openSheet('sheetRatio')],
         ['bi-badge-3d text-info', '3D Cam', () => {
           if (!this.viewport3D.enabled) this.toggleViewport3D();
-          this.openSheet('sheetStyle', 'camera');
+          this.openSheet('sheetCamera');
         }]
       ];
       rootItems.forEach(([ic, lbl, fn]) => container.appendChild(makeBtn(ic, lbl, fn)));
@@ -2844,23 +2903,23 @@ class MotionFlowApp {
         commonSplit,
         commonDelLeft,
         commonDelRight,
-        ['bi-speedometer2 text-info', 'Speed', () => this.openSheet('sheetStyle', 'layer')],
-        ['bi-volume-up', 'Volume/FX', () => this.openSheet('sheetStyle', 'layer')],
+        ['bi-speedometer2 text-info', 'Speed', () => this.openSheet('sheetEdit')],
+        ['bi-volume-up', 'Volume/FX', () => this.openSheet('sheetEdit')],
         commonAnim,
         commonTransition,
         trackToggleBtn,
         ...reorderBtns,
-        ['bi-stars text-info', 'Effects', () => this.openSheet('sheetStyle', 'fx', 'effects')],
-        ['bi-palette-fill text-success', 'Filters', () => this.openSheet('sheetStyle', 'fx', 'filters')],
-        ['bi-sliders2', 'Adjust', () => this.openSheet('sheetStyle', 'fx', 'adjust')],
+        ['bi-stars text-info', 'Effects', () => this.openSheet('sheetEffects')],
+        ['bi-palette-fill text-success', 'Filters', () => this.openSheet('sheetFilters')],
+        ['bi-sliders2', 'Adjust', () => this.openSheet('sheetAdjust', null, 'adjust')],
         ['bi-scissors text-warning', 'Cutout', () => this.openCutoutBrushForSelected()],
-        ['bi-person-bounding-box text-success', 'Chroma', () => this.openSheet('sheetStyle', 'fx', 'chroma')],
-        ['bi-pip text-info', 'PIP/Split', () => this.openSheet('sheetStyle', 'mask')],
-        ['bi-crop text-warning', 'Crop/Rot', () => this.openSheet('sheetStyle', 'mask')],
+        ['bi-person-bounding-box text-success', 'Chroma', () => this.openSheet('sheetAdjust', null, 'chroma')],
+        ['bi-pip text-info', 'PIP/Split', () => this.openSheet('sheetMask')],
+        ['bi-crop text-warning', 'Crop/Rot', () => this.openSheet('sheetMask')],
         ['bi-camera-reels text-info', 'Stabilize', () => this.openStabilizerUI(layer.id)],
         ['bi-snow text-info', 'Freeze', () => this.freezeSelectedFrame()],
         ['bi-crosshair text-warning', 'Track 3D', () => this.openTrackerUI(layer.id)],
-        ['bi-circle-half', 'Mask/Tr', () => this.openSheet('sheetStyle', 'mask')],
+        ['bi-circle-half', 'Mask/Tr', () => this.openSheet('sheetMask')],
         commonTransform,
         commonCopyStyle,
         ...(commonPasteStyle ? [commonPasteStyle] : []),
@@ -2883,15 +2942,15 @@ class MotionFlowApp {
         commonTransition,
         trackToggleBtn,
         ...reorderBtns,
-        ['bi-stars text-info', 'Effects', () => this.openSheet('sheetStyle', 'fx', 'effects')],
-        ['bi-palette-fill text-success', 'Filters', () => this.openSheet('sheetStyle', 'fx', 'filters')],
-        ['bi-sliders2', 'Adjust', () => this.openSheet('sheetStyle', 'fx', 'adjust')],
+        ['bi-stars text-info', 'Effects', () => this.openSheet('sheetEffects')],
+        ['bi-palette-fill text-success', 'Filters', () => this.openSheet('sheetFilters')],
+        ['bi-sliders2', 'Adjust', () => this.openSheet('sheetAdjust', null, 'adjust')],
         ['bi-scissors text-warning', 'Cutout', () => this.openCutoutBrushForSelected()],
-        ['bi-person-bounding-box text-success', 'Chroma', () => this.openSheet('sheetStyle', 'fx', 'chroma')],
-        ['bi-pip text-info', 'PIP/Split', () => this.openSheet('sheetStyle', 'mask')],
-        ['bi-crop text-warning', 'Crop/Rot', () => this.openSheet('sheetStyle', 'mask')],
+        ['bi-person-bounding-box text-success', 'Chroma', () => this.openSheet('sheetAdjust', null, 'chroma')],
+        ['bi-pip text-info', 'PIP/Split', () => this.openSheet('sheetMask')],
+        ['bi-crop text-warning', 'Crop/Rot', () => this.openSheet('sheetMask')],
         ['bi-snow text-info', 'Freeze', () => this.freezeSelectedFrame()],
-        ['bi-circle-half', 'Mask/Tr', () => this.openSheet('sheetStyle', 'mask')],
+        ['bi-circle-half', 'Mask/Tr', () => this.openSheet('sheetMask')],
         commonTransform,
         commonCopyStyle,
         ...(commonPasteStyle ? [commonPasteStyle] : []),
@@ -2902,20 +2961,20 @@ class MotionFlowApp {
       ];
     } else if (layer.type === 'text') {
       ctxItems = [
-        ['bi-pencil-square text-info', 'Edit Text', () => this.openSheet('sheetStyle', 'layer', 'edit')],
-        ['bi-card-heading text-warning', 'Templates', () => this.openSheet('sheetStyle', 'layer', 'templates')],
-        ['bi-megaphone text-info', 'TTS/Caps', () => this.openSheet('sheetStyle', 'layer', 'voice')],
+        ['bi-pencil-square text-info', 'Edit Text', () => this.openSheet('sheetEdit', null, 'edit')],
+        ['bi-card-heading text-warning', 'Templates', () => this.openSheet('sheetEdit', null, 'templates')],
+        ['bi-megaphone text-info', 'TTS/Caps', () => this.openSheet('sheetEdit', null, 'voice')],
         commonSplit,
         commonDelLeft,
         commonDelRight,
-        ['bi-chat-square-text', 'Bubble', () => this.openSheet('sheetStyle', 'layer', 'bubble')],
+        ['bi-chat-square-text', 'Bubble', () => this.openSheet('sheetEdit', null, 'bubble')],
         commonAnim,
         commonTransition,
-        ['bi-stars text-info', 'Effects', () => this.openSheet('sheetStyle', 'fx', 'effects')],
+        ['bi-stars text-info', 'Effects', () => this.openSheet('sheetEffects')],
         ['bi-crosshair text-warning', 'Track 3D', () => this.openTrackerUI()],
         commonTransform,
-        ['bi-sliders2', 'Adjust/FX', () => this.openSheet('sheetStyle', 'fx', 'adjust')],
-        ['bi-circle-half', 'Mask/Tr', () => this.openSheet('sheetStyle', 'mask')],
+        ['bi-sliders2', 'Adjust/FX', () => this.openSheet('sheetAdjust', null, 'adjust')],
+        ['bi-circle-half', 'Mask/Tr', () => this.openSheet('sheetMask')],
         commonDup,
         commonDel
       ];
@@ -2924,14 +2983,14 @@ class MotionFlowApp {
         commonSplit,
         commonDelLeft,
         commonDelRight,
-        ['bi-palette2 text-warning', 'Style', () => this.openSheet('sheetStyle', 'layer')],
+        ['bi-palette2 text-warning', 'Style', () => this.openSheet('sheetEdit')],
         commonAnim,
         commonTransition,
-        ['bi-stars text-info', 'Effects', () => this.openSheet('sheetStyle', 'fx', 'effects')],
+        ['bi-stars text-info', 'Effects', () => this.openSheet('sheetEffects')],
         ['bi-crosshair text-warning', 'Track 3D', () => this.openTrackerUI()],
         commonTransform,
-        ['bi-sliders2', 'Adjust/FX', () => this.openSheet('sheetStyle', 'fx', 'adjust')],
-        ['bi-circle-half', 'Mask/Tr', () => this.openSheet('sheetStyle', 'mask')],
+        ['bi-sliders2', 'Adjust/FX', () => this.openSheet('sheetAdjust', null, 'adjust')],
+        ['bi-circle-half', 'Mask/Tr', () => this.openSheet('sheetMask')],
         commonDup,
         commonDel
       ];
@@ -2940,10 +2999,10 @@ class MotionFlowApp {
         commonSplit,
         commonDelLeft,
         commonDelRight,
-        ['bi-volume-up text-warning', 'Volume', () => this.openSheet('sheetStyle', 'layer')],
-        ['bi-soundwave text-info', 'Voice FX', () => this.openSheet('sheetStyle', 'layer')],
-        ['bi-graph-up', 'Fade', () => this.openSheet('sheetStyle', 'layer')],
-        ['bi-speedometer2 text-info', 'Speed', () => this.openSheet('sheetStyle', 'layer')],
+        ['bi-volume-up text-warning', 'Volume', () => this.openSheet('sheetEdit')],
+        ['bi-soundwave text-info', 'Voice FX', () => this.openSheet('sheetEdit')],
+        ['bi-graph-up', 'Fade', () => this.openSheet('sheetEdit')],
+        ['bi-speedometer2 text-info', 'Speed', () => this.openSheet('sheetEdit')],
         ['bi-music-note-list text-warning', 'Beat', () => this.toggleBeatAtPlayhead()],
         ['bi-bookmark-plus text-success', 'Marker', () => this.toggleMarkerAtPlayhead()],
         ['bi-arrow-counterclockwise', 'Reverse', () => {
@@ -2960,10 +3019,10 @@ class MotionFlowApp {
         commonSplit,
         commonDelLeft,
         commonDelRight,
-        ['bi-stars text-info', 'Effects', () => this.openSheet('sheetStyle', 'fx', 'effects')],
-        ['bi-palette-fill text-success', 'Filters', () => this.openSheet('sheetStyle', 'fx', 'filters')],
-        ['bi-sliders2 text-warning', 'Adjust/HSL', () => this.openSheet('sheetStyle', 'fx', 'adjust')],
-        ['bi-circle-half', 'Mask/Tr', () => this.openSheet('sheetStyle', 'mask')],
+        ['bi-stars text-info', 'Effects', () => this.openSheet('sheetEffects')],
+        ['bi-palette-fill text-success', 'Filters', () => this.openSheet('sheetFilters')],
+        ['bi-sliders2 text-warning', 'Adjust/HSL', () => this.openSheet('sheetAdjust', null, 'adjust')],
+        ['bi-circle-half', 'Mask/Tr', () => this.openSheet('sheetMask')],
         commonAnim,
         commonTransform,
         commonCopyStyle,
@@ -2992,8 +3051,7 @@ class MotionFlowApp {
 
   openStabilizerUI(layerId = null) {
     if (layerId) this.selectedLayerId = layerId;
-    this.panels.activeStyleTab = 'layer';
-    this.openSheet('sheetStyle', 'layer');
+    this.openSheet('sheetEdit');
     setTimeout(() => {
       document.getElementById('videoStabilizerCard')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
     }, 120);
@@ -3009,7 +3067,7 @@ class MotionFlowApp {
     this.stabilizerState.level = level;
     this.stabilizerState.progressPct = 0;
     this.stabilizerState.progressDetail = 'Scanning video frames...';
-    this.panels.renderStylePanel();
+    this.panels.renderEditPanel();
 
     const prevStab = layer.stabilizer ? JSON.parse(JSON.stringify(layer.stabilizer)) : null;
     try {
@@ -3044,7 +3102,7 @@ class MotionFlowApp {
       this.stabilizerState.isStabilizing = false;
       this.stabilizerState.targetLayerId = null;
       layer.stabilizer = prevStab;
-      this.panels.renderStylePanel();
+      this.panels.renderEditPanel();
       if (err?.message !== 'Stabilization cancelled') {
         this.showToast(err?.message || 'Stabilization failed');
       } else {
@@ -3057,7 +3115,7 @@ class MotionFlowApp {
     this.stabilizerEngine.cancel();
     this.stabilizerState.isStabilizing = false;
     this.stabilizerState.targetLayerId = null;
-    this.panels.renderStylePanel();
+    this.panels.renderEditPanel();
   }
 
   recomputeStabilizerLevel(layerId, level) {
@@ -3121,10 +3179,8 @@ class MotionFlowApp {
         this.seekToFrame(src.startFrame);
       }
     }
-    this.panels.activeStyleTab = 'tracker';
-    this.panels.renderStylePanel();
     this.syncTrackerOverlay();
-    bootstrap.Offcanvas.getOrCreateInstance(document.getElementById('sheetStyle')).show();
+    this.openSheet('sheetTracker');
   }
 
   async runMotionTrack(direction = 'forward') {
@@ -3140,7 +3196,7 @@ class MotionFlowApp {
     this.trackerState.progressPct = 0;
     this.trackerState.progressDetail = `Analyzing from F${anchorFrame}...`;
     src.trackData = { sourceLayerId: src.id, anchorFrame, points: [] };
-    this.panels.renderStylePanel();
+    this.panels.renderTrackerPanel();
 
     try {
       const result = await this.trackerEngine.trackLayer({
@@ -3164,7 +3220,7 @@ class MotionFlowApp {
           this.timelineView.updatePlayhead(this.currentFrame);
           this.updateTransportLabels();
           this.renderPreview();
-          const bar = document.querySelector('#styleBody .progress-bar');
+          const bar = document.querySelector('#trackerBody .progress-bar');
           if (bar) bar.style.width = `${pct}%`;
           const pctLbl = document.getElementById('trkPctLbl');
           if (pctLbl) pctLbl.textContent = `${pct}%`;
@@ -3183,7 +3239,7 @@ class MotionFlowApp {
     } catch (err) {
       this.trackerState.isTracking = false;
       src.trackData = prevTrackData;
-      this.panels.renderStylePanel();
+      this.panels.renderTrackerPanel();
       this.renderPreview();
       this.showToast(err?.message || 'Tracking failed');
     }
@@ -3192,7 +3248,7 @@ class MotionFlowApp {
   cancelMotionTrack() {
     this.trackerEngine.cancel();
     this.trackerState.isTracking = false;
-    this.panels.renderStylePanel();
+    this.panels.renderTrackerPanel();
   }
 
   pinNewTrackedText(srcLayer, textContent, offsetY = -65) {
@@ -3291,7 +3347,7 @@ class MotionFlowApp {
     if (result) {
       this.renderPreview();
       this.refreshTimelineOnly();
-      this.panels.renderStylePanel();
+      this.panels.renderAdjustPanel();
       this.scheduleAutosave();
       if (!opts.silent) {
         this.showToast(`Color matched "${layer.name}" to timeline palette`);
@@ -3375,6 +3431,7 @@ class MotionFlowApp {
     if (!found) return;
     this.pause();
     this.project = deserializeProject(found);
+    this.renderer?.pruneUnusedCaches?.(this.project);
     this.history.clear();
     this.currentFrame = 0;
     this.selectedLayerId = this.project.layers[0]?.id || null;
@@ -3382,6 +3439,7 @@ class MotionFlowApp {
     this.applyThemeMode(this.project?.settings?.themeMode || this._getStoredThemeMode());
     this.setSaveState(true);
     this.updateAllUI();
+    this._preloadProjectAudioBuffers();
     this.showToast(`Opened "${this.project.name}"`);
   }
 
@@ -3408,12 +3466,14 @@ class MotionFlowApp {
     if (id === this.project.id) {
       const remaining = await ProjectStorage.listProjects();
       this.project = deserializeProject(remaining[0]);
+      this.renderer?.pruneUnusedCaches?.(this.project);
       this.history.clear();
       this.currentFrame = 0;
       this.selectedLayerId = this.project.layers[0]?.id || null;
       this.applyThemeMode(this.project?.settings?.themeMode || this._getStoredThemeMode());
       this.setSaveState(true);
       this.updateAllUI();
+      this._preloadProjectAudioBuffers();
     }
     this.panels.renderProjectsList();
   }
@@ -3802,7 +3862,7 @@ class MotionFlowApp {
           this.updateTransportLabels();
           this.syncViewport3DUI();
           this.panels?.renderInspector();
-          if (this.panels?.activeStyleTab === 'camera') this.panels.renderStylePanel();
+          this.panels?.renderCameraPanel();
           this.renderPreview();
         } else if (g.undoPushed) {
           this.onTimelineMutated();
@@ -3961,12 +4021,14 @@ class MotionFlowApp {
           const imported = deserializeProject(jsonText);
           await ProjectStorage.saveProject(imported);
           this.project = imported;
+          this.renderer?.pruneUnusedCaches?.(this.project);
           this.history.clear();
           this.currentFrame = 0;
           this.selectedLayerId = this.project.layers[0]?.id || null;
           this.hideOpenSheets();
           this.applyThemeMode(this.project?.settings?.themeMode || this._getStoredThemeMode());
           this.updateAllUI();
+          this._preloadProjectAudioBuffers();
           this.showToast(`Imported "${imported.name}"`);
         } catch (err) {
           this.showToast('Invalid project JSON file');
@@ -3984,7 +4046,7 @@ class MotionFlowApp {
         if (layer?.type === 'text' && layer.textProps) {
           this.mutateProject(() => { layer.textProps.fontFamily = fontObj.name; });
         } else {
-          this.panels.renderStylePanel();
+          this.panels.renderEditPanel();
         }
         this.showToast(`Loaded font "${fontObj.name}"`);
       },
@@ -4163,9 +4225,7 @@ class MotionFlowApp {
     document.getElementById('btn3DCamKf').onclick = () => this.keyframeCameraAtPlayhead();
     document.getElementById('btn3DCamReset').onclick = () => this.resetCameraRig();
     document.getElementById('btn3DOpenSheet').onclick = () => {
-      this.panels.activeStyleTab = 'camera';
-      this.panels.renderStylePanel();
-      bootstrap.Offcanvas.getOrCreateInstance(document.getElementById('sheetStyle')).show();
+      this.openSheet('sheetCamera');
     };
 
     // Transport Controls
@@ -4352,6 +4412,7 @@ class MotionFlowApp {
       if (!name) return;
       this.pause();
       this.project = createEmptyProject(name.trim() || 'New Motion Project');
+      this.renderer?.pruneUnusedCaches?.(this.project);
       await ProjectStorage.saveProject(this.project);
       this.history.clear();
       this.currentFrame = 0;
@@ -4507,7 +4568,7 @@ class MotionFlowApp {
         this.selectedLayerId = adj.id;
       });
       this.hideOpenSheets();
-      this.openSheet('sheetStyle', 'fx', 'adjust');
+      this.openSheet('sheetAdjust', null, 'adjust');
     });
 
     // Doodle Draw Modal bindings

@@ -92,6 +92,7 @@ export class RendererEngine {
     const vid = this.videoCache.get(mediaId);
     if (vid) {
       try {
+        vid._wantsPlay = false;
         vid.pause();
         vid.removeAttribute('src');
         vid.load();
@@ -102,6 +103,41 @@ export class RendererEngine {
     if (this.glPreview?.textures?.has(mediaId)) {
       this.glPreview.gl.deleteTexture(this.glPreview.textures.get(mediaId));
       this.glPreview.textures.delete(mediaId);
+    }
+    this.glPreview?.textureMeta?.delete(mediaId);
+  }
+
+  pruneUnusedCaches(project) {
+    if (!project || !Array.isArray(project.layers)) return;
+    const activeMediaIds = new Set();
+    const activeLayerIds = new Set();
+    for (const l of project.layers) {
+      activeLayerIds.add(l.id);
+      if (l.mediaId) activeMediaIds.add(l.mediaId);
+    }
+    for (const lid of [...this.rasterCache.keys()]) {
+      if (!activeLayerIds.has(lid)) {
+        this.rasterCache.delete(lid);
+        if (this.glPreview?.textures?.has(lid)) {
+          this.glPreview.gl.deleteTexture(this.glPreview.textures.get(lid));
+          this.glPreview.textures.delete(lid);
+        }
+        this.glPreview?.textureMeta?.delete(lid);
+      }
+    }
+    for (const mid of [...this.videoCache.keys()]) {
+      if (!activeMediaIds.has(mid)) {
+        this.purgeMediaCache(mid);
+      }
+    }
+    for (const mid of [...this.videoLastFrameCache.keys()]) {
+      if (!activeMediaIds.has(mid)) this.videoLastFrameCache.delete(mid);
+    }
+    for (const mid of [...this.videoThumbFallbackCache.keys()]) {
+      if (!activeMediaIds.has(mid)) this.videoThumbFallbackCache.delete(mid);
+    }
+    for (const mid of [...this.gifCache.keys()]) {
+      if (!activeMediaIds.has(mid)) this.gifCache.delete(mid);
     }
   }
 
@@ -679,7 +715,8 @@ export class RendererEngine {
       fxTexB: null,
       fxW: 0,
       fxH: 0,
-      textures: new Map()
+      textures: new Map(),
+      textureMeta: new Map()
     };
   }
 
@@ -745,8 +782,15 @@ export class RendererEngine {
     return compositor.adjTex;
   }
 
-  getOrCreateTexture(compositor, key, sourceEl) {
-    const { gl, textures } = compositor;
+  getOrCreateTexture(compositor, key, sourceEl, cacheToken = null) {
+    const { gl, textures, textureMeta } = compositor;
+    const isVideo = Boolean(
+      sourceEl && (sourceEl.tagName === 'VIDEO' || (typeof HTMLVideoElement !== 'undefined' && sourceEl instanceof HTMLVideoElement))
+    );
+    const sw = sourceEl?.videoWidth || sourceEl?.naturalWidth || sourceEl?.width || 0;
+    const sh = sourceEl?.videoHeight || sourceEl?.naturalHeight || sourceEl?.height || 0;
+    const srcId = sourceEl?.dataset?.srcUrl || sourceEl?.currentSrc || sourceEl?.src || '';
+
     let tex = textures.get(key);
     if (!tex) {
       tex = gl.createTexture();
@@ -758,11 +802,16 @@ export class RendererEngine {
       textures.set(key, tex);
     } else {
       gl.bindTexture(gl.TEXTURE_2D, tex);
+      if (!isVideo && sw > 0 && sh > 0 && textureMeta) {
+        const meta = textureMeta.get(key);
+        if (meta && meta.el === sourceEl && meta.src === srcId && meta.w === sw && meta.h === sh && meta.token === cacheToken) {
+          return tex;
+        }
+      }
     }
+
     try {
       const maxTex = Math.min(2048, Number(gl.getParameter(gl.MAX_TEXTURE_SIZE)) || 2048);
-      const sw = sourceEl?.videoWidth || sourceEl?.naturalWidth || sourceEl?.width || 0;
-      const sh = sourceEl?.videoHeight || sourceEl?.naturalHeight || sourceEl?.height || 0;
       if (sw > maxTex || sh > maxTex) {
         const scale = Math.min(maxTex / sw, maxTex / sh);
         const tw = Math.max(2, Math.round(sw * scale));
@@ -779,9 +828,12 @@ export class RendererEngine {
       } else {
         gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, sourceEl);
       }
+      if (!isVideo && sw > 0 && sh > 0 && textureMeta) {
+        textureMeta.set(key, { el: sourceEl, src: srcId, w: sw, h: sh, token: cacheToken });
+      } else if (isVideo && textureMeta) {
+        textureMeta.delete(key);
+      }
     } catch {
-      const sw = sourceEl?.videoWidth || sourceEl?.naturalWidth || sourceEl?.width || 0;
-      const sh = sourceEl?.videoHeight || sourceEl?.naturalHeight || sourceEl?.height || 0;
       if (sw > 0 && sh > 0) {
         if (!this._safeTexCanvas) this._safeTexCanvas = document.createElement('canvas');
         const tw = Math.min(1920, sw);
@@ -881,7 +933,8 @@ export class RendererEngine {
     if (!host) {
       host = document.createElement('div');
       host.id = 'mfHiddenVideoHost';
-      host.style.cssText = 'position:fixed;left:-9999px;top:0;width:2px;height:2px;opacity:0.001;pointer-events:none;overflow:hidden;z-index:-1;';
+      // Keep inside viewport bounds behind preview so Android WebView Chromium compositor always decodes active frames
+      host.style.cssText = 'position:fixed;left:0;top:0;width:2px;height:2px;opacity:0.004;pointer-events:none;overflow:hidden;z-index:-1;';
       host.setAttribute('aria-hidden', 'true');
       document.body.appendChild(host);
     }
@@ -898,15 +951,19 @@ export class RendererEngine {
     }
     const vw = vid.videoWidth;
     const vh = vid.videoHeight;
-    if (entry.canvas.width !== vw || entry.canvas.height !== vh) {
-      entry.canvas.width = vw;
-      entry.canvas.height = vh;
+    const scale = Math.min(1, 360 / Math.max(vw, vh));
+    const cw = Math.max(2, Math.round(vw * scale));
+    const ch = Math.max(2, Math.round(vh * scale));
+    if (entry.canvas.width !== cw || entry.canvas.height !== ch) {
+      entry.canvas.width = cw;
+      entry.canvas.height = ch;
     }
     entry.width = vw;
     entry.height = vh;
+    entry.canvas._mfVersion = (entry.canvas._mfVersion || 0) + 1;
     try {
       const ctx = entry.canvas.getContext('2d');
-      ctx.drawImage(vid, 0, 0, vw, vh);
+      ctx.drawImage(vid, 0, 0, cw, ch);
       return entry;
     } catch {
       return null;
@@ -917,8 +974,13 @@ export class RendererEngine {
     if (!mediaItem || !mediaItem.url) return null;
     if (this.videoCache.has(mediaItem.id)) {
       const existing = this.videoCache.get(mediaItem.id);
-      if (existing.dataset.srcUrl === mediaItem.url) return existing;
+      if (existing.dataset.srcUrl === mediaItem.url) {
+        const host = this._ensureHiddenVideoHost();
+        if (host && !existing.isConnected) host.appendChild(existing);
+        return existing;
+      }
       try {
+        existing._wantsPlay = false;
         existing.pause();
         existing.remove();
       } catch {}
@@ -939,25 +1001,56 @@ export class RendererEngine {
     vid.setAttribute('webkit-playsinline', '');
     vid.preload = 'auto';
     vid.dataset.srcUrl = urlStr;
+    vid._wantsPlay = false;
+    vid._pendingPlayTargetTime = null;
+    vid._lastSyncSeekMs = 0;
 
-    const notifyReady = () => {
-      if (vid.readyState >= 2 && vid.videoWidth > 0) {
+    const notifyReady = (captureFallback = false) => {
+      if (captureFallback && vid.readyState >= 2 && vid.videoWidth > 0) {
         this.captureVideoFallbackFrame(mediaItem.id, vid);
       }
       this.onMediaFrameReady?.(mediaItem);
     };
+    const maybeResumePendingPlay = () => {
+      if (!vid._wantsPlay) return;
+      if (vid._pendingPlayTargetTime !== null && vid._pendingPlayTargetTime !== undefined && vid.readyState >= 1) {
+        const tgt = vid._pendingPlayTargetTime;
+        vid._pendingPlayTargetTime = null;
+        if (!vid.seeking && Math.abs(vid.currentTime - tgt) > 0.08) {
+          vid._lastSyncSeekMs = typeof performance !== 'undefined' ? performance.now() : Date.now();
+          try { vid.currentTime = tgt; } catch {}
+        }
+      }
+      if (vid.paused && vid.readyState >= 1) {
+        vid.play().catch(() => {});
+      }
+    };
+
     vid.addEventListener('loadedmetadata', () => {
-      // Nudge WebView decoder off exact t=0 so the first video frame decodes reliably when paused
-      if (vid.readyState < 2 && vid.paused && !vid._primedFrame0) {
+      if (vid._wantsPlay) {
+        maybeResumePendingPlay();
+      } else if (vid.readyState < 2 && vid.paused && !vid._primedFrame0) {
         vid._primedFrame0 = true;
         try { vid.currentTime = 0.001; } catch {}
       }
-      notifyReady();
+      notifyReady(false);
     });
-    vid.addEventListener('loadeddata', notifyReady);
-    vid.addEventListener('canplay', notifyReady);
-    vid.addEventListener('playing', notifyReady);
+    vid.addEventListener('loadeddata', () => {
+      maybeResumePendingPlay();
+      notifyReady(!vid._wantsPlay);
+    });
+    vid.addEventListener('canplay', () => {
+      maybeResumePendingPlay();
+      notifyReady(false);
+    });
+    vid.addEventListener('playing', () => notifyReady(false));
     vid.addEventListener('seeked', () => {
+      if (vid._wantsPlay) {
+        vid._pendingSeekTime = null;
+        if (vid.paused) vid.play().catch(() => {});
+        notifyReady(false);
+        return;
+      }
       if (vid._pendingSeekTime !== undefined && vid._pendingSeekTime !== null) {
         const nextT = vid._pendingSeekTime;
         vid._pendingSeekTime = null;
@@ -966,8 +1059,9 @@ export class RendererEngine {
           return;
         }
       }
-      notifyReady();
+      notifyReady(true);
     });
+    vid.addEventListener('ended', () => notifyReady(true));
 
     vid.src = urlStr;
     const host = this._ensureHiddenVideoHost();
@@ -997,6 +1091,8 @@ export class RendererEngine {
   syncVideoPlayback(project, frame, mediaMap, isPlaying, shuttleRate = 1) {
     const fps = Math.max(1, project?.fps || 30);
     const activeMediaIds = new Set();
+    const nowMs = typeof performance !== 'undefined' ? performance.now() : Date.now();
+    const maxConcurrentDecoders = 4;
 
     if (isPlaying && shuttleRate > 0 && project && Array.isArray(project.layers)) {
       for (const layer of project.layers) {
@@ -1004,12 +1100,14 @@ export class RendererEngine {
         if (frame < layer.startFrame || frame > layer.endFrame) continue;
         const mediaItem = mediaMap.get(layer.mediaId);
         if (!mediaItem) continue;
+        if (!activeMediaIds.has(mediaItem.id) && activeMediaIds.size >= maxConcurrentDecoders) continue;
         const vid = this.getVideoElement(mediaItem);
         if (!vid) continue;
         activeMediaIds.add(mediaItem.id);
 
         const targetTime = this._computeVideoTargetTime(layer, frame, fps, vid, mediaItem);
         if (layer.reversed) {
+          vid._wantsPlay = false;
           if (!vid.paused) vid.pause();
           if (!vid.seeking && Math.abs(vid.currentTime - targetTime) > 0.03) {
             try { vid.currentTime = targetTime; } catch {}
@@ -1024,29 +1122,50 @@ export class RendererEngine {
           Math.min(4.0, shuttleRate * (layer.speed || 1) * TimelineEngine.evaluateLayerSpeedFactor(layer, normT))
         );
         vid.muted = true;
+        vid._wantsPlay = true;
         if (Math.abs((vid.playbackRate || 1) - rate) > 0.04) {
           try { vid.playbackRate = rate; } catch {}
         }
 
-        if (vid.readyState >= 1) {
-          if (vid.paused) {
-            if (!vid.seeking && Math.abs(vid.currentTime - targetTime) > 0.07) {
-              try { vid.currentTime = targetTime; } catch {}
-            }
-            vid.play().catch(() => {});
-          } else if (!vid.seeking && Math.abs(vid.currentTime - targetTime) > 0.28) {
+        if (vid.readyState === 0) {
+          vid._pendingPlayTargetTime = targetTime;
+          if (vid.networkState === 0) {
+            try { vid.load(); } catch {}
+          }
+          vid.play?.().catch?.(() => {});
+        } else if (vid.paused) {
+          vid._pendingPlayTargetTime = null;
+          if (!vid.seeking && Math.abs(vid.currentTime - targetTime) > 0.08) {
+            vid._lastSyncSeekMs = nowMs;
             try { vid.currentTime = targetTime; } catch {}
           }
+          vid.play?.().catch?.(() => {});
+        } else if (vid.ended && targetTime < (vid.duration || targetTime) - 0.12) {
+          vid._lastSyncSeekMs = nowMs;
+          try { vid.currentTime = targetTime; } catch {}
+          vid.play?.().catch?.(() => {});
+        } else if (
+          !vid.seeking &&
+          Math.abs(vid.currentTime - targetTime) > 0.75 &&
+          nowMs - (vid._lastSyncSeekMs || 0) > 900
+        ) {
+          vid._lastSyncSeekMs = nowMs;
+          try { vid.currentTime = targetTime; } catch {}
         }
       }
     }
 
     for (const [id, vid] of this.videoCache.entries()) {
-      if (!activeMediaIds.has(id) && !vid.paused) {
-        if (vid.readyState >= 2 && vid.videoWidth > 0) {
+      if (!activeMediaIds.has(id)) {
+        const wasPlaying = vid._wantsPlay || !vid.paused;
+        vid._wantsPlay = false;
+        vid._pendingPlayTargetTime = null;
+        if (!vid.paused) {
+          try { vid.pause(); } catch {}
+        }
+        if (wasPlaying && vid.readyState >= 2 && vid.videoWidth > 0) {
           this.captureVideoFallbackFrame(id, vid);
         }
-        try { vid.pause(); } catch {}
       }
     }
   }
@@ -1322,6 +1441,7 @@ export class RendererEngine {
     }
 
     ctx.restore();
+    c._mfVersion = (c._mfVersion || 0) + 1;
     this.rasterCache.set(layer.id, { key, canvas: c, drawW: cw, drawH: ch, contentW: w, contentH: h });
     return c;
   }
@@ -1346,11 +1466,11 @@ export class RendererEngine {
       if (!item) return null;
       if (item.isGif) {
         const gifCanvas = this.getGifFrameCanvas(item, layer, frame, projectFps);
-        if (gifCanvas) return { el: gifCanvas, w: layer.width || gifCanvas.width, h: layer.height || gifCanvas.height };
+        if (gifCanvas) return { el: gifCanvas, w: layer.width || gifCanvas.width, h: layer.height || gifCanvas.height, token: gifCanvas._mfVersion || frame };
       }
       const img = this.getImageElement(item);
       if (img && img.complete && img.naturalWidth > 0) {
-        return { el: img, w: layer.width || img.naturalWidth, h: layer.height || img.naturalHeight };
+        return { el: img, w: layer.width || img.naturalWidth, h: layer.height || img.naturalHeight, token: item.url };
       }
       return null;
     }
@@ -1359,12 +1479,11 @@ export class RendererEngine {
       if (!item) return null;
       const vid = this.getVideoElement(item);
       if (vid && vid.readyState >= 2 && vid.videoWidth > 0) {
-        this.captureVideoFallbackFrame(item.id, vid);
         return { el: vid, w: layer.width || vid.videoWidth, h: layer.height || vid.videoHeight };
       }
       const cachedFrame = this.videoLastFrameCache.get(item.id);
       if (cachedFrame && cachedFrame.width > 0) {
-        return { el: cachedFrame.canvas, w: layer.width || cachedFrame.width, h: layer.height || cachedFrame.height };
+        return { el: cachedFrame.canvas, w: layer.width || cachedFrame.width, h: layer.height || cachedFrame.height, token: cachedFrame.canvas._mfVersion || 1 };
       }
       if (item.thumbUrl) {
         let thumbImg = this.videoThumbFallbackCache.get(item.id);
@@ -1376,14 +1495,14 @@ export class RendererEngine {
           this.videoThumbFallbackCache.set(item.id, thumbImg);
         }
         if (thumbImg.complete && thumbImg.naturalWidth > 0) {
-          return { el: thumbImg, w: layer.width || item.width || thumbImg.naturalWidth, h: layer.height || item.height || thumbImg.naturalHeight };
+          return { el: thumbImg, w: layer.width || item.width || thumbImg.naturalWidth, h: layer.height || item.height || thumbImg.naturalHeight, token: item.thumbUrl };
         }
       }
       return null;
     }
     if (layer.type === 'text' || layer.type === 'shape') {
       const c = this.getOrRasterizeVectorLayer(layer, frame);
-      return { el: c, w: c.width, h: c.height };
+      return { el: c, w: c.width, h: c.height, token: c._mfVersion || 1 };
     }
     return null;
   }
@@ -1665,7 +1784,7 @@ export class RendererEngine {
     const bgMode = project.backgroundMode || 'color';
     if (bgMode === 'gradient') {
       const gradC = this.getGradientBgCanvas(project.backgroundGradient?.[0], project.backgroundGradient?.[1]);
-      this.getOrCreateTexture(compositor, '__bg_grad', gradC);
+      this.getOrCreateTexture(compositor, '__bg_grad', gradC, this.bgGradientCache?.key || 'grad');
       this._resetDefaultShaderUniforms(compositor);
       gl.uniformMatrix4fv(uMvp, false, Mat4.scale(Mat4.identity(), 2, 2, 1));
       gl.uniform2f(uTexel, 1 / 16, 1 / 128);
@@ -1677,7 +1796,7 @@ export class RendererEngine {
       if (bgLayer) {
         const bgDrawable = this.resolveLayerDrawable(bgLayer, frame, project.fps || 30, mediaMap);
         if (bgDrawable) {
-          this.getOrCreateTexture(compositor, bgLayer.mediaId || bgLayer.id, bgDrawable.el);
+          this.getOrCreateTexture(compositor, bgLayer.mediaId || bgLayer.id, bgDrawable.el, bgDrawable.token ?? null);
           this._resetDefaultShaderUniforms(compositor);
           const scaleCover = Math.max(project.width / Math.max(1, bgDrawable.w), project.height / Math.max(1, bgDrawable.h));
           const sxCover = (bgDrawable.w * scaleCover) / project.width * 2;
@@ -1800,7 +1919,7 @@ export class RendererEngine {
             model = Mat4.scale(model, drawable.w, drawable.h, 1);
 
             mvp = Mat4.multiply(projMat, Mat4.multiply(viewMat, model));
-            this.getOrCreateTexture(compositor, layer.mediaId || layer.id, drawable.el);
+            this.getOrCreateTexture(compositor, layer.mediaId || layer.id, drawable.el, drawable.token ?? null);
             texelW = Math.max(1, drawable.w);
             texelH = Math.max(1, drawable.h);
           }

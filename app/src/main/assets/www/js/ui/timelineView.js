@@ -197,6 +197,41 @@ export function isSnapActive(project, modifierHeld = false) {
   return Boolean(project?.settings?.snapToTimeline) && !Boolean(modifierHeld);
 }
 
+export function resolveMainTrackThumbSrc(project, mediaMap) {
+  if (typeof project?.coverDataUrl === 'string' && project.coverDataUrl.length > 0) {
+    return project.coverDataUrl;
+  }
+  const layers = Array.isArray(project?.layers) ? project.layers : [];
+  const lookupMedia = (mediaId) => {
+    if (!mediaId || !mediaMap) return null;
+    if (typeof mediaMap.get === 'function') return mediaMap.get(mediaId) || null;
+    return mediaMap[mediaId] || null;
+  };
+  const mainLayers = layers
+    .filter((l) => l && l.trackRole === 'main')
+    .sort((a, b) => (a.startFrame || 0) - (b.startFrame || 0));
+  for (const layer of mainLayers) {
+    const mItem = lookupMedia(layer.mediaId);
+    if (!mItem) continue;
+    if (typeof mItem.thumbUrl === 'string' && mItem.thumbUrl.length > 0) return mItem.thumbUrl;
+    if (mItem.type === 'image' && typeof mItem.url === 'string' && mItem.url.length > 0) return mItem.url;
+  }
+  return null;
+}
+
+export function cloneKeyframesMap(kf) {
+  if (!kf || typeof kf !== 'object') return {};
+  const out = {};
+  for (const [prop, list] of Object.entries(kf)) {
+    if (!Array.isArray(list)) continue;
+    out[prop] = list.map((item) => {
+      if (!item || typeof item !== 'object') return item;
+      return item.bezier ? { ...item, bezier: item.bezier.slice() } : { ...item };
+    });
+  }
+  return out;
+}
+
 export function computeEdgeAutoScrollDelta(
   clientX,
   scrollRectLeft,
@@ -261,7 +296,9 @@ export class TimelineView {
     this._lastBeatMarkers = [];
     this._lastDrawnScrollLeft = -1;
     this.isScrubbing = false;
-    this.filmstripCache = new Map(); // mediaId -> HTMLCanvasElement strip | 'loading'
+    this.filmstripCache = new Map(); // mediaId -> HTMLCanvasElement[] | 'loading'
+    this._filmstripQueue = [];
+    this._filmstripBusy = false;
     this._waveEntries = [];
     this._filmstripEntries = [];
     this._lastRenderContext = null;
@@ -437,7 +474,7 @@ export class TimelineView {
         const ctx = tile.getContext('2d');
         ctx.drawImage(img, 0, 0, tile.width, tile.height);
         this.filmstripCache.set(mediaItem.id, [tile]);
-        this.cb.onPinchZoom?.(); // gentle timeline redraw
+        this.cb.onPinchZoom?.();
       };
       img.onerror = () => this.filmstripCache.delete(mediaItem.id);
       img.src = imgUrl;
@@ -446,43 +483,89 @@ export class TimelineView {
 
     if (mediaItem.type === 'video') {
       this.filmstripCache.set(mediaItem.id, 'loading');
-      const vid = document.createElement('video');
-      vid.crossOrigin = 'anonymous';
-      vid.muted = true;
-      vid.playsInline = true;
-      vid.preload = 'metadata';
-      vid.onloadeddata = async () => {
-        try {
-          const rawDur = isFinite(vid.duration) && vid.duration > 0 ? vid.duration : 2;
-          const dur = Math.max(0.2, Math.min(3600, rawDur));
-          const samples = 4;
-          const tiles = [];
-          for (let i = 0; i < samples; i++) {
-            const t = Math.max(0, Math.min(Math.max(0, dur - 0.05), (dur * (i + 0.15)) / samples));
-            await new Promise((res) => {
-              const done = () => { vid.removeEventListener('seeked', done); res(); };
-              vid.addEventListener('seeked', done, { once: true });
-              try { vid.currentTime = t; } catch { res(); }
-              setTimeout(done, 160);
-            });
-            const tile = document.createElement('canvas');
-            tile.width = 56;
-            tile.height = 34;
-            tile.getContext('2d').drawImage(vid, 0, 0, tile.width, tile.height);
-            tiles.push(tile);
-          }
-          this.filmstripCache.set(mediaItem.id, tiles);
-          this.cb.onPinchZoom?.();
-        } catch {
-          this.filmstripCache.delete(mediaItem.id);
-        } finally {
-          try { vid.removeAttribute('src'); vid.load(); } catch {}
-        }
-      };
-      vid.onerror = () => this.filmstripCache.delete(mediaItem.id);
-      vid.src = mediaItem.url;
+      this._filmstripQueue.push(mediaItem);
+      this._pumpFilmstripQueue();
     }
     return null;
+  }
+
+  _pumpFilmstripQueue() {
+    if (this._filmstripBusy || this._filmstripQueue.length === 0) return;
+    if (this.cb.isPlaying?.()) {
+      setTimeout(() => this._pumpFilmstripQueue(), 350);
+      return;
+    }
+    const mediaItem = this._filmstripQueue.shift();
+    if (!mediaItem || !mediaItem.url) {
+      this._pumpFilmstripQueue();
+      return;
+    }
+    if (this.filmstripCache.get(mediaItem.id) !== 'loading') {
+      this._pumpFilmstripQueue();
+      return;
+    }
+
+    this._filmstripBusy = true;
+    const finishItem = () => {
+      this._filmstripBusy = false;
+      setTimeout(() => this._pumpFilmstripQueue(), 60);
+    };
+
+    const vid = document.createElement('video');
+    vid.crossOrigin = 'anonymous';
+    vid.muted = true;
+    vid.playsInline = true;
+    vid.preload = 'metadata';
+    let settled = false;
+    const cleanup = () => {
+      try { vid.removeAttribute('src'); vid.load(); } catch {}
+    };
+    vid.onloadeddata = async () => {
+      if (settled) return;
+      settled = true;
+      try {
+        const rawDur = isFinite(vid.duration) && vid.duration > 0 ? vid.duration : 2;
+        const dur = Math.max(0.2, Math.min(3600, rawDur));
+        const samples = 3;
+        const tiles = [];
+        for (let i = 0; i < samples; i++) {
+          const t = Math.max(0, Math.min(Math.max(0, dur - 0.05), (dur * (i + 0.15)) / samples));
+          await new Promise((res) => {
+            const done = () => { vid.removeEventListener('seeked', done); res(); };
+            vid.addEventListener('seeked', done, { once: true });
+            try { vid.currentTime = t; } catch { res(); }
+            setTimeout(done, 120);
+          });
+          const tile = document.createElement('canvas');
+          tile.width = 56;
+          tile.height = 34;
+          tile.getContext('2d').drawImage(vid, 0, 0, tile.width, tile.height);
+          tiles.push(tile);
+        }
+        this.filmstripCache.set(mediaItem.id, tiles);
+        this.cb.onPinchZoom?.();
+      } catch {
+        this.filmstripCache.delete(mediaItem.id);
+      } finally {
+        cleanup();
+        finishItem();
+      }
+    };
+    vid.onerror = () => {
+      if (settled) return;
+      settled = true;
+      this.filmstripCache.delete(mediaItem.id);
+      cleanup();
+      finishItem();
+    };
+    setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      this.filmstripCache.delete(mediaItem.id);
+      cleanup();
+      finishItem();
+    }, 3500);
+    vid.src = mediaItem.url;
   }
 
   _setZoomAnchored(nextPx, anchorFrame = null, explicitScreenX = null) {
@@ -1741,12 +1824,15 @@ export class TimelineView {
               ? 'is-magnet'
               : '';
 
+    const thumbSrc = resolveMainTrackThumbSrc(project, mediaMap);
     const hdr = document.createElement('div');
     hdr.className = `mf-track-header-item main-track d-flex align-items-center justify-content-between ${anySelected ? 'selected' : ''} ${isMainCompact ? 'compact' : ''}`.trim();
     hdr.dataset.zone = 'main';
     hdr.innerHTML = `
       <div class="d-flex align-items-center gap-1 min-w-0 flex-grow-1 overflow-hidden">
-        <i class="bi bi-film text-info small flex-shrink-0"></i>
+        <button type="button" class="mf-main-thumb-box ${thumbSrc ? 'has-thumb' : 'is-empty'} ${isMainCompact ? 'compact' : ''}" data-act="main-thumb" title="${thumbSrc ? 'Cover / Thumbnail Main Track (Ketuk untuk perbarui)' : 'Tambah Thumbnail / Media Main Track'}" aria-label="${thumbSrc ? 'Thumbnail Main Track' : 'Tambah Thumbnail atau Media Main Track'}">
+          ${thumbSrc ? `<img src="${thumbSrc}" alt="Main Cover" loading="lazy" decoding="async" />` : `<i class="bi bi-plus-lg"></i>`}
+        </button>
         <span class="mf-track-title text-info min-w-0">Main</span>
         <span class="badge bg-info bg-opacity-25 text-info px-1 flex-shrink-0" style="font-size:0.54rem;">${mainClips.length}</span>
       </div>
@@ -1759,6 +1845,12 @@ export class TimelineView {
     `;
 
     hdr.addEventListener('click', (e) => {
+      const thumbBtn = e.target.closest('button[data-act="main-thumb"]');
+      if (thumbBtn) {
+        e.stopPropagation();
+        this.cb.onMainTrackThumbClick?.();
+        return;
+      }
       const btn = e.target.closest('button[data-act="open-wheel"]');
       if (btn) {
         e.stopPropagation();
@@ -2667,8 +2759,19 @@ export class TimelineView {
       }
     };
 
+    let pendingDragRaf = null;
+    let pendingDragDirty = false;
+    const cancelDragRaf = () => {
+      if (pendingDragRaf !== null) {
+        cancelAnimationFrame(pendingDragRaf);
+        pendingDragRaf = null;
+      }
+      pendingDragDirty = false;
+    };
+
     const stopActiveGestureLoops = () => {
       cancelHold();
+      cancelDragRaf();
       this._stopEdgeAutoScroll();
       if (this._activeDragReapply === reapplyCurrentDrag) {
         this._activeDragReapply = null;
@@ -2683,7 +2786,7 @@ export class TimelineView {
         for (const g of multiGroupSnapshot) {
           g.layer.startFrame = g.startFrame;
           g.layer.endFrame = g.endFrame;
-          g.layer.keyframes = JSON.parse(JSON.stringify(g.keyframes));
+          g.layer.keyframes = cloneKeyframesMap(g.keyframes);
           if (g.clipEl) {
             g.clipEl.style.left = `${g.startFrame * this.pxPerFrame}px`;
           }
@@ -2693,7 +2796,7 @@ export class TimelineView {
           snap.layer.startFrame = snap.startFrame;
           snap.layer.endFrame = snap.endFrame;
           snap.layer.mediaOffsetFrames = snap.mediaOffsetFrames;
-          snap.layer.keyframes = JSON.parse(JSON.stringify(snap.keyframes));
+          snap.layer.keyframes = cloneKeyframesMap(snap.keyframes);
           snap.clipEl.style.left = `${snap.startFrame * this.pxPerFrame}px`;
           snap.clipEl.style.width = `${Math.max(24, (snap.endFrame - snap.startFrame) * this.pxPerFrame)}px`;
         }
@@ -2701,7 +2804,7 @@ export class TimelineView {
         layer.startFrame = origStart;
         layer.endFrame = origEnd;
         layer.mediaOffsetFrames = origMediaOffset;
-        layer.keyframes = JSON.parse(JSON.stringify(origKeyframes || {}));
+        layer.keyframes = cloneKeyframesMap(origKeyframes || {});
         clip.style.left = `${origStart * this.pxPerFrame}px`;
         clip.style.width = `${Math.max(24, (origEnd - origStart) * this.pxPerFrame)}px`;
       }
@@ -2784,7 +2887,7 @@ export class TimelineView {
         for (const g of multiGroupSnapshot) {
           g.layer.startFrame = Math.max(0, g.origStart + effectiveDelta);
           g.layer.endFrame = g.layer.startFrame + Math.max(5, g.origEnd - g.origStart);
-          g.layer.keyframes = JSON.parse(JSON.stringify(g.keyframes));
+          g.layer.keyframes = cloneKeyframesMap(g.keyframes);
           TimelineEngine.shiftLayerKeyframes(g.layer, effectiveDelta);
           TimelineEngine.ensureProjectDuration(project, g.layer.endFrame);
           if (g.clipEl) {
@@ -2921,7 +3024,7 @@ export class TimelineView {
       if (mode === 'move') {
         layer.startFrame = origStart;
         layer.endFrame = origEnd;
-        layer.keyframes = JSON.parse(JSON.stringify(origKeyframes));
+        layer.keyframes = cloneKeyframesMap(origKeyframes);
         const moveRes = TimelineEngine.moveClip(
           project,
           layer.id,
@@ -2949,13 +3052,13 @@ export class TimelineView {
             snap.layer.startFrame = snap.startFrame;
             snap.layer.endFrame = snap.endFrame;
             snap.layer.mediaOffsetFrames = snap.mediaOffsetFrames;
-            snap.layer.keyframes = JSON.parse(JSON.stringify(snap.keyframes));
+            snap.layer.keyframes = cloneKeyframesMap(snap.keyframes);
           }
         } else {
           layer.startFrame = origStart;
           layer.endFrame = origEnd;
           layer.mediaOffsetFrames = origMediaOffset;
-          layer.keyframes = JSON.parse(JSON.stringify(origKeyframes || {}));
+          layer.keyframes = cloneKeyframesMap(origKeyframes || {});
         }
         const targetFrame = (mode === 'left' ? origStart : origEnd) + deltaFrames;
         const trimRes = TimelineEngine.trimMainOrClip(
@@ -3085,7 +3188,7 @@ export class TimelineView {
       origStart = layer.startFrame;
       origEnd = layer.endFrame;
       origMediaOffset = layer.mediaOffsetFrames || 0;
-      origKeyframes = JSON.parse(JSON.stringify(layer.keyframes || {}));
+      origKeyframes = cloneKeyframesMap(layer.keyframes || {});
       pendingCenterFrame = null;
       pendingDrop = null;
       slowAccumMs = 0;
@@ -3105,7 +3208,7 @@ export class TimelineView {
             origEnd: l.endFrame,
             startFrame: l.startFrame,
             endFrame: l.endFrame,
-            keyframes: JSON.parse(JSON.stringify(l.keyframes || {}))
+            keyframes: cloneKeyframesMap(l.keyframes || {})
           }));
       } else {
         multiGroupSnapshot = null;
@@ -3118,7 +3221,7 @@ export class TimelineView {
           startFrame: r.layer.startFrame,
           endFrame: r.layer.endFrame,
           mediaOffsetFrames: r.layer.mediaOffsetFrames || 0,
-          keyframes: JSON.parse(JSON.stringify(r.layer.keyframes || {}))
+          keyframes: cloneKeyframesMap(r.layer.keyframes || {})
         }));
       } else {
         origMainSnapshot = null;
@@ -3218,12 +3321,25 @@ export class TimelineView {
       lastClientX = e.clientX;
       lastClientY = e.clientY;
       this._updateModifierHeld(Boolean(e.altKey || e.shiftKey), true);
-      applyDragStep(lastClientX, lastClientY, false);
+      pendingDragDirty = true;
+      if (pendingDragRaf === null) {
+        pendingDragRaf = requestAnimationFrame(() => {
+          pendingDragRaf = null;
+          if (!mode || !holdActivated || !pendingDragDirty) return;
+          pendingDragDirty = false;
+          applyDragStep(lastClientX, lastClientY, false);
+        });
+      }
     });
 
     const onEnd = (e) => {
       const wasHoldActive = holdActivated;
       const prevMode = mode;
+      const hadPendingMove = pendingDragDirty && wasHoldActive && Boolean(prevMode);
+      cancelDragRaf();
+      if (hadPendingMove) {
+        applyDragStep(lastClientX, lastClientY, false);
+      }
       cancelHold();
       this._activeClipAbort = null;
       stopActiveGestureLoops();
@@ -3270,7 +3386,7 @@ export class TimelineView {
             snap.layer.startFrame = snap.startFrame;
             snap.layer.endFrame = snap.endFrame;
             snap.layer.mediaOffsetFrames = snap.mediaOffsetFrames;
-            snap.layer.keyframes = JSON.parse(JSON.stringify(snap.keyframes));
+            snap.layer.keyframes = cloneKeyframesMap(snap.keyframes);
           }
         }
         this.cb.onDropClipInTimeline?.(layer.id, d);

@@ -304,7 +304,9 @@ import {
   formatSignedDurationDelta,
   getClipStatusBadges,
   isSnapActive,
-  computeEdgeAutoScrollDelta
+  computeEdgeAutoScrollDelta,
+  resolveMainTrackThumbSrc,
+  cloneKeyframesMap
 } from '../src/main/assets/www/js/ui/timelineView.js';
 
 test('ExportEngine effective trimmed duration & even dimensions', () => {
@@ -1618,6 +1620,148 @@ test('Per-layer procedural motionBlur defaults, velocity detection & Dark/Light 
     assert.ok(Number.isFinite(midVal), `Preset ${bp.id} midpoint should be finite`);
   }
 });
+
+test('Main Track left thumbnail resolution (cover priority, clip fallback, empty + state) & cloneKeyframesMap', () => {
+  const proj = createEmptyProject('ThumbTest', { width: 1080, height: 1920, fps: 30, durationSec: 5 });
+  const mediaMap = new Map([
+    ['vid1', { id: 'vid1', type: 'video', url: 'blob:v1', thumbUrl: 'data:image/jpeg;base64,V1' }],
+    ['img1', { id: 'img1', type: 'image', url: 'blob:img1', thumbUrl: '' }],
+    ['ovl1', { id: 'ovl1', type: 'image', url: 'blob:ovl', thumbUrl: 'data:image/jpeg;base64,OVL' }]
+  ]);
+
+  // Empty timeline -> null (UI renders '+' button)
+  assert.equal(resolveMainTrackThumbSrc(proj, mediaMap), null);
+
+  // Overlay-only clip is ignored by Main Track thumbnail box
+  const overlayLayer = TimelineEngine.createMediaLayer(proj, mediaMap.get('ovl1'), 0, { trackRole: 'overlay' });
+  TimelineEngine.addLayer(proj, overlayLayer);
+  assert.equal(resolveMainTrackThumbSrc(proj, mediaMap), null);
+
+  // Main track image with no thumbUrl falls back to image url
+  const mainImg = TimelineEngine.createMediaLayer(proj, mediaMap.get('img1'), 0, { trackRole: 'main' });
+  TimelineEngine.addToMainTrack(proj, mainImg);
+  assert.equal(resolveMainTrackThumbSrc(proj, mediaMap), 'blob:img1');
+
+  // Main track video with thumbUrl uses video thumbUrl when placed first
+  const mainVid = TimelineEngine.createMediaLayer(proj, mediaMap.get('vid1'), 0, { trackRole: 'main' });
+  TimelineEngine.addToMainTrack(proj, mainVid);
+  TimelineEngine.reorderMainTrackClipByFrame(proj, mainVid.id, 0);
+  assert.equal(resolveMainTrackThumbSrc(proj, mediaMap), 'data:image/jpeg;base64,V1');
+
+  // Explicit coverDataUrl overrides clip thumbnails
+  proj.coverDataUrl = 'data:image/jpeg;base64,COVER';
+  assert.equal(resolveMainTrackThumbSrc(proj, mediaMap), 'data:image/jpeg;base64,COVER');
+
+  // cloneKeyframesMap creates independent deep copy including nested bezier arrays
+  const kfSrc = {
+    x: [{ frame: 0, value: 10, easing: 'cubicBezier', bezier: [0.2, 0.8, 0.3, 1.0] }],
+    opacity: [{ frame: 15, value: 0.5, easing: 'linear' }]
+  };
+  const kfClone = cloneKeyframesMap(kfSrc);
+  kfClone.x[0].value = 999;
+  kfClone.x[0].bezier[0] = 0.99;
+  assert.equal(kfSrc.x[0].value, 10);
+  assert.equal(kfSrc.x[0].bezier[0], 0.2);
+});
+
+test('RendererEngine getOrCreateTexture dirty-checks static layers and syncVideoPlayback avoids readyState 0 seek thrashing', () => {
+  // 1. WebGL texture upload dirty-check
+  let uploadCount = 0;
+  const mockGl = {
+    TEXTURE_2D: 0x0DE1,
+    RGBA: 0x1908,
+    UNSIGNED_BYTE: 0x1401,
+    LINEAR: 0x2601,
+    CLAMP_TO_EDGE: 0x812F,
+    TEXTURE_MIN_FILTER: 0x2801,
+    TEXTURE_MAG_FILTER: 0x2800,
+    TEXTURE_WRAP_S: 0x2802,
+    TEXTURE_WRAP_T: 0x2803,
+    MAX_TEXTURE_SIZE: 0x0D33,
+    createTexture: () => ({ id: 'tex_1' }),
+    bindTexture: () => {},
+    texParameteri: () => {},
+    getParameter: () => 2048,
+    texImage2D: () => { uploadCount += 1; }
+  };
+  const compositor = { gl: mockGl, textures: new Map(), textureMeta: new Map() };
+  const texCtx = {};
+
+  const staticCanvas = { tagName: 'CANVAS', width: 200, height: 100 };
+  RendererEngine.prototype.getOrCreateTexture.call(texCtx, compositor, 'layer_static', staticCanvas, 1);
+  assert.equal(uploadCount, 1);
+  // Same element & token skips redundant texImage2D upload
+  RendererEngine.prototype.getOrCreateTexture.call(texCtx, compositor, 'layer_static', staticCanvas, 1);
+  assert.equal(uploadCount, 1);
+  // Incremented token triggers fresh upload
+  RendererEngine.prototype.getOrCreateTexture.call(texCtx, compositor, 'layer_static', staticCanvas, 2);
+  assert.equal(uploadCount, 2);
+
+  // VIDEO elements always upload new frame on render tick
+  const mockVideoEl = { tagName: 'VIDEO', videoWidth: 640, videoHeight: 360 };
+  RendererEngine.prototype.getOrCreateTexture.call(texCtx, compositor, 'vid_tex', mockVideoEl, null);
+  RendererEngine.prototype.getOrCreateTexture.call(texCtx, compositor, 'vid_tex', mockVideoEl, null);
+  assert.equal(uploadCount, 4);
+
+  // 2. syncVideoPlayback at readyState === 0 stages target time without setting currentTime directly
+  let playCalls = 0;
+  let loadCalls = 0;
+  let seekAssigns = 0;
+  let currentTimeBacking = 0;
+  const fakeVid = {
+    readyState: 0,
+    networkState: 0,
+    paused: true,
+    ended: false,
+    seeking: false,
+    muted: false,
+    playbackRate: 1,
+    duration: 5,
+    videoWidth: 1280,
+    videoHeight: 720,
+    dataset: { srcUrl: 'blob:vid' },
+    isConnected: true,
+    _wantsPlay: false,
+    _pendingPlayTargetTime: null,
+    _lastSyncSeekMs: 0,
+    get currentTime() { return currentTimeBacking; },
+    set currentTime(v) { seekAssigns += 1; currentTimeBacking = v; },
+    play: () => { playCalls += 1; return Promise.resolve(); },
+    pause: () => { fakeVid.paused = true; },
+    load: () => { loadCalls += 1; }
+  };
+  const fakeRenderer = {
+    videoCache: new Map([['m1', fakeVid]]),
+    _ensureHiddenVideoHost: () => null,
+    getVideoElement: () => fakeVid,
+    _computeVideoTargetTime: RendererEngine.prototype._computeVideoTargetTime,
+    captureVideoFallbackFrame: () => {}
+  };
+  const proj = createEmptyProject('VidSync', { width: 1280, height: 720, fps: 30, durationSec: 5 });
+  const vLayer = TimelineEngine.createMediaLayer(proj, { id: 'm1', name: 'Clip', type: 'video', width: 1280, height: 720, durationMs: 5000 }, 0, { trackRole: 'main' });
+  TimelineEngine.addToMainTrack(proj, vLayer);
+  const mMap = new Map([['m1', { id: 'm1', type: 'video', url: 'blob:vid', durationMs: 5000 }]]);
+
+  RendererEngine.prototype.syncVideoPlayback.call(fakeRenderer, proj, 30, mMap, true, 1);
+  assert.equal(fakeVid._wantsPlay, true);
+  assert.ok(Math.abs(fakeVid._pendingPlayTargetTime - 1.0) < 0.01);
+  assert.equal(seekAssigns, 0);
+  assert.equal(loadCalls, 1);
+  assert.equal(playCalls, 1);
+
+  // Once playing smoothly with small drift (< 0.75s), do not seek-thrash
+  fakeVid.readyState = 4;
+  fakeVid.paused = false;
+  currentTimeBacking = 1.2;
+  RendererEngine.prototype.syncVideoPlayback.call(fakeRenderer, proj, 45, mMap, true, 1); // target 1.5s, drift 0.3s
+  assert.equal(seekAssigns, 0);
+
+  // Moving outside clip bounds pauses and clears _wantsPlay
+  RendererEngine.prototype.syncVideoPlayback.call(fakeRenderer, proj, 149, mMap, false, 0);
+  assert.equal(fakeVid._wantsPlay, false);
+  assert.equal(fakeVid.paused, true);
+});
+
 
 
 

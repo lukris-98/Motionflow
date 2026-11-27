@@ -40,6 +40,7 @@ export class PanelsUI {
     this.copiedKeyframe = null;
     this.activeStyleTab = 'layer';
     this.activeFxSubTab = 'effects';
+    this.activeAdjustSubTab = 'adjust';
     this.activeAnimTab = 'in';
     this.activeTextSubTab = 'edit';
     this.activeTransSide = 'in';
@@ -47,6 +48,7 @@ export class PanelsUI {
     this.activeAudioHubTab = 'sfx';
     this.activeEffectCat = 'all';
     this.activeFilterCat = 'all';
+    this.activeMediaCat = 'all';
     this.activeSfxCat = 'all';
     this.activeTransCat = 'all';
     this.transitionTarget = { mode: 'junction', leftId: null, rightId: null, layerId: null };
@@ -54,10 +56,15 @@ export class PanelsUI {
     this.filterThumbCache = new Map();
     this._landscapeImg = null;
     this._landscapeImgState = 'idle';
+    this._filterThumbBatchRaf = null;
     this.selectedVfxId = null;
     this.selectedSpeedPtIdx = 1;
     this.beatSensitivity = 0.55;
     this._bezierAnimRafId = null;
+  }
+
+  isSheetOpen(sheetId) {
+    return typeof document !== 'undefined' && Boolean(document.getElementById(sheetId)?.classList?.contains('show'));
   }
 
   getBezierForEasingMode(mode, curBez = [0.42, 0, 0.58, 1]) {
@@ -106,8 +113,8 @@ export class PanelsUI {
     if (!fp || this._landscapeImgState !== 'ready' || !this._landscapeImg) return null;
     if (this.filterThumbCache.has(fp.id)) return this.filterThumbCache.get(fp.id);
 
-    const w = 144;
-    const h = 108;
+    const w = 88;
+    const h = 66;
     const c = document.createElement('canvas');
     c.width = w;
     c.height = h;
@@ -205,59 +212,88 @@ export class PanelsUI {
       ctx.putImageData(imgData, 0, 0);
     }
 
-    const url = c.toDataURL('image/jpeg', 0.86);
+    const url = c.toDataURL('image/jpeg', 0.82);
     this.filterThumbCache.set(fp.id, url);
     return url;
   }
 
-  _upgradeRenderedFilterThumbs() {
-    if (this._landscapeImgState !== 'ready') return;
-    document.querySelectorAll('img[data-filter-thumb]').forEach((imgEl) => {
-      const fid = imgEl.dataset.filterThumb;
-      const fp = FILTER_PRESETS.find((p) => p.id === fid);
-      if (!fp) return;
-      const graded = this._renderGradedLandscapeThumb(fp);
-      if (graded) {
-        imgEl.src = graded;
-        imgEl.style.filter = 'none';
+  _scheduleFilterThumbBatch() {
+    if (this._landscapeImgState !== 'ready' || typeof requestAnimationFrame !== 'function') return;
+    if (this._filterThumbBatchRaf !== null) {
+      cancelAnimationFrame(this._filterThumbBatchRaf);
+      this._filterThumbBatchRaf = null;
+    }
+    const step = () => {
+      this._filterThumbBatchRaf = null;
+      if (!this.isSheetOpen('sheetFilters')) return;
+      const pending = [...document.querySelectorAll('#filtersBody img[data-filter-thumb]')].filter(
+        (imgEl) => imgEl.dataset.filterGraded !== '1'
+      );
+      if (pending.length === 0) return;
+      const batch = pending.slice(0, 3);
+      for (const imgEl of batch) {
+        const fid = imgEl.dataset.filterThumb;
+        const fp = FILTER_PRESETS.find((p) => p.id === fid);
+        if (fp) {
+          const graded = this._renderGradedLandscapeThumb(fp);
+          if (graded) {
+            imgEl.src = graded;
+            imgEl.style.filter = 'none';
+            imgEl.dataset.filterGraded = '1';
+          }
+        }
       }
-    });
+      if (pending.length > 3) {
+        this._filterThumbBatchRaf = requestAnimationFrame(step);
+      }
+    };
+    this._filterThumbBatchRaf = requestAnimationFrame(step);
+  }
+
+  _upgradeRenderedFilterThumbs() {
+    this._scheduleFilterThumbBatch();
   }
 
   getFilterPreviewInfo(fp) {
     this._ensureLandscapeImageLoaded();
-    if (this._landscapeImgState === 'ready') {
-      const graded = this._renderGradedLandscapeThumb(fp);
-      if (graded) return { src: graded, cssFilter: 'none' };
+    if (this.filterThumbCache.has(fp.id)) {
+      return { src: this.filterThumbCache.get(fp.id), cssFilter: 'none', graded: true };
     }
     if (this._landscapeImgState === 'error') {
-      return { src: SAMPLE_PREVIEW_SVG, cssFilter: fp.css || 'none' };
+      return { src: SAMPLE_PREVIEW_SVG, cssFilter: fp.css || 'none', graded: true };
     }
-    return { src: LANDSCAPE_FILTER_SRC, cssFilter: fp.css || 'none' };
+    return { src: LANDSCAPE_FILTER_SRC, cssFilter: fp.css || 'none', graded: false };
   }
 
   getPreviewThumbSrc() {
     if (this.app.project?.layers?.some((l) => l.visible && (l.type === 'video' || l.type === 'image'))) {
-      const snap = this.app.renderer?.capturePreviewThumbnailDataUrl?.(120, 90);
+      const snap = this.app.renderer?.capturePreviewThumbnailDataUrl?.(96, 72);
       if (snap) return snap;
     }
     this._ensureLandscapeImageLoaded();
     return this._landscapeImgState === 'error' ? SAMPLE_PREVIEW_SVG : LANDSCAPE_FILTER_SRC;
   }
 
-  refreshAll() {
-    this.renderInspector();
-    this.renderKeyframesPanel();
-    this.renderStylePanel();
-    if (document.getElementById('sheetTransitions')?.classList.contains('show')) {
-      this.renderTransitionsPanel();
-    }
+  refreshAll(opts = {}) {
+    if (opts.force || this.isSheetOpen('sheetInspector')) this.renderInspector(opts);
+    if (opts.force || this.isSheetOpen('sheetKeyframes')) this.renderKeyframesPanel(opts);
+    if (opts.force || this.isSheetOpen('sheetEdit')) this.renderEditPanel(opts);
+    if (opts.force || this.isSheetOpen('sheetFilters')) this.renderFiltersPanel(opts);
+    if (opts.force || this.isSheetOpen('sheetEffects')) this.renderEffectsPanel(opts);
+    if (opts.force || this.isSheetOpen('sheetCamera')) this.renderCameraPanel(opts);
+    if (opts.force || this.isSheetOpen('sheetAdjust')) this.renderAdjustPanel(opts);
+    if (opts.force || this.isSheetOpen('sheetMask')) this.renderMaskPanel(opts);
+    if (opts.force || this.isSheetOpen('sheetTracker')) this.renderTrackerPanel(opts);
+    if (opts.force || this.isSheetOpen('sheetRatio')) this.renderRatioPanel(opts);
+    if (this.isSheetOpen('sheetTransitions')) this.renderTransitionsPanel();
   }
 
   async renderProjectsList() {
     const container = document.getElementById('projectsList');
+    if (!container) return;
     const projects = await this.app.getSavedProjects();
     container.innerHTML = '';
+    const frag = document.createDocumentFragment();
 
     projects.forEach((p) => {
       const isCurrent = p.id === this.app.project.id;
@@ -267,7 +303,7 @@ export class PanelsUI {
         <div class="p-2 rounded border ${isCurrent ? 'border-info bg-info bg-opacity-10' : 'border-secondary-subtle bg-dark'} d-flex justify-content-between align-items-center gap-2">
           <div class="d-flex align-items-center gap-2 min-w-0 flex-grow-1">
             ${p.coverDataUrl
-              ? `<img src="${p.coverDataUrl}" class="mf-proj-cover" alt="Cover" />`
+              ? `<img src="${p.coverDataUrl}" class="mf-proj-cover" alt="Cover" loading="lazy" decoding="async" />`
               : `<div class="mf-proj-cover d-flex align-items-center justify-content-center text-secondary"><i class="bi bi-film"></i></div>`}
             <div class="min-w-0">
               <div class="fw-semibold small text-truncate">${this.esc(p.name)} ${isCurrent ? '<span class="badge bg-info text-dark ms-1">Active</span>' : ''}</div>
@@ -287,19 +323,48 @@ export class PanelsUI {
         if (next && next.trim()) this.app.renameProjectById(p.id, next.trim());
       };
       col.querySelector('[data-act="del"]').onclick = () => this.app.deleteProjectById(p.id);
-      container.appendChild(col);
+      frag.appendChild(col);
     });
+    container.appendChild(frag);
   }
 
-  renderMediaLibrary(mediaItems) {
+  renderMediaLibrary(mediaItems, opts = {}) {
+    if (!opts.force && !this.isSheetOpen('sheetMedia')) return;
     const grid = document.getElementById('mediaLibraryGrid');
     const empty = document.getElementById('mediaLibraryEmpty');
+    if (!grid || !empty) return;
+    const list = Array.isArray(mediaItems) ? mediaItems : [];
+
+    const filterBar = document.getElementById('mediaFilterBar');
+    if (filterBar) {
+      filterBar.querySelectorAll('[data-media-cat]').forEach((btn) => {
+        const isAct = btn.dataset.mediaCat === this.activeMediaCat;
+        btn.className = `btn ${isAct ? 'btn-info text-dark fw-semibold' : 'btn-dark border-secondary-subtle'}`;
+        btn.onclick = () => {
+          this.activeMediaCat = btn.dataset.mediaCat || 'all';
+          this.renderMediaLibrary(this.app.mediaItems, { force: true });
+        };
+      });
+    }
+
+    const filtered = this.activeMediaCat === 'all'
+      ? list
+      : list.filter((m) => m.type === this.activeMediaCat);
+
+    const lblCount = document.getElementById('lblMediaCount');
+    if (lblCount) {
+      lblCount.textContent = filtered.length === list.length
+        ? `${list.length} item`
+        : `${filtered.length} / ${list.length} item`;
+    }
+
     grid.innerHTML = '';
-    empty.classList.toggle('d-none', mediaItems.length > 0);
+    empty.classList.toggle('d-none', filtered.length > 0);
 
     const isReplace = this.app.mediaPickerContext === 'replace';
     const isOverlay = this.app.mediaPickerContext === 'overlay';
     const sel = this.app.getSelectedLayer();
+    const frag = document.createDocumentFragment();
     if (isReplace && sel) {
       const banner = document.createElement('div');
       banner.className = 'col-12';
@@ -311,9 +376,9 @@ export class PanelsUI {
       `;
       banner.querySelector('#btnCancelReplaceMode').onclick = () => {
         this.app.mediaPickerContext = null;
-        this.renderMediaLibrary(mediaItems);
+        this.renderMediaLibrary(list, { force: true });
       };
-      grid.appendChild(banner);
+      frag.appendChild(banner);
     } else if (isOverlay) {
       const banner = document.createElement('div');
       banner.className = 'col-12';
@@ -325,16 +390,16 @@ export class PanelsUI {
       `;
       banner.querySelector('#btnCancelOverlayMode').onclick = () => {
         this.app.mediaPickerContext = null;
-        this.renderMediaLibrary(mediaItems);
+        this.renderMediaLibrary(list, { force: true });
       };
-      grid.appendChild(banner);
+      frag.appendChild(banner);
     }
 
-    mediaItems.forEach((item) => {
+    filtered.forEach((item) => {
       const col = document.createElement('div');
       col.className = 'col-6 col-sm-4 col-md-3';
       const thumbHtml = item.thumbUrl
-        ? `<img src="${item.thumbUrl}" class="mf-media-thumb" alt="${this.esc(item.name)}" />`
+        ? `<img src="${item.thumbUrl}" class="mf-media-thumb" alt="${this.esc(item.name)}" loading="lazy" decoding="async" />`
         : `<div class="mf-media-thumb d-flex align-items-center justify-content-center"><i class="bi ${item.type === 'audio' ? 'bi-music-note-beamed text-warning' : 'bi-film text-info'} fs-2"></i></div>`;
 
       const resLabel = item.type === 'audio' ? formatDurationMs(item.durationMs) : `${item.width}×${item.height} · ${formatDurationMs(item.durationMs)}`;
@@ -362,12 +427,15 @@ export class PanelsUI {
         }
       };
       col.querySelector('[data-act="del"]').onclick = () => this.app.deleteMediaFromLibrary(item);
-      grid.appendChild(col);
+      frag.appendChild(col);
     });
+    grid.appendChild(frag);
   }
 
-  renderInspector() {
+  renderInspector(opts = {}) {
+    if (!opts.force && !this.isSheetOpen('sheetInspector')) return;
     const body = document.getElementById('inspectorBody');
+    if (!body) return;
     const layer = this.app.getSelectedLayer();
     if (!layer) {
       body.innerHTML = `<div class="text-center text-secondary py-4 small">Select a layer on the timeline or preview to inspect &amp; transform it.</div>`;
@@ -612,7 +680,8 @@ export class PanelsUI {
     });
   }
 
-  renderKeyframesPanel() {
+  renderKeyframesPanel(opts = {}) {
+    if (!opts.force && !this.isSheetOpen('sheetKeyframes')) return;
     const body = document.getElementById('keyframesBody');
     if (!body) return;
     const layer = this.app.getSelectedLayer();
@@ -1598,7 +1667,7 @@ export class PanelsUI {
       const { idx, pts, prevState, moved } = dragState;
       dragState = null;
       if (!moved) {
-        this.renderStylePanel();
+        this.renderEditPanel({ force: true });
         return;
       }
       const finalPts = pts.map(([t, v]) => [t, v]);
@@ -1713,92 +1782,32 @@ export class PanelsUI {
     });
   }
 
-  renderStylePanel() {
-    const body = document.getElementById('styleBody');
-    const layer = this.app.getSelectedLayer();
-    const cam = this.app.project.camera;
+  renderStylePanel(opts = {}) {
+    if (opts.force) {
+      if (this.activeStyleTab === 'camera') this.renderCameraPanel({ force: true });
+      else if (this.activeStyleTab === 'mask') this.renderMaskPanel({ force: true });
+      else if (this.activeStyleTab === 'tracker') this.renderTrackerPanel({ force: true });
+      else if (this.activeStyleTab === 'fx') {
+        if (this.activeFxSubTab === 'filters') this.renderFiltersPanel({ force: true });
+        else if (this.activeFxSubTab === 'effects') this.renderEffectsPanel({ force: true });
+        else this.renderAdjustPanel({ force: true });
+      } else {
+        this.renderEditPanel({ force: true });
+      }
+      return;
+    }
+    this.refreshAll(opts);
+  }
 
-    const tabsHtml = `
-      <ul class="nav nav-pills nav-fill mb-2 bg-dark p-1 rounded border border-secondary-subtle flex-nowrap overflow-auto">
-        <li class="nav-item">
-          <button class="nav-link py-1 px-1 small text-nowrap ${this.activeStyleTab === 'layer' ? 'active bg-info text-dark fw-semibold' : 'text-light'}" id="tabStyleLayer">Style</button>
-        </li>
-        <li class="nav-item">
-          <button class="nav-link py-1 px-1 small text-nowrap ${this.activeStyleTab === 'fx' ? 'active bg-info text-dark fw-semibold' : 'text-light'}" id="tabStyleFx">Color/FX</button>
-        </li>
-        <li class="nav-item">
-          <button class="nav-link py-1 px-1 small text-nowrap ${this.activeStyleTab === 'mask' ? 'active bg-info text-dark fw-semibold' : 'text-light'}" id="tabStyleMask">Mask/Tr</button>
-        </li>
-        <li class="nav-item">
-          <button class="nav-link py-1 px-1 small text-nowrap ${this.activeStyleTab === 'tracker' ? 'active bg-warning text-dark fw-semibold' : 'text-light'}" id="tabStyleTracker"><i class="bi bi-crosshair me-1"></i>Track</button>
-        </li>
-        <li class="nav-item">
-          <button class="nav-link py-1 px-1 small text-nowrap ${this.activeStyleTab === 'camera' ? 'active bg-info text-dark fw-semibold' : 'text-light'}" id="tabStyleCamera">Cam 3D</button>
-        </li>
-      </ul>
-    `;
+  renderEditPanel(opts = {}) {
+    if (!opts.force && !this.isSheetOpen('sheetEdit')) return;
+    const body = document.getElementById('editBody');
+    if (!body) return;
+    const layer = this.app.getSelectedLayer();
 
     let innerHtml = '';
-    if (this.activeStyleTab === 'tracker') {
-      innerHtml = this.buildTrackerTabHtml();
-    } else if (this.activeStyleTab === 'camera') {
-      const autoRec = Boolean(this.app.viewport3D?.autoRecord);
-      const curF = Math.round(this.app.currentFrame);
-      const curCam = this.app.getEffectiveCamera(curF);
-      const pendingCam = Boolean(this.app._pending3DCamPose && this.app._pending3DCamPose.frame === curF);
-      const hasCamKf = KeyframeEngine.hasAnyCameraKeyframeAtFrame(cam, curF);
-      innerHtml = `
-        ${pendingCam ? `
-          <div class="alert alert-warning py-1 px-2 mb-2 d-flex flex-wrap align-items-center justify-content-between gap-2 small">
-            <span><i class="bi bi-camera-video me-1"></i>Kamera 3D bergerak di <strong>F${curF}</strong> — klik Keyframe untuk menyimpan.</span>
-            <button id="btnCamDiscardPending" type="button" class="btn btn-xs btn-outline-light py-0 px-2">Batal</button>
-          </div>
-        ` : ''}
-        <div class="d-flex flex-wrap gap-3 mb-2">
-          <div class="form-check form-switch mb-0">
-            <input class="form-check-input" type="checkbox" id="camEnabled" ${cam.enabled ? 'checked' : ''} />
-            <label class="form-check-label small fw-semibold" for="camEnabled">WebGL 3D Camera</label>
-          </div>
-          <div class="form-check form-switch mb-0">
-            <input class="form-check-input" type="checkbox" id="camAutoRec" ${autoRec ? 'checked' : ''} />
-            <label class="form-check-label small text-danger fw-semibold" for="camAutoRec">Auto-Rec Motion</label>
-          </div>
-          <div class="form-check form-switch mb-0">
-            <input class="form-check-input" type="checkbox" id="camMotionBlur" ${cam.motionBlur ? 'checked' : ''} />
-            <label class="form-check-label small" for="camMotionBlur">Motion Blur</label>
-          </div>
-        </div>
-        <div class="row g-2">
-          <div class="col-4 col-sm-3"><label class="form-label small text-secondary mb-0">Cam X</label><input id="camX" type="number" class="form-control form-control-sm" value="${Math.round(curCam.x)}" /></div>
-          <div class="col-4 col-sm-3"><label class="form-label small text-secondary mb-0">Cam Y</label><input id="camY" type="number" class="form-control form-control-sm" value="${Math.round(curCam.y)}" /></div>
-          <div class="col-4 col-sm-3"><label class="form-label small text-secondary mb-0">Cam Z</label><input id="camZ" type="number" class="form-control form-control-sm" value="${Math.round(curCam.z)}" /></div>
-          <div class="col-3"><label class="form-label small text-secondary mb-0">Rot X (°)</label><input id="camRX" type="number" class="form-control form-control-sm" value="${Math.round(curCam.rotX)}" /></div>
-          <div class="col-3"><label class="form-label small text-secondary mb-0">Rot Y (°)</label><input id="camRY" type="number" class="form-control form-control-sm" value="${Math.round(curCam.rotY)}" /></div>
-          <div class="col-3"><label class="form-label small text-secondary mb-0">Rot Z (°)</label><input id="camRZ" type="number" class="form-control form-control-sm" value="${Math.round(curCam.rotZ || 0)}" /></div>
-          <div class="col-3"><label class="form-label small text-secondary mb-0">Zoom</label><input id="camZoom" type="number" step="0.05" min="0.2" max="4" class="form-control form-control-sm" value="${Number((curCam.zoom ?? 1).toFixed(2))}" /></div>
-        </div>
-        <div class="mt-2 d-flex gap-1 mb-2">
-          <button id="btnCamKf" class="btn btn-sm ${pendingCam ? 'btn-warning text-dark fw-semibold' : hasCamKf ? 'btn-info text-dark fw-semibold' : 'mf-btn-accent'} flex-grow-1"><i class="bi bi-diamond-fill me-1"></i>${pendingCam ? `Simpan Key @ F${curF}` : hasCamKf ? `Hapus Key @ F${curF}` : `Key @ F${curF}`}</button>
-          <button id="btnCamSmoothPath" class="btn btn-sm btn-outline-info"><i class="bi bi-bezier2 me-1"></i>Smooth Path</button>
-          <button id="btnCamReset" class="btn btn-sm btn-outline-light">Reset</button>
-        </div>
-        <div>
-          <label class="form-label small text-secondary mb-1">Camera Motion Keyframe Presets</label>
-          <div class="d-flex flex-wrap gap-1">
-            ${CAMERA_MOTION_PRESETS.map((cp) => `
-              <button type="button" class="btn btn-xs btn-outline-info py-1 px-2" data-cam-preset="${cp.id}">
-                <i class="bi ${cp.icon} me-1"></i>${cp.label}
-              </button>
-            `).join('')}
-          </div>
-        </div>
-      `;
-    } else if (this.activeStyleTab === 'fx') {
-      innerHtml = this.buildFxTabHtml(layer);
-    } else if (!layer) {
+    if (!layer) {
       innerHtml = `<div class="text-center text-secondary py-4 small">Select a Text, Shape, Image, Video, or Audio layer to edit its properties.</div>`;
-    } else if (this.activeStyleTab === 'mask') {
-      innerHtml = this.buildMaskTransTabHtml(layer);
     } else if (layer.type === 'text' && layer.textProps) {
       const tp = layer.textProps;
       const customFonts = this.app.customFonts || [];
@@ -2131,89 +2140,21 @@ export class PanelsUI {
           <button id="btnStyleReplaceImg" class="btn btn-xs btn-outline-light py-1 px-2"><i class="bi bi-arrow-left-right me-1"></i>Replace Media</button>
         </div>
         ${this.renderLayerMotionBlurCardHtml(layer)}
-        <div class="text-secondary small text-center mt-1">Gunakan tab Color/FX &amp; Mask/Tr untuk grading, filter, dan efek lainnya.</div>
+        <div class="text-secondary small text-center mt-1">Gunakan panel Filters, Effects, dan Adjust untuk grading, filter, dan efek lainnya.</div>
       `;
     } else {
-      innerHtml = `<div class="text-secondary small py-3 text-center">Use Color/FX, Mask/Tr, Transform &amp; Keyframes tabs to style and animate this ${layer.type} layer.</div>`;
+      innerHtml = `<div class="text-secondary small py-3 text-center">Gunakan panel Effects, Filters, Adjust, Mask, Transform, dan Keyframes untuk mengatur item ${this.esc(layer.type)} ini.</div>`;
     }
 
-    body.innerHTML = tabsHtml + innerHtml;
-
-    body.querySelector('#tabStyleLayer').onclick = () => { this.app.stopTemplateLivePreview(); this.activeStyleTab = 'layer'; this.renderStylePanel(); };
-    body.querySelector('#tabStyleFx').onclick = () => { this.app.stopTemplateLivePreview(); this.activeStyleTab = 'fx'; this.renderStylePanel(); };
-    body.querySelector('#tabStyleMask').onclick = () => { this.app.stopTemplateLivePreview(); this.activeStyleTab = 'mask'; this.renderStylePanel(); };
-    body.querySelector('#tabStyleTracker').onclick = () => {
-      this.app.stopTemplateLivePreview();
-      this.activeStyleTab = 'tracker';
-      this.app.ensureTrackerSourceSelected();
-      this.renderStylePanel();
-    };
-    body.querySelector('#tabStyleCamera').onclick = () => { this.app.stopTemplateLivePreview(); this.activeStyleTab = 'camera'; this.renderStylePanel(); };
-
-    if (this.activeStyleTab === 'tracker') {
-      this.bindTrackerTabEvents(body);
-      return;
-    }
-
-    if (this.activeStyleTab === 'camera') {
-      body.querySelector('#camEnabled').onchange = (e) => {
-        const enabled = e.target.checked;
-        this.app.mutateProject(() => { cam.enabled = enabled; });
-        this.app.setViewport3DEnabled(enabled);
-      };
-      body.querySelector('#camAutoRec')?.addEventListener('change', (e) => {
-        this.app.setViewport3DAutoRecord(e.target.checked);
-      });
-      body.querySelector('#camMotionBlur').onchange = (e) => this.app.mutateProject(() => { cam.motionBlur = e.target.checked; });
-      const bindCam = (id, prop, fallback = 0, minVal = -Infinity, maxVal = Infinity) => {
-        body.querySelector(id).onchange = (e) => {
-          const parsed = Number(e.target.value);
-          const val = Number.isFinite(parsed) ? Math.max(minVal, Math.min(maxVal, parsed)) : fallback;
-          this.app.setCameraProp(prop, val, true);
-        };
-      };
-      bindCam('#camX', 'x');
-      bindCam('#camY', 'y');
-      bindCam('#camZ', 'z');
-      bindCam('#camRX', 'rotX', 0, -85, 85);
-      bindCam('#camRY', 'rotY', 0, -175, 175);
-      bindCam('#camRZ', 'rotZ');
-      bindCam('#camZoom', 'zoom', 1, 0.2, 4.0);
-      body.querySelector('#btnCamDiscardPending')?.addEventListener('click', () => this.app.clearPending3DPose(true));
-      body.querySelector('#btnCamKf').onclick = () => this.app.keyframeCameraAtPlayhead();
-      body.querySelector('#btnCamSmoothPath')?.addEventListener('click', () => this.app.smoothCameraPath());
-      body.querySelector('#btnCamReset').onclick = () => this.app.resetCameraRig();
-      body.querySelectorAll('[data-cam-preset]').forEach((btn) => {
-        btn.onclick = () => {
-          const pid = btn.dataset.camPreset;
-          this.app.mutateProject(() => {
-            KeyframeEngine.applyCameraPreset(cam, pid, this.app.project.durationFrames);
-            TimelineEngine.syncCameraToLayer(this.app.project);
-          });
-          this.app.showToast(`Applied camera motion: ${btn.textContent.trim()}`);
-        };
-      });
-      return;
-    }
-
-    if (this.activeStyleTab === 'fx') {
-      this.bindFxTabEvents(body, layer);
-      return;
-    }
-
+    body.innerHTML = innerHtml;
     if (!layer) return;
-
-    if (this.activeStyleTab === 'mask') {
-      this.bindMaskTransTabEvents(body, layer);
-      return;
-    }
 
     if (layer.type === 'text' && layer.textProps) {
       const tp = layer.textProps;
       body.querySelectorAll('[data-txt-sub]').forEach((btn) => {
         btn.onclick = () => {
           this.activeTextSubTab = btn.dataset.txtSub;
-          this.renderStylePanel();
+          this.renderEditPanel({ force: true });
         };
       });
       body.querySelector('#btnTextOpenDraw')?.addEventListener('click', () => this.app.openDrawModal());
@@ -2339,7 +2280,7 @@ export class PanelsUI {
             if (layer.stabilizer?.frames?.length) {
               this.app.recomputeStabilizerLevel(layer.id, btn.dataset.stabLvl);
             } else {
-              this.renderStylePanel();
+              this.renderEditPanel({ force: true });
             }
           };
         });
@@ -2375,7 +2316,891 @@ export class PanelsUI {
     }
   }
 
-  renderRatioPanel() {
+  renderCameraPanel(opts = {}) {
+    if (!opts.force && !this.isSheetOpen('sheetCamera')) return;
+    const body = document.getElementById('cameraBody');
+    if (!body) return;
+    const cam = this.app.project.camera;
+    const autoRec = Boolean(this.app.viewport3D?.autoRecord);
+    const curF = Math.round(this.app.currentFrame);
+    const curCam = this.app.getEffectiveCamera(curF);
+    const pendingCam = Boolean(this.app._pending3DCamPose && this.app._pending3DCamPose.frame === curF);
+    const hasCamKf = KeyframeEngine.hasAnyCameraKeyframeAtFrame(cam, curF);
+
+    body.innerHTML = `
+      ${pendingCam ? `
+        <div class="alert alert-warning py-1 px-2 mb-2 d-flex flex-wrap align-items-center justify-content-between gap-2 small">
+          <span><i class="bi bi-camera-video me-1"></i>Kamera 3D bergerak di <strong>F${curF}</strong> — klik Keyframe untuk menyimpan.</span>
+          <button id="btnCamDiscardPending" type="button" class="btn btn-xs btn-outline-light py-0 px-2">Batal</button>
+        </div>
+      ` : ''}
+      <div class="d-flex flex-wrap gap-3 mb-2">
+        <div class="form-check form-switch mb-0">
+          <input class="form-check-input" type="checkbox" id="camEnabled" ${cam.enabled ? 'checked' : ''} />
+          <label class="form-check-label small fw-semibold" for="camEnabled">WebGL 3D Camera</label>
+        </div>
+        <div class="form-check form-switch mb-0">
+          <input class="form-check-input" type="checkbox" id="camAutoRec" ${autoRec ? 'checked' : ''} />
+          <label class="form-check-label small text-danger fw-semibold" for="camAutoRec">Auto-Rec Motion</label>
+        </div>
+        <div class="form-check form-switch mb-0">
+          <input class="form-check-input" type="checkbox" id="camMotionBlur" ${cam.motionBlur ? 'checked' : ''} />
+          <label class="form-check-label small" for="camMotionBlur">Motion Blur</label>
+        </div>
+      </div>
+      <div class="row g-2">
+        <div class="col-4 col-sm-3"><label class="form-label small text-secondary mb-0">Cam X</label><input id="camX" type="number" class="form-control form-control-sm" value="${Math.round(curCam.x)}" /></div>
+        <div class="col-4 col-sm-3"><label class="form-label small text-secondary mb-0">Cam Y</label><input id="camY" type="number" class="form-control form-control-sm" value="${Math.round(curCam.y)}" /></div>
+        <div class="col-4 col-sm-3"><label class="form-label small text-secondary mb-0">Cam Z</label><input id="camZ" type="number" class="form-control form-control-sm" value="${Math.round(curCam.z)}" /></div>
+        <div class="col-3"><label class="form-label small text-secondary mb-0">Rot X (°)</label><input id="camRX" type="number" class="form-control form-control-sm" value="${Math.round(curCam.rotX)}" /></div>
+        <div class="col-3"><label class="form-label small text-secondary mb-0">Rot Y (°)</label><input id="camRY" type="number" class="form-control form-control-sm" value="${Math.round(curCam.rotY)}" /></div>
+        <div class="col-3"><label class="form-label small text-secondary mb-0">Rot Z (°)</label><input id="camRZ" type="number" class="form-control form-control-sm" value="${Math.round(curCam.rotZ || 0)}" /></div>
+        <div class="col-3"><label class="form-label small text-secondary mb-0">Zoom</label><input id="camZoom" type="number" step="0.05" min="0.2" max="4" class="form-control form-control-sm" value="${Number((curCam.zoom ?? 1).toFixed(2))}" /></div>
+      </div>
+      <div class="mt-2 d-flex gap-1 mb-2">
+        <button id="btnCamKf" class="btn btn-sm ${pendingCam ? 'btn-warning text-dark fw-semibold' : hasCamKf ? 'btn-info text-dark fw-semibold' : 'mf-btn-accent'} flex-grow-1"><i class="bi bi-diamond-fill me-1"></i>${pendingCam ? `Simpan Key @ F${curF}` : hasCamKf ? `Hapus Key @ F${curF}` : `Key @ F${curF}`}</button>
+        <button id="btnCamSmoothPath" class="btn btn-sm btn-outline-info"><i class="bi bi-bezier2 me-1"></i>Smooth Path</button>
+        <button id="btnCamReset" class="btn btn-sm btn-outline-light">Reset</button>
+      </div>
+      <div>
+        <label class="form-label small text-secondary mb-1">Camera Motion Keyframe Presets</label>
+        <div class="d-flex flex-wrap gap-1">
+          ${CAMERA_MOTION_PRESETS.map((cp) => `
+            <button type="button" class="btn btn-xs btn-outline-info py-1 px-2" data-cam-preset="${cp.id}">
+              <i class="bi ${cp.icon} me-1"></i>${cp.label}
+            </button>
+          `).join('')}
+        </div>
+      </div>
+    `;
+
+    body.querySelector('#camEnabled').onchange = (e) => {
+      const enabled = e.target.checked;
+      this.app.mutateProject(() => { cam.enabled = enabled; });
+      this.app.setViewport3DEnabled(enabled);
+    };
+    body.querySelector('#camAutoRec')?.addEventListener('change', (e) => {
+      this.app.setViewport3DAutoRecord(e.target.checked);
+    });
+    body.querySelector('#camMotionBlur').onchange = (e) => this.app.mutateProject(() => { cam.motionBlur = e.target.checked; });
+    const bindCam = (id, prop, fallback = 0, minVal = -Infinity, maxVal = Infinity) => {
+      body.querySelector(id).onchange = (e) => {
+        const parsed = Number(e.target.value);
+        const val = Number.isFinite(parsed) ? Math.max(minVal, Math.min(maxVal, parsed)) : fallback;
+        this.app.setCameraProp(prop, val, true);
+      };
+    };
+    bindCam('#camX', 'x');
+    bindCam('#camY', 'y');
+    bindCam('#camZ', 'z');
+    bindCam('#camRX', 'rotX', 0, -85, 85);
+    bindCam('#camRY', 'rotY', 0, -175, 175);
+    bindCam('#camRZ', 'rotZ');
+    bindCam('#camZoom', 'zoom', 1, 0.2, 4.0);
+    body.querySelector('#btnCamDiscardPending')?.addEventListener('click', () => this.app.clearPending3DPose(true));
+    body.querySelector('#btnCamKf').onclick = () => this.app.keyframeCameraAtPlayhead();
+    body.querySelector('#btnCamSmoothPath')?.addEventListener('click', () => this.app.smoothCameraPath());
+    body.querySelector('#btnCamReset').onclick = () => this.app.resetCameraRig();
+    body.querySelectorAll('[data-cam-preset]').forEach((btn) => {
+      btn.onclick = () => {
+        const pid = btn.dataset.camPreset;
+        this.app.mutateProject(() => {
+          KeyframeEngine.applyCameraPreset(cam, pid, this.app.project.durationFrames);
+          TimelineEngine.syncCameraToLayer(this.app.project);
+        });
+        this.app.showToast(`Applied camera motion: ${btn.textContent.trim()}`);
+      };
+    });
+  }
+
+  renderFiltersPanel(opts = {}) {
+    if (!opts.force && !this.isSheetOpen('sheetFilters')) return;
+    const body = document.getElementById('filtersBody');
+    if (!body) return;
+    const layer = this.app.getSelectedLayer();
+    if (layer && (layer.type === 'audio' || layer.type === 'group')) {
+      body.innerHTML = `<div class="text-center text-secondary py-4 small">Filters apply to Video, Image, Text, Shape, or Adjustment layers.</div>`;
+      return;
+    }
+    const isVirtual = !layer;
+    const target = layer || { type: 'virtual', filterId: 'normal', filterIntensity: 1, fx: {}, keyframes: {} };
+    const isAdjustment = !isVirtual && target.type === 'adjustment';
+    const filterCats = [
+      { id: 'all', label: 'All' },
+      { id: 'cinema', label: 'Cinema' },
+      { id: 'warm', label: 'Warm/Vibe' },
+      { id: 'bw', label: 'Film/B&W' },
+      { id: 'neon', label: 'Neon/Ice' }
+    ];
+    const visibleFilters = this.activeFilterCat === 'all'
+      ? FILTER_PRESETS
+      : FILTER_PRESETS.filter((f) => f.id === 'normal' || f.cat === this.activeFilterCat);
+
+    const curF = Math.round(this.app.currentFrame);
+    const hasIntTrack = !isVirtual && (target.keyframes?.intensity?.length || 0) > 0;
+    const hasIntKfAtF = !isVirtual && Boolean(KeyframeEngine.getKeyframeAtFrame(target, 'intensity', curF));
+    const effFilterInt = hasIntTrack
+      ? KeyframeEngine.getValueAtFrame(target, 'intensity', curF, target.filterIntensity ?? 1)
+      : (target.filterIntensity ?? 1);
+
+    body.innerHTML = `
+      ${isAdjustment ? `
+        <div class="alert alert-warning bg-dark border-warning-subtle py-1 px-2 mb-2 small d-flex align-items-center gap-2">
+          <i class="bi bi-sliders2-vertical text-warning"></i>
+          <span><strong>Timeline Filter</strong> — Geser atau tahan pojok kiri/kanan atas di timeline untuk atur durasi.</span>
+        </div>
+      ` : isVirtual ? `
+        <div class="alert alert-info bg-dark border-info-subtle py-1 px-2 mb-2 small d-flex align-items-center gap-2">
+          <i class="bi bi-layers-half text-info"></i>
+          <span>Tap <strong>Filter</strong> untuk menambahkannya sebagai item di Timeline agar bisa diatur kemunculannya.</span>
+        </div>
+      ` : ''}
+      <div class="d-flex align-items-center justify-content-between gap-2 mb-1">
+        <span class="small text-secondary">${isAdjustment && target.adjustmentKind === 'filter' ? 'Filter Timeline terpilih' : 'Tap filter = buat item Filter di Timeline'}</span>
+        <div class="d-flex gap-1 flex-shrink-0">
+          <button id="btnAddNewFilterItem" type="button" class="btn btn-xs btn-outline-info py-0 px-2"><i class="bi bi-plus-circle me-1"></i>+ Item Baru</button>
+          ${!isVirtual ? `<button id="btnFilterReset" type="button" class="btn btn-xs btn-outline-secondary py-0 px-2">Reset</button>` : ''}
+        </div>
+      </div>
+      <div class="mf-cat-scroll mb-1">
+        ${filterCats.map((c) => `
+          <button type="button" class="btn btn-xs ${this.activeFilterCat === c.id ? 'btn-info text-dark fw-semibold' : 'btn-dark border-secondary-subtle'} py-0 px-2 text-nowrap" data-flt-cat="${c.id}">${c.label}</button>
+        `).join('')}
+      </div>
+      <div class="mf-tile-grid mb-2">
+        ${visibleFilters.map((fp) => {
+          const pInfo = this.getFilterPreviewInfo(fp);
+          return `
+            <button type="button" class="mf-preview-tile ${(target.filterId || 'normal') === fp.id ? 'active' : ''}" data-fx-preset="${fp.id}">
+              <div class="mf-tile-stage">
+                <img src="${pInfo.src}" data-filter-thumb="${fp.id}" data-filter-graded="${pInfo.graded ? '1' : '0'}" class="mf-tile-thumb" style="filter:${pInfo.cssFilter};" alt="${this.esc(fp.label)}" loading="lazy" decoding="async" />
+              </div>
+              <div class="mf-tile-label">${fp.label}</div>
+            </button>
+          `;
+        }).join('')}
+      </div>
+      ${!isVirtual ? `
+        <div class="row g-2 align-items-end">
+          <div class="col-8">
+            <div class="d-flex align-items-center justify-content-between">
+              <label class="form-label small text-secondary mb-0">Filter Intensity (<span id="lblFilterInt">${Math.round(effFilterInt * 100)}%</span>)</label>
+              ${isAdjustment ? `<button id="btnToggleFilterIntKf" type="button" class="btn btn-xs ${hasIntKfAtF ? 'btn-info text-dark' : 'btn-outline-info'} py-0 px-1" title="Keyframe Intensitas Filter @ F${curF}"><i class="bi ${hasIntKfAtF ? 'bi-diamond-fill' : 'bi-diamond'}"></i></button>` : ''}
+            </div>
+            <input id="fxFilterInt" type="range" min="0" max="1" step="0.05" class="form-range" value="${effFilterInt}" />
+          </div>
+          <div class="col-4">
+            <button id="btnFilterApplyAll" type="button" class="btn btn-xs btn-outline-info w-100 py-1">Apply to All</button>
+          </div>
+        </div>
+      ` : ''}
+    `;
+
+    this._scheduleFilterThumbBatch();
+
+    body.querySelectorAll('[data-flt-cat]').forEach((btn) => {
+      btn.onclick = () => {
+        this.activeFilterCat = btn.dataset.fltCat;
+        this.renderFiltersPanel({ force: true });
+      };
+    });
+    body.querySelector('#btnAddNewFilterItem')?.addEventListener('click', () => {
+      const preset = FILTER_PRESETS.find((p) => p.id === layer?.filterId && p.id !== 'normal')
+        || FILTER_PRESETS.find((p) => p.id !== 'normal')
+        || FILTER_PRESETS[0];
+      if (preset) this.app.applyFilterAsTimelineItem(preset, { forceNew: true });
+    });
+    body.querySelectorAll('[data-fx-preset]').forEach((btn) => {
+      btn.onclick = () => {
+        const fp = FILTER_PRESETS.find((p) => p.id === btn.dataset.fxPreset);
+        if (fp) this.app.applyFilterAsTimelineItem(fp);
+      };
+    });
+
+    if (!layer) return;
+    const fx = this.ensureLayerFx(layer);
+    body.querySelector('#btnFilterReset')?.addEventListener('click', () => {
+      this.app.mutateProject(() => {
+        layer.filterId = 'normal';
+        layer.filterIntensity = 1;
+        TimelineEngine.applyFilterWithIntensity(layer, 'normal', FILTER_PRESETS[0].fx, 1);
+      });
+    });
+    body.querySelector('#btnToggleFilterIntKf')?.addEventListener('click', () => {
+      this.app.togglePropLaneKeyframe(layer.id, 'intensity', Math.round(this.app.currentFrame));
+    });
+    body.querySelector('#btnFilterApplyAll')?.addEventListener('click', () => this.app.applyFilterAndAdjustToAllClips(layer));
+
+    const filterIntEl = body.querySelector('#fxFilterInt');
+    const lblFilterInt = body.querySelector('#lblFilterInt');
+    if (filterIntEl) {
+      let startInt = layer.filterIntensity ?? 1;
+      let startIntKfs = JSON.parse(JSON.stringify(layer.keyframes?.intensity || []));
+      let capInt = false;
+      const capStart = () => {
+        if (!capInt) {
+          startInt = layer.filterIntensity ?? 1;
+          startIntKfs = JSON.parse(JSON.stringify(layer.keyframes?.intensity || []));
+          capInt = true;
+        }
+      };
+      filterIntEl.addEventListener('pointerdown', capStart);
+      filterIntEl.addEventListener('input', (e) => {
+        capStart();
+        const val = Number(e.target.value);
+        const fp = FILTER_PRESETS.find((p) => p.id === (layer.filterId || 'normal')) || FILTER_PRESETS[0];
+        if (lblFilterInt) lblFilterInt.textContent = `${Math.round(val * 100)}%`;
+        if ((layer.keyframes?.intensity?.length || 0) > 0) {
+          KeyframeEngine.setKeyframe(layer, 'intensity', Math.round(this.app.currentFrame), val);
+        } else {
+          TimelineEngine.applyFilterWithIntensity(layer, fp.id, fp.fx, val);
+        }
+        this.app.renderPreview();
+      });
+      filterIntEl.addEventListener('change', (e) => {
+        const nextVal = Number(e.target.value);
+        const fp = FILTER_PRESETS.find((p) => p.id === (layer.filterId || 'normal')) || FILTER_PRESETS[0];
+        if (!layer.keyframes) layer.keyframes = {};
+        layer.keyframes.intensity = startIntKfs;
+        TimelineEngine.applyFilterWithIntensity(layer, fp.id, fp.fx, startInt);
+        capInt = false;
+        this.app.mutateProject(() => {
+          if ((layer.keyframes?.intensity?.length || 0) > 0) {
+            KeyframeEngine.setKeyframe(layer, 'intensity', Math.round(this.app.currentFrame), nextVal);
+          } else {
+            TimelineEngine.applyFilterWithIntensity(layer, fp.id, fp.fx, nextVal);
+          }
+        });
+      });
+    }
+    void fx;
+  }
+
+  renderEffectsPanel(opts = {}) {
+    if (!opts.force && !this.isSheetOpen('sheetEffects')) return;
+    const body = document.getElementById('effectsBody');
+    if (!body) return;
+    const layer = this.app.getSelectedLayer();
+    if (layer && (layer.type === 'audio' || layer.type === 'group')) {
+      body.innerHTML = `<div class="text-center text-secondary py-4 small">Video Effects apply to Video, Image, Text, Shape, or Adjustment layers.</div>`;
+      return;
+    }
+    const isVirtual = !layer;
+    const target = layer || { type: 'virtual', vfx: { type: 'none', intensity: 0.75, speed: 1 }, vfxStack: [], keyframes: {} };
+    const vfx = isVirtual ? target.vfx : this.ensureLayerVfx(target);
+    const thumbSrc = this.getPreviewThumbSrc();
+    const effectCats = [
+      { id: 'all', label: 'All' },
+      { id: 'trending', label: 'Trending' },
+      { id: 'retro', label: 'Retro' },
+      { id: 'lens', label: 'Lens/Optic' }
+    ];
+    const visibleVfx = this.activeEffectCat === 'all'
+      ? VIDEO_EFFECT_PRESETS
+      : VIDEO_EFFECT_PRESETS.filter((e) => e.id === 'none' || e.cat === this.activeEffectCat);
+    const isAdjustment = !isVirtual && target.type === 'adjustment';
+    const vfxStack = Array.isArray(target.vfxStack) && target.vfxStack.length > 0
+      ? target.vfxStack
+      : TimelineEngine.getActiveVfxList(target);
+    const activeEntry = vfxStack.find((item) => item.id === this.selectedVfxId) || vfxStack[0] || vfx;
+    if (activeEntry?.id && vfxStack.some((x) => x.id === activeEntry.id)) {
+      this.selectedVfxId = activeEntry.id;
+    }
+
+    const curF = Math.round(this.app.currentFrame);
+    const hasIntTrack = !isVirtual && (target.keyframes?.intensity?.length || 0) > 0;
+    const hasIntKfAtF = !isVirtual && Boolean(KeyframeEngine.getKeyframeAtFrame(target, 'intensity', curF));
+    const effInt = hasIntTrack
+      ? KeyframeEngine.getValueAtFrame(target, 'intensity', curF, activeEntry?.intensity ?? 0.75)
+      : (activeEntry?.intensity ?? 0.75);
+
+    body.innerHTML = `
+      ${isAdjustment ? `
+        <div class="alert alert-warning bg-dark border-warning-subtle py-1 px-2 mb-2 small d-flex align-items-center gap-2">
+          <i class="bi bi-sliders2-vertical text-warning"></i>
+          <span><strong>Timeline Effect</strong> — Geser atau tahan pojok kiri/kanan atas di timeline untuk atur durasi.</span>
+        </div>
+      ` : isVirtual ? `
+        <div class="alert alert-info bg-dark border-info-subtle py-1 px-2 mb-2 small d-flex align-items-center gap-2">
+          <i class="bi bi-layers-half text-info"></i>
+          <span>Tap <strong>Effect</strong> untuk menambahkannya sebagai item di Timeline agar bisa diatur kemunculannya.</span>
+        </div>
+      ` : ''}
+      <div class="d-flex align-items-center justify-content-between gap-2 mb-1">
+        <span class="small text-secondary">${isAdjustment && target.adjustmentKind === 'effect' ? `Item Efek aktif (${vfxStack.filter((x) => x.enabled !== false && x.type !== 'none').length}) · Tap <strong class="text-info">+</strong> utk lapis` : 'Tap efek = buat item Timeline baru di playhead'}</span>
+        <div class="d-flex gap-1 flex-shrink-0">
+          <button id="btnAddNewEffectItem" type="button" class="btn btn-xs btn-outline-info py-0 px-2"><i class="bi bi-plus-circle me-1"></i>+ Item Baru</button>
+          ${!isVirtual && !isAdjustment ? `<button id="btnAddAdjLayerQuick" type="button" class="btn btn-xs btn-outline-warning py-0 px-2"><i class="bi bi-sliders2-vertical me-1"></i>+ Adj</button>` : ''}
+          ${!isVirtual ? `<button id="btnEffectReset" type="button" class="btn btn-xs btn-outline-secondary py-0 px-2">Reset</button>` : ''}
+        </div>
+      </div>
+      ${vfxStack.length > 0 ? `
+        <div class="d-flex flex-column gap-1 mb-2">
+          ${vfxStack.map((item, idx) => {
+            const meta = VIDEO_EFFECT_PRESETS.find((e) => e.id === item.type);
+            const isSel = activeEntry && activeEntry.id === item.id;
+            return `
+              <div class="mf-vfx-stack-item d-flex align-items-center justify-content-between gap-2 ${isSel ? 'border-info' : ''}" data-vfx-select="${item.id}" style="cursor:pointer;">
+                <div class="d-flex align-items-center gap-2 min-w-0">
+                  <span class="badge ${item.enabled === false ? 'bg-secondary' : 'bg-info text-dark'}" style="font-size:0.6rem;">#${idx + 1}</span>
+                  <span class="small fw-semibold text-truncate ${item.enabled === false ? 'text-secondary text-decoration-line-through' : 'text-light'}">${this.esc(meta?.label || item.type)}</span>
+                  <span class="text-secondary" style="font-size:0.64rem;">${Math.round((item.intensity ?? 0.65) * 100)}%</span>
+                </div>
+                <div class="d-flex align-items-center gap-1 flex-shrink-0">
+                  <button type="button" class="btn btn-xs ${item.enabled === false ? 'btn-outline-secondary' : 'btn-outline-info'} py-0 px-1" data-vfx-toggle="${item.id}" title="Toggle Effect">
+                    <i class="bi ${item.enabled === false ? 'bi-eye-slash' : 'bi-eye'}"></i>
+                  </button>
+                  <button type="button" class="btn btn-xs btn-outline-danger py-0 px-1" data-vfx-del="${item.id}" title="Remove Effect">
+                    <i class="bi bi-x-lg"></i>
+                  </button>
+                </div>
+              </div>
+            `;
+          }).join('')}
+        </div>
+      ` : ''}
+      <div class="mf-cat-scroll mb-1">
+        ${effectCats.map((c) => `
+          <button type="button" class="btn btn-xs ${this.activeEffectCat === c.id ? 'btn-info text-dark fw-semibold' : 'btn-dark border-secondary-subtle'} py-0 px-2 text-nowrap" data-ef-cat="${c.id}">${c.label}</button>
+        `).join('')}
+      </div>
+      <div class="mf-tile-grid mb-2">
+        ${visibleVfx.map((ef) => `
+          <div role="button" tabindex="0" class="mf-preview-tile ${ef.id !== 'none' ? 'has-add-btn' : ''} ${(activeEntry?.type || 'none') === ef.id ? 'active' : ''}" data-vfx-id="${ef.id}">
+            <div class="mf-tile-stage">
+              <img src="${thumbSrc}" class="mf-tile-thumb" style="filter:${ef.css};" alt="${this.esc(ef.label)}" loading="lazy" decoding="async" />
+              <span class="mf-tile-badge" style="color:${ef.accent};">${ef.badge}</span>
+            </div>
+            <div class="mf-tile-label">${ef.label}</div>
+            ${ef.id !== 'none' ? `
+              <button type="button" class="mf-tile-add-btn" data-vfx-add="${ef.id}" title="Tambah/Lapis ${ef.label} FX" aria-label="Tambah ${ef.label}">
+                <i class="bi bi-plus-lg"></i>
+              </button>
+            ` : ''}
+          </div>
+        `).join('')}
+      </div>
+      ${!isVirtual ? `
+        <div class="row g-2 align-items-end">
+          <div class="col-4">
+            <div class="d-flex align-items-center justify-content-between">
+              <label class="form-label small text-secondary mb-0">Intensity (<span id="lblVfxInt">${Math.round(effInt * 100)}%</span>)</label>
+              ${isAdjustment ? `<button id="btnToggleVfxIntKf" type="button" class="btn btn-xs ${hasIntKfAtF ? 'btn-info text-dark' : 'btn-outline-info'} py-0 px-1" title="Keyframe Intensitas Efek @ F${curF}"><i class="bi ${hasIntKfAtF ? 'bi-diamond-fill' : 'bi-diamond'}"></i></button>` : ''}
+            </div>
+            <input id="vfxIntensity" type="range" min="0.05" max="1.2" step="0.05" class="form-range" value="${effInt}" />
+          </div>
+          <div class="col-4">
+            <label class="form-label small text-secondary mb-0">Speed (<span id="lblVfxSpd">${(activeEntry?.speed ?? 1).toFixed(1)}x</span>)</label>
+            <input id="vfxSpeed" type="range" min="0.2" max="3" step="0.1" class="form-range" value="${activeEntry?.speed ?? 1}" />
+          </div>
+          <div class="col-4">
+            <button id="btnFxApplyAll" type="button" class="btn btn-xs btn-outline-info w-100 py-1">Apply to All</button>
+          </div>
+        </div>
+      ` : ''}
+    `;
+
+    body.querySelectorAll('[data-ef-cat]').forEach((btn) => {
+      btn.onclick = () => {
+        this.activeEffectCat = btn.dataset.efCat;
+        this.renderEffectsPanel({ force: true });
+      };
+    });
+    body.querySelector('#btnAddNewEffectItem')?.addEventListener('click', () => {
+      const activeType = layer?.vfxStack?.[0]?.type || layer?.vfx?.type;
+      const preset = VIDEO_EFFECT_PRESETS.find((p) => p.id === activeType && p.id !== 'none')
+        || VIDEO_EFFECT_PRESETS.find((p) => p.id !== 'none');
+      if (preset) this.app.applyEffectAsTimelineItem(preset, { forceNew: true });
+    });
+    body.querySelector('#btnAddAdjLayerQuick')?.addEventListener('click', () => {
+      this.app.mutateProject(() => {
+        const adj = TimelineEngine.createAdjustmentLayer(this.app.project, this.app.currentFrame);
+        TimelineEngine.addLayer(this.app.project, adj);
+        TimelineEngine.normalizeTrackZOrder(this.app.project);
+        this.app.selectedLayerId = adj.id;
+      });
+      this.app.showToast('Added Adjustment Layer track');
+    });
+    body.querySelectorAll('[data-vfx-add]').forEach((btn) => {
+      btn.onclick = (e) => {
+        e.stopPropagation();
+        const vid = btn.dataset.vfxAdd;
+        const preset = VIDEO_EFFECT_PRESETS.find((p) => p.id === vid) || { id: vid, label: vid };
+        const isAdjEffect = layer?.type === 'adjustment' &&
+          (layer.adjustmentKind === 'effect' || (!layer.adjustmentKind && TimelineEngine.getActiveVfxList(layer).length > 0));
+        this.app.applyEffectAsTimelineItem(preset, {
+          forceNew: !isAdjEffect,
+          stackOnExisting: isAdjEffect
+        });
+      };
+    });
+    body.querySelectorAll('[data-vfx-id]').forEach((btn) => {
+      btn.onclick = (e) => {
+        if (e.target.closest('[data-vfx-add]')) return;
+        const vid = btn.dataset.vfxId;
+        const preset = VIDEO_EFFECT_PRESETS.find((p) => p.id === vid) || { id: vid, label: vid };
+        this.app.applyEffectAsTimelineItem(preset);
+      };
+    });
+
+    if (!layer) return;
+    body.querySelector('#btnEffectReset')?.addEventListener('click', () => {
+      this.selectedVfxId = null;
+      this.app.mutateProject(() => {
+        vfx.type = 'none';
+        TimelineEngine.setPrimaryLayerVfx(layer, 'none');
+      });
+    });
+    body.querySelectorAll('[data-vfx-select]').forEach((row) => {
+      row.onclick = (e) => {
+        if (e.target.closest('[data-vfx-toggle]') || e.target.closest('[data-vfx-del]')) return;
+        this.selectedVfxId = row.dataset.vfxSelect;
+        this.renderEffectsPanel({ force: true });
+      };
+    });
+    body.querySelectorAll('[data-vfx-toggle]').forEach((btn) => {
+      btn.onclick = (e) => {
+        e.stopPropagation();
+        this.app.mutateProject(() => TimelineEngine.toggleLayerVfx(layer, btn.dataset.vfxToggle));
+      };
+    });
+    body.querySelectorAll('[data-vfx-del]').forEach((btn) => {
+      btn.onclick = (e) => {
+        e.stopPropagation();
+        const delId = btn.dataset.vfxDel;
+        if (this.selectedVfxId === delId) this.selectedVfxId = null;
+        this.app.mutateProject(() => TimelineEngine.removeLayerVfx(layer, delId));
+      };
+    });
+
+    const vfxTarget = (Array.isArray(layer.vfxStack) && layer.vfxStack.find((x) => x.id === this.selectedVfxId))
+      || (Array.isArray(layer.vfxStack) && layer.vfxStack[0])
+      || vfx;
+    const vfxIntEl = body.querySelector('#vfxIntensity');
+    const lblVfxInt = body.querySelector('#lblVfxInt');
+    if (vfxIntEl) {
+      let startVal = vfxTarget.intensity ?? 0.75;
+      let startKfs = JSON.parse(JSON.stringify(layer.keyframes?.intensity || []));
+      let cap = false;
+      const capVfxStart = () => {
+        if (!cap) {
+          startVal = vfxTarget.intensity ?? 0.75;
+          startKfs = JSON.parse(JSON.stringify(layer.keyframes?.intensity || []));
+          cap = true;
+        }
+      };
+      vfxIntEl.addEventListener('pointerdown', capVfxStart);
+      vfxIntEl.addEventListener('input', (e) => {
+        capVfxStart();
+        const val = Number(e.target.value);
+        if (lblVfxInt) lblVfxInt.textContent = `${Math.round(val * 100)}%`;
+        if ((layer.keyframes?.intensity?.length || 0) > 0) {
+          KeyframeEngine.setKeyframe(layer, 'intensity', Math.round(this.app.currentFrame), val);
+        } else {
+          vfxTarget.intensity = val;
+          if (vfxTarget !== vfx) vfx.intensity = val;
+        }
+        this.app.renderPreview();
+      });
+      vfxIntEl.addEventListener('change', (e) => {
+        const nextVal = Number(e.target.value);
+        if (!layer.keyframes) layer.keyframes = {};
+        layer.keyframes.intensity = startKfs;
+        vfxTarget.intensity = startVal;
+        if (vfxTarget !== vfx) vfx.intensity = startVal;
+        cap = false;
+        this.app.mutateProject(() => {
+          if ((layer.keyframes?.intensity?.length || 0) > 0) {
+            KeyframeEngine.setKeyframe(layer, 'intensity', Math.round(this.app.currentFrame), nextVal);
+          } else if (vfxTarget?.id && Array.isArray(layer.vfxStack) && layer.vfxStack.some((x) => x.id === vfxTarget.id)) {
+            TimelineEngine.updateLayerVfx(layer, vfxTarget.id, { intensity: nextVal });
+          } else {
+            vfx.intensity = nextVal;
+          }
+        });
+      });
+    }
+    const vfxSpdEl = body.querySelector('#vfxSpeed');
+    const lblVfxSpd = body.querySelector('#lblVfxSpd');
+    if (vfxSpdEl) {
+      let startSpd = vfxTarget.speed ?? 1;
+      let capSpd = false;
+      vfxSpdEl.addEventListener('pointerdown', () => { if (!capSpd) { startSpd = vfxTarget.speed ?? 1; capSpd = true; } });
+      vfxSpdEl.addEventListener('input', (e) => {
+        const val = Number(e.target.value);
+        if (lblVfxSpd) lblVfxSpd.textContent = `${val.toFixed(1)}x`;
+        vfxTarget.speed = val;
+        if (vfxTarget !== vfx) vfx.speed = val;
+        this.app.renderPreview();
+      });
+      vfxSpdEl.addEventListener('change', (e) => {
+        const nextVal = Number(e.target.value);
+        vfxTarget.speed = startSpd;
+        if (vfxTarget !== vfx) vfx.speed = startSpd;
+        capSpd = false;
+        this.app.mutateProject(() => {
+          if (vfxTarget?.id && Array.isArray(layer.vfxStack) && layer.vfxStack.some((x) => x.id === vfxTarget.id)) {
+            TimelineEngine.updateLayerVfx(layer, vfxTarget.id, { speed: nextVal });
+          } else {
+            vfx.speed = nextVal;
+          }
+        });
+      });
+    }
+    body.querySelector('#btnToggleVfxIntKf')?.addEventListener('click', () => {
+      this.app.togglePropLaneKeyframe(layer.id, 'intensity', Math.round(this.app.currentFrame));
+    });
+    body.querySelector('#btnFxApplyAll')?.addEventListener('click', () => this.app.applyFilterAndAdjustToAllClips(layer));
+  }
+
+  renderAdjustPanel(opts = {}) {
+    if (!opts.force && !this.isSheetOpen('sheetAdjust')) return;
+    const body = document.getElementById('adjustBody');
+    if (!body) return;
+    const layer = this.app.getSelectedLayer();
+    if (!layer || layer.type === 'audio' || layer.type === 'group') {
+      body.innerHTML = `<div class="text-center text-secondary py-4 small">Select a Video, Image, Text, Shape, or Adjustment layer to adjust Color, HSL, and Cutout.</div>`;
+      return;
+    }
+    const fx = this.ensureLayerFx(layer);
+    const blend = layer.blendMode || 'normal';
+    const isAdjustment = layer.type === 'adjustment';
+    let activeSub = this.activeAdjustSubTab === 'chroma' ? 'chroma' : 'adjust';
+    if (isAdjustment) activeSub = 'adjust';
+    const curHsl = fx.hsl?.[this.selectedHslIdx] || [0, 0, 0];
+    const activeCh = HSL_CHANNELS[this.selectedHslIdx] || HSL_CHANNELS[0];
+
+    body.innerHTML = `
+      <div class="d-flex flex-wrap justify-content-between align-items-center mb-2 gap-1">
+        <div class="btn-group btn-group-sm flex-grow-1">
+          <button type="button" class="btn ${activeSub === 'adjust' ? 'btn-info text-dark fw-semibold' : 'btn-dark border-secondary-subtle'}" data-adj-sub="adjust">Adjust / HSL</button>
+          ${!isAdjustment ? `<button type="button" class="btn ${activeSub === 'chroma' ? 'btn-success text-dark fw-semibold' : 'btn-dark border-secondary-subtle'}" data-adj-sub="chroma">Cutout / Chroma</button>` : ''}
+        </div>
+        <button id="btnAdjReset" class="btn btn-xs btn-outline-secondary py-1 px-2 flex-shrink-0">Reset</button>
+      </div>
+      ${activeSub === 'chroma' ? `
+        <div class="p-2 rounded bg-dark border border-secondary-subtle mb-2">
+          <div class="d-flex justify-content-between align-items-center mb-2">
+            <div class="form-check form-switch mb-0">
+              <input class="form-check-input" type="checkbox" id="fxChromaOn" ${fx.chromaEnabled ? 'checked' : ''} />
+              <label class="form-check-label small fw-semibold text-success" for="fxChromaOn">Chroma Key (Green / Blue Screen)</label>
+            </div>
+            <input id="fxChromaColor" type="color" class="form-control form-control-color form-control-sm" style="width:46px;" value="${fx.chromaColor || '#00FF00'}" title="Key Color" />
+          </div>
+          <div class="row g-2">
+            <div class="col-4">
+              <label class="form-label small text-secondary mb-0">Sim (<span id="lblChromaSim">${(fx.chromaSimilarity ?? 0.35).toFixed(2)}</span>)</label>
+              <input id="fxChromaSim" type="range" min="0.05" max="0.75" step="0.01" class="form-range" value="${fx.chromaSimilarity ?? 0.35}" />
+            </div>
+            <div class="col-4">
+              <label class="form-label small text-secondary mb-0">Smooth (<span id="lblChromaSm">${(fx.chromaSmoothness ?? 0.12).toFixed(2)}</span>)</label>
+              <input id="fxChromaSm" type="range" min="0.01" max="0.35" step="0.01" class="form-range" value="${fx.chromaSmoothness ?? 0.12}" />
+            </div>
+            <div class="col-4">
+              <label class="form-label small text-secondary mb-0">Despill (<span id="lblChromaSp">${Math.round((fx.chromaSpill ?? 0.5) * 100)}%</span>)</label>
+              <input id="fxChromaSp" type="range" min="0" max="1" step="0.02" class="form-range" value="${fx.chromaSpill ?? 0.5}" />
+            </div>
+          </div>
+        </div>
+        <div class="p-2 rounded bg-dark border border-secondary-subtle">
+          <div class="d-flex justify-content-between align-items-center gap-2 mb-2">
+            <div>
+              <div class="small fw-semibold text-info"><i class="bi bi-scissors me-1"></i>Custom Cutout &amp; Alpha Stroke</div>
+              <div class="text-secondary" style="font-size:0.65rem;">Erase BG manually with brush &amp; add glowing outline</div>
+            </div>
+            <button id="btnOpenCutoutBrush" type="button" class="btn btn-xs btn-outline-warning py-1 px-2" ${layer.type === 'video' || layer.type === 'image' ? '' : 'disabled'}>
+              <i class="bi bi-eraser-fill me-1"></i>Brush Cutout
+            </button>
+          </div>
+          <div class="row g-2 align-items-center">
+            <div class="col-8">
+              <label class="form-label small text-secondary mb-0">Subject Outline (<span id="lblFxOutlineW">${Math.round((fx.outlineWidth || 0) * 100)}</span>)</label>
+              <input id="fxOutlineW" type="range" min="0" max="1" step="0.05" class="form-range" value="${fx.outlineWidth || 0}" />
+            </div>
+            <div class="col-4">
+              <label class="form-label small text-secondary mb-0">Stroke Color</label>
+              <input id="fxOutlineCol" type="color" class="form-control form-control-color form-control-sm w-100" value="${fx.outlineColor || '#FFFFFF'}" />
+            </div>
+          </div>
+        </div>
+      ` : `
+        <div class="d-flex justify-content-between align-items-center gap-1 mb-2">
+          <div class="d-flex gap-1">
+            <button id="btnStyleCopy" type="button" class="btn btn-xs btn-outline-info py-1 px-2"><i class="bi bi-copy me-1"></i>Copy Style</button>
+            <button id="btnStylePaste" type="button" class="btn btn-xs btn-outline-warning py-1 px-2" ${this.app.copiedClipStyle ? '' : 'disabled'}><i class="bi bi-clipboard-check me-1"></i>Paste Style</button>
+          </div>
+          <button id="btnAdjApplyAll" type="button" class="btn btn-xs btn-outline-light py-1 px-2">Apply to All</button>
+        </div>
+        ${(layer.type === 'video' || layer.type === 'image') ? (() => {
+          const cm = layer.colorMatch;
+          const cmEnabled = Boolean(cm?.enabled);
+          const cmPct = Math.round((cm?.intensity ?? 0.78) * 100);
+          const tlSwatches = cm?.targetPalette?.swatches || [];
+          const srcSwatches = cm?.sourcePalette?.swatches || [];
+          return `
+            <div class="p-2 rounded bg-dark border border-secondary-subtle mb-2">
+              <div class="d-flex justify-content-between align-items-center gap-2 mb-1">
+                <div class="d-flex align-items-center gap-1">
+                  <i class="bi bi-palette2 text-info"></i>
+                  <span class="small fw-semibold">Auto Color Match</span>
+                  <span class="badge ${cmEnabled ? 'bg-info text-dark' : 'bg-secondary'} px-1" style="font-size:0.58rem;">${cmEnabled ? 'Matched' : 'Off'}</span>
+                </div>
+                <div class="d-flex align-items-center gap-2">
+                  <button id="btnColorMatchNow" type="button" class="btn btn-xs btn-outline-info py-0 px-2">Match Timeline</button>
+                  ${cm ? `
+                    <div class="form-check form-switch m-0">
+                      <input class="form-check-input" type="checkbox" id="chkColorMatchOn" ${cmEnabled ? 'checked' : ''} aria-label="Toggle Auto Color Match" />
+                    </div>
+                  ` : ''}
+                </div>
+              </div>
+              ${cm ? `
+                <div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mb-1">
+                  <div class="d-flex align-items-center gap-1">
+                    <span class="text-secondary" style="font-size:0.64rem;">Timeline Avg</span>
+                    <div class="mf-color-swatch-row">
+                      ${tlSwatches.slice(0, 4).map((s) => `<span class="mf-color-swatch-dot" style="background:${s.hex};" title="${s.hex}"></span>`).join('')}
+                    </div>
+                  </div>
+                  <i class="bi bi-arrow-left text-info small"></i>
+                  <div class="d-flex align-items-center gap-1">
+                    <span class="text-secondary" style="font-size:0.64rem;">Clip Raw</span>
+                    <div class="mf-color-swatch-row">
+                      ${srcSwatches.slice(0, 4).map((s) => `<span class="mf-color-swatch-dot" style="background:${s.hex};" title="${s.hex}"></span>`).join('')}
+                    </div>
+                  </div>
+                </div>
+                <div>
+                  <label class="form-label small text-secondary mb-0">Match Strength (<span id="lblColorMatchInt">${cmPct}%</span>)</label>
+                  <input id="rngColorMatchInt" type="range" min="0" max="1" step="0.02" class="form-range" value="${cm.intensity ?? 0.78}" />
+                </div>
+              ` : `
+                <div class="text-secondary" style="font-size:0.66rem;">Matches this clip's brightness, contrast &amp; white balance to the average palette of existing timeline clips.</div>
+              `}
+            </div>
+          `;
+        })() : ''}
+        <div class="row g-2 mb-2 align-items-center">
+          <div class="col-7">
+            <label class="form-label small text-secondary mb-0">Blend Mode</label>
+            <select id="fxBlendMode" class="form-select form-select-sm">
+              <option value="normal" ${blend === 'normal' ? 'selected' : ''}>Normal</option>
+              <option value="add" ${blend === 'add' ? 'selected' : ''}>Add (Glow / Linear Dodge)</option>
+              <option value="screen" ${blend === 'screen' ? 'selected' : ''}>Screen</option>
+              <option value="multiply" ${blend === 'multiply' ? 'selected' : ''}>Multiply</option>
+            </select>
+          </div>
+          <div class="col-5 pt-3">
+            ${layer.type === 'video' ? `
+              <div class="form-check form-switch mb-0">
+                <input class="form-check-input" type="checkbox" id="fxReverseChk" ${layer.reversed ? 'checked' : ''} />
+                <label class="form-check-label small" for="fxReverseChk">Reverse Clip</label>
+              </div>
+            ` : `<span class="small text-secondary">WebGL Color Engine</span>`}
+          </div>
+        </div>
+        <div class="p-2 rounded bg-dark border border-secondary-subtle mb-2">
+          <div class="small fw-semibold text-info mb-1"><i class="bi bi-palette me-1"></i>HSL Selective Color (${activeCh.label})</div>
+          <div class="mf-cat-scroll mb-2">
+            ${HSL_CHANNELS.map((ch) => `
+              <button type="button" class="mf-hsl-pill ${this.selectedHslIdx === ch.idx ? 'active' : ''}" data-hsl-ch="${ch.idx}" title="${ch.label}">
+                <span class="mf-hsl-dot" style="background:${ch.color};"></span>
+              </button>
+            `).join('')}
+          </div>
+          <div class="row g-2">
+            <div class="col-4">
+              <label class="form-label small text-secondary mb-0">Hue (<span id="lblHslH">${Math.round(curHsl[0] * 100)}</span>)</label>
+              <input id="fxHslH" type="range" min="-1" max="1" step="0.05" class="form-range" value="${curHsl[0]}" />
+            </div>
+            <div class="col-4">
+              <label class="form-label small text-secondary mb-0">Sat (<span id="lblHslS">${Math.round(curHsl[1] * 100)}</span>)</label>
+              <input id="fxHslS" type="range" min="-1" max="1" step="0.05" class="form-range" value="${curHsl[1]}" />
+            </div>
+            <div class="col-4">
+              <label class="form-label small text-secondary mb-0">Lum (<span id="lblHslL">${Math.round(curHsl[2] * 100)}</span>)</label>
+              <input id="fxHslL" type="range" min="-1" max="1" step="0.05" class="form-range" value="${curHsl[2]}" />
+            </div>
+          </div>
+        </div>
+        <div class="row g-2">
+          <div class="col-6">
+            <label class="form-label small text-secondary mb-0">Brightness (<span id="lblFxBright">${Number(fx.brightness || 0).toFixed(2)}</span>)</label>
+            <input id="fxBright" type="range" min="-0.8" max="0.8" step="0.02" class="form-range" value="${fx.brightness || 0}" />
+          </div>
+          <div class="col-6">
+            <label class="form-label small text-secondary mb-0">Contrast (<span id="lblFxContrast">${Number(fx.contrast ?? 1).toFixed(2)}</span>)</label>
+            <input id="fxContrast" type="range" min="0.2" max="2.2" step="0.02" class="form-range" value="${fx.contrast ?? 1}" />
+          </div>
+          <div class="col-6">
+            <label class="form-label small text-secondary mb-0">Saturation (<span id="lblFxSat">${Number(fx.saturation ?? 1).toFixed(2)}</span>)</label>
+            <input id="fxSat" type="range" min="0" max="2.2" step="0.02" class="form-range" value="${fx.saturation ?? 1}" />
+          </div>
+          <div class="col-6">
+            <label class="form-label small text-secondary mb-0">Exposure (<span id="lblFxExp">${Number(fx.exposure || 0).toFixed(2)}</span>)</label>
+            <input id="fxExp" type="range" min="-1.0" max="1.0" step="0.02" class="form-range" value="${fx.exposure || 0}" />
+          </div>
+          <div class="col-6">
+            <label class="form-label small text-secondary mb-0">Highlights (<span id="lblFxHigh">${Number(fx.highlights || 0).toFixed(2)}</span>)</label>
+            <input id="fxHigh" type="range" min="-0.6" max="0.6" step="0.02" class="form-range" value="${fx.highlights || 0}" />
+          </div>
+          <div class="col-6">
+            <label class="form-label small text-secondary mb-0">Shadows (<span id="lblFxShad">${Number(fx.shadows || 0).toFixed(2)}</span>)</label>
+            <input id="fxShad" type="range" min="-0.6" max="0.6" step="0.02" class="form-range" value="${fx.shadows || 0}" />
+          </div>
+          <div class="col-6">
+            <label class="form-label small text-secondary mb-0">Temp (<span id="lblFxTemp">${Number(fx.temperature || 0).toFixed(2)}</span>)</label>
+            <input id="fxTemp" type="range" min="-0.8" max="0.8" step="0.02" class="form-range" value="${fx.temperature || 0}" />
+          </div>
+          <div class="col-6">
+            <label class="form-label small text-secondary mb-0">Tint (<span id="lblFxTint">${Number(fx.tint || 0).toFixed(2)}</span>)</label>
+            <input id="fxTint" type="range" min="-0.8" max="0.8" step="0.02" class="form-range" value="${fx.tint || 0}" />
+          </div>
+          <div class="col-6">
+            <label class="form-label small text-secondary mb-0">Fade (<span id="lblFxFade">${Math.round((fx.fade || 0) * 100)}%</span>)</label>
+            <input id="fxFade" type="range" min="0" max="0.8" step="0.02" class="form-range" value="${fx.fade || 0}" />
+          </div>
+          <div class="col-6">
+            <label class="form-label small text-secondary mb-0">Sharpen (<span id="lblFxSharp">${Number(fx.sharpen || 0).toFixed(2)}</span>)</label>
+            <input id="fxSharp" type="range" min="0" max="1" step="0.02" class="form-range" value="${fx.sharpen || 0}" />
+          </div>
+          <div class="col-6">
+            <label class="form-label small text-secondary mb-0">GPU Blur (<span id="lblFxBlur">${Number(fx.blur || 0).toFixed(1)}</span>)</label>
+            <input id="fxBlur" type="range" min="0" max="10" step="0.2" class="form-range" value="${fx.blur || 0}" />
+          </div>
+          <div class="col-6">
+            <label class="form-label small text-secondary mb-0">Vignette (<span id="lblFxVig">${Math.round((fx.vignette || 0) * 100)}%</span>)</label>
+            <input id="fxVig" type="range" min="0" max="1" step="0.02" class="form-range" value="${fx.vignette || 0}" />
+          </div>
+          <div class="col-12">
+            <label class="form-label small text-secondary mb-0">Film Grain (<span id="lblFxGrain">${Math.round((fx.grain || 0) * 100)}%</span>)</label>
+            <input id="fxGrain" type="range" min="0" max="1" step="0.02" class="form-range" value="${fx.grain || 0}" />
+          </div>
+        </div>
+        ${this.renderLayerMotionBlurCardHtml(layer)}
+      `}
+    `;
+
+    body.querySelectorAll('[data-adj-sub]').forEach((btn) => {
+      btn.onclick = () => {
+        this.activeAdjustSubTab = btn.dataset.adjSub;
+        this.renderAdjustPanel({ force: true });
+      };
+    });
+    body.querySelector('#btnAdjApplyAll')?.addEventListener('click', () => this.app.applyFilterAndAdjustToAllClips(layer));
+    body.querySelector('#btnStyleCopy')?.addEventListener('click', () => this.app.copySelectedStyle());
+    body.querySelector('#btnStylePaste')?.addEventListener('click', () => this.app.pasteStyleToSelected());
+    body.querySelector('#btnColorMatchNow')?.addEventListener('click', () => this.app.matchSelectedToTimelinePalette());
+    body.querySelector('#chkColorMatchOn')?.addEventListener('change', (e) => {
+      this.app.mutateProject(() => toggleLayerColorMatch(layer, e.target.checked));
+    });
+    const cmRng = body.querySelector('#rngColorMatchInt');
+    const lblCm = body.querySelector('#lblColorMatchInt');
+    if (cmRng) {
+      let startCm = layer.colorMatch?.intensity ?? 0.78;
+      let capCm = false;
+      const capStart = () => { if (!capCm) { startCm = layer.colorMatch?.intensity ?? 0.78; capCm = true; } };
+      cmRng.addEventListener('pointerdown', capStart);
+      cmRng.addEventListener('input', (e) => {
+        capStart();
+        const v = Number(e.target.value);
+        if (lblCm) lblCm.textContent = `${Math.round(v * 100)}%`;
+        setLayerColorMatchIntensity(layer, v);
+        this.app.renderPreview();
+      });
+      cmRng.addEventListener('change', (e) => {
+        const nextV = Number(e.target.value);
+        setLayerColorMatchIntensity(layer, startCm);
+        capCm = false;
+        this.app.mutateProject(() => {
+          setLayerColorMatchIntensity(layer, nextV);
+        });
+      });
+    }
+    body.querySelector('#btnOpenCutoutBrush')?.addEventListener('click', () => {
+      this.app.hideOpenSheets();
+      this.app.openCutoutBrushForSelected();
+    });
+    body.querySelector('#btnAdjReset')?.addEventListener('click', () => {
+      this.app.mutateProject(() => {
+        Object.assign(fx, FILTER_PRESETS[0].fx, {
+          blur: 0, sharpen: 0, grain: 0, outlineWidth: 0, outlineColor: '#FFFFFF',
+          hsl: Array.from({ length: 8 }, () => [0, 0, 0]),
+          chromaEnabled: false, chromaColor: '#00FF00', chromaSimilarity: 0.35, chromaSmoothness: 0.12, chromaSpill: 0.5
+        });
+        layer.blendMode = 'normal';
+      });
+    });
+    body.querySelector('#fxBlendMode')?.addEventListener('change', (e) => {
+      this.app.mutateProject(() => { layer.blendMode = e.target.value; });
+    });
+    body.querySelector('#fxReverseChk')?.addEventListener('change', (e) => {
+      this.app.mutateProject(() => { layer.reversed = e.target.checked; });
+    });
+    body.querySelectorAll('[data-hsl-ch]').forEach((btn) => {
+      btn.onclick = () => {
+        this.selectedHslIdx = Number(btn.dataset.hslCh) || 0;
+        this.renderAdjustPanel({ force: true });
+      };
+    });
+    const hslVec = fx.hsl[this.selectedHslIdx];
+    this.bindLiveRange(body.querySelector('#fxHslH'), body.querySelector('#lblHslH'), hslVec, 0, (v) => String(Math.round(v * 100)));
+    this.bindLiveRange(body.querySelector('#fxHslS'), body.querySelector('#lblHslS'), hslVec, 1, (v) => String(Math.round(v * 100)));
+    this.bindLiveRange(body.querySelector('#fxHslL'), body.querySelector('#lblHslL'), hslVec, 2, (v) => String(Math.round(v * 100)));
+
+    this.bindLiveRange(body.querySelector('#fxBright'), body.querySelector('#lblFxBright'), fx, 'brightness', (v) => v.toFixed(2));
+    this.bindLiveRange(body.querySelector('#fxContrast'), body.querySelector('#lblFxContrast'), fx, 'contrast', (v) => v.toFixed(2));
+    this.bindLiveRange(body.querySelector('#fxSat'), body.querySelector('#lblFxSat'), fx, 'saturation', (v) => v.toFixed(2));
+    this.bindLiveRange(body.querySelector('#fxExp'), body.querySelector('#lblFxExp'), fx, 'exposure', (v) => v.toFixed(2));
+    this.bindLiveRange(body.querySelector('#fxHigh'), body.querySelector('#lblFxHigh'), fx, 'highlights', (v) => v.toFixed(2));
+    this.bindLiveRange(body.querySelector('#fxShad'), body.querySelector('#lblFxShad'), fx, 'shadows', (v) => v.toFixed(2));
+    this.bindLiveRange(body.querySelector('#fxTemp'), body.querySelector('#lblFxTemp'), fx, 'temperature', (v) => v.toFixed(2));
+    this.bindLiveRange(body.querySelector('#fxTint'), body.querySelector('#lblFxTint'), fx, 'tint', (v) => v.toFixed(2));
+    this.bindLiveRange(body.querySelector('#fxFade'), body.querySelector('#lblFxFade'), fx, 'fade', (v) => `${Math.round(v * 100)}%`);
+    this.bindLiveRange(body.querySelector('#fxSharp'), body.querySelector('#lblFxSharp'), fx, 'sharpen', (v) => v.toFixed(2));
+    this.bindLiveRange(body.querySelector('#fxBlur'), body.querySelector('#lblFxBlur'), fx, 'blur', (v) => v.toFixed(1));
+    this.bindLiveRange(body.querySelector('#fxVig'), body.querySelector('#lblFxVig'), fx, 'vignette', (v) => `${Math.round(v * 100)}%`);
+    this.bindLiveRange(body.querySelector('#fxGrain'), body.querySelector('#lblFxGrain'), fx, 'grain', (v) => `${Math.round(v * 100)}%`);
+    this.bindLiveRange(body.querySelector('#fxOutlineW'), body.querySelector('#lblFxOutlineW'), fx, 'outlineWidth', (v) => String(Math.round(v * 100)));
+    body.querySelector('#fxOutlineCol')?.addEventListener('change', (e) => {
+      this.app.mutateProject(() => { fx.outlineColor = e.target.value; });
+    });
+
+    body.querySelector('#fxChromaOn')?.addEventListener('change', (e) => {
+      this.app.mutateProject(() => { fx.chromaEnabled = e.target.checked; });
+    });
+    body.querySelector('#fxChromaColor')?.addEventListener('change', (e) => {
+      this.app.mutateProject(() => { fx.chromaColor = e.target.value; });
+    });
+    this.bindLiveRange(body.querySelector('#fxChromaSim'), body.querySelector('#lblChromaSim'), fx, 'chromaSimilarity', (v) => v.toFixed(2));
+    this.bindLiveRange(body.querySelector('#fxChromaSm'), body.querySelector('#lblChromaSm'), fx, 'chromaSmoothness', (v) => v.toFixed(2));
+    this.bindLiveRange(body.querySelector('#fxChromaSp'), body.querySelector('#lblChromaSp'), fx, 'chromaSpill', (v) => `${Math.round(v * 100)}%`);
+    this.bindLayerMotionBlurEvents(body, layer);
+  }
+
+  renderMaskPanel(opts = {}) {
+    if (!opts.force && !this.isSheetOpen('sheetMask')) return;
+    const body = document.getElementById('maskBody');
+    if (!body) return;
+    const layer = this.app.getSelectedLayer();
+    if (!layer) {
+      body.innerHTML = `<div class="text-center text-secondary py-4 small">Select a visual layer on the timeline to edit Mask, Crop &amp; PIP.</div>`;
+      return;
+    }
+    body.innerHTML = this.buildMaskTransTabHtml(layer);
+    this.bindMaskTransTabEvents(body, layer);
+  }
+
+  renderTrackerPanel(opts = {}) {
+    if (!opts.force && !this.isSheetOpen('sheetTracker')) return;
+    const body = document.getElementById('trackerBody');
+    if (!body) return;
+    body.innerHTML = this.buildTrackerTabHtml();
+    this.bindTrackerTabEvents(body);
+  }
+
+  renderRatioPanel(opts = {}) {
+    if (!opts.force && !this.isSheetOpen('sheetRatio')) return;
     const body = document.getElementById('ratioBody');
     if (!body) return;
     const p = this.app.project;
@@ -3356,7 +4181,7 @@ export class PanelsUI {
       btn.onclick = () => {
         this.app.stopTemplateLivePreview();
         this.activeTransSide = btn.dataset.trSide;
-        this.renderStylePanel();
+        this.renderMaskPanel({ force: true });
       };
     });
     this.bindTemplatePreviewTiles(body, '[data-tr-preview]', (tile, isPreviewing) => {
@@ -4026,14 +4851,14 @@ export class PanelsUI {
       tr.sourceLayerId = e.target.value;
       tr.active = true;
       this.app.syncTrackerOverlay();
-      this.renderStylePanel();
+      this.renderTrackerPanel({ force: true });
     });
 
     body.querySelector('#btnTrkAimToggle')?.addEventListener('click', () => {
       tr.active = !tr.active;
       if (tr.active) tr.followTrackedPoints = false;
       this.app.syncTrackerOverlay();
-      this.renderStylePanel();
+      this.renderTrackerPanel({ force: true });
     });
 
     const syncCoords = () => {

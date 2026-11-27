@@ -246,6 +246,15 @@
     </div>
     <div class="offcanvas-body py-2">
       <input id="fallbackFileInput" type="file" multiple accept="video/*,image/*,audio/*" class="d-none" />
+      <div id="mediaFilterBar" class="d-flex flex-wrap align-items-center justify-content-between gap-2 mb-2">
+        <div class="btn-group btn-group-sm" role="group" aria-label="Filter media">
+          <button type="button" class="btn btn-info text-dark fw-semibold" data-media-cat="all">All</button>
+          <button type="button" class="btn btn-dark border-secondary-subtle" data-media-cat="video">Video</button>
+          <button type="button" class="btn btn-dark border-secondary-subtle" data-media-cat="image">Photo</button>
+          <button type="button" class="btn btn-dark border-secondary-subtle" data-media-cat="audio">Audio</button>
+        </div>
+        <span id="lblMediaCount" class="small text-secondary"></span>
+      </div>
       <div id="mediaLibraryEmpty" class="text-center py-4 text-secondary">
         <i class="bi bi-cloud-plus fs-2 d-block mb-2"></i>
         <p class="mb-2 small">Import videos, photos, GIFs, or audio from your device.</p>
@@ -319,13 +328,67 @@
     <div class="offcanvas-body py-2" id="keyframesBody"></div>
   </div>
 
-  <!-- 6. STYLE / EFFECTS / FILTERS / MASK / TRACK / CAMERA SHEET -->
-  <div class="offcanvas offcanvas-bottom mf-sheet" tabindex="-1" id="sheetStyle">
+  <!-- 6A. EDIT CLIP SHEET -->
+  <div class="offcanvas offcanvas-bottom mf-sheet" tabindex="-1" id="sheetEdit">
     <div class="offcanvas-header py-2 border-bottom border-secondary-subtle">
-      <h6 class="offcanvas-title mb-0"><i class="bi bi-palette2 me-2 text-info"></i>Edit, Filters, Effects &amp; Camera</h6>
+      <h6 class="offcanvas-title mb-0"><i class="bi bi-sliders me-2 text-info"></i>Edit Clip</h6>
       <button type="button" class="btn-close" data-bs-dismiss="offcanvas" aria-label="Close"></button>
     </div>
-    <div class="offcanvas-body py-2" id="styleBody"></div>
+    <div class="offcanvas-body py-2" id="editBody"></div>
+  </div>
+
+  <!-- 6B. FILTERS SHEET -->
+  <div class="offcanvas offcanvas-bottom mf-sheet" tabindex="-1" id="sheetFilters">
+    <div class="offcanvas-header py-2 border-bottom border-secondary-subtle">
+      <h6 class="offcanvas-title mb-0"><i class="bi bi-palette-fill me-2 text-success"></i>Filters</h6>
+      <button type="button" class="btn-close" data-bs-dismiss="offcanvas" aria-label="Close"></button>
+    </div>
+    <div class="offcanvas-body py-2" id="filtersBody"></div>
+  </div>
+
+  <!-- 6C. EFFECTS SHEET -->
+  <div class="offcanvas offcanvas-bottom mf-sheet" tabindex="-1" id="sheetEffects">
+    <div class="offcanvas-header py-2 border-bottom border-secondary-subtle">
+      <h6 class="offcanvas-title mb-0"><i class="bi bi-stars me-2 text-info"></i>Effects</h6>
+      <button type="button" class="btn-close" data-bs-dismiss="offcanvas" aria-label="Close"></button>
+    </div>
+    <div class="offcanvas-body py-2" id="effectsBody"></div>
+  </div>
+
+  <!-- 6D. 3D CAMERA SHEET -->
+  <div class="offcanvas offcanvas-bottom mf-sheet" tabindex="-1" id="sheetCamera">
+    <div class="offcanvas-header py-2 border-bottom border-secondary-subtle">
+      <h6 class="offcanvas-title mb-0"><i class="bi bi-badge-3d me-2 text-info"></i>3D Camera</h6>
+      <button type="button" class="btn-close" data-bs-dismiss="offcanvas" aria-label="Close"></button>
+    </div>
+    <div class="offcanvas-body py-2" id="cameraBody"></div>
+  </div>
+
+  <!-- 6E. ADJUST & CUTOUT SHEET -->
+  <div class="offcanvas offcanvas-bottom mf-sheet" tabindex="-1" id="sheetAdjust">
+    <div class="offcanvas-header py-2 border-bottom border-secondary-subtle">
+      <h6 class="offcanvas-title mb-0"><i class="bi bi-sliders2 me-2 text-warning"></i>Adjust &amp; Cutout</h6>
+      <button type="button" class="btn-close" data-bs-dismiss="offcanvas" aria-label="Close"></button>
+    </div>
+    <div class="offcanvas-body py-2" id="adjustBody"></div>
+  </div>
+
+  <!-- 6F. MASK, CROP & PIP SHEET -->
+  <div class="offcanvas offcanvas-bottom mf-sheet" tabindex="-1" id="sheetMask">
+    <div class="offcanvas-header py-2 border-bottom border-secondary-subtle">
+      <h6 class="offcanvas-title mb-0"><i class="bi bi-bounding-box-circles me-2 text-info"></i>Mask, Crop &amp; PIP</h6>
+      <button type="button" class="btn-close" data-bs-dismiss="offcanvas" aria-label="Close"></button>
+    </div>
+    <div class="offcanvas-body py-2" id="maskBody"></div>
+  </div>
+
+  <!-- 6G. 3D MOTION TRACKER SHEET -->
+  <div class="offcanvas offcanvas-bottom mf-sheet" tabindex="-1" id="sheetTracker">
+    <div class="offcanvas-header py-2 border-bottom border-secondary-subtle">
+      <h6 class="offcanvas-title mb-0"><i class="bi bi-crosshair me-2 text-warning"></i>3D Motion Tracker</h6>
+      <button type="button" class="btn-close" data-bs-dismiss="offcanvas" aria-label="Close"></button>
+    </div>
+    <div class="offcanvas-body py-2" id="trackerBody"></div>
   </div>
 
   <!-- 7. ASPECT RATIO & CANVAS BG QUICK SHEET -->
