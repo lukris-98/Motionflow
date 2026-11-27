@@ -12,7 +12,8 @@ import {
 } from '../src/main/assets/www/js/engine/stabilizerEngine.js';
 import { TimelineEngine } from '../src/main/assets/www/js/engine/timelineEngine.js';
 import { AudioEngine, detectBeatsFromPcm } from '../src/main/assets/www/js/engine/audioEngine.js';
-import { parseSrtOrLyrics, FILTER_PRESETS, VIDEO_EFFECT_PRESETS, TRANSITION_PRESETS, TRANSITION_CATEGORIES, getAnimationCatalogForLayerType } from '../src/main/assets/www/js/engine/capcutCatalog.js';
+import fs from 'node:fs';
+import { parseSrtOrLyrics, FILTER_PRESETS, VIDEO_EFFECT_PRESETS, TRANSITION_PRESETS, TRANSITION_CATEGORIES, ANIMATION_CATALOG, getAnimationCatalogForLayerType } from '../src/main/assets/www/js/engine/capcutCatalog.js';
 import { ExportEngine } from '../src/main/assets/www/js/export/exportEngine.js';
 import { createEmptyProject, deserializeProject, serializeProject } from '../src/main/assets/www/js/storage/projectStorage.js';
 import { RendererEngine } from '../src/main/assets/www/js/engine/rendererEngine.js';
@@ -2118,6 +2119,79 @@ test('computeRulerWindow keeps ruler bitmap static inside buffered content windo
   assert.equal(farScroll.needsRedraw, true);
   assert.ok(farScroll.windowStart > initLong.windowStart);
 });
+
+test('Expanded In/Out/Combo animation templates generate valid keyframes and have matching CSS preview classes', () => {
+  const proj = createEmptyProject('AllAnimTemplatesProj', { fps: 30, width: 1080, height: 1920 });
+  const cssText = fs.readFileSync(new URL('../src/main/assets/www/css/studio.css', import.meta.url), 'utf8');
+
+  const textLayer = TimelineEngine.createTextLayer(proj, 0);
+  textLayer.endFrame = 120;
+  const videoLayer = TimelineEngine.createMediaLayer(proj, { id: 'v1', type: 'video', name: 'Clip 1', durationMs: 4000 }, 0);
+  videoLayer.endFrame = 120;
+
+  // Every catalog template must have a defined CSS preview class in studio.css and generate >=2 keyframes
+  for (const item of ANIMATION_CATALOG) {
+    assert.ok(item.animClass.startsWith('mf-anim-'), `Expected mf-anim-* class on ${item.id}`);
+    assert.ok(cssText.includes(`.${item.animClass}`), `studio.css missing CSS rule for .${item.animClass}`);
+
+    const target = item.target === 'text' ? textLayer : videoLayer;
+    KeyframeEngine.clearPresetCategory(target, item.cat);
+    KeyframeEngine.applyPreset(target, item.id, proj.width, proj.height, 24);
+    const taggedCount = Object.values(target.keyframes || {})
+      .flat()
+      .filter((k) => k.presetTag === item.cat).length;
+    assert.ok(taggedCount >= 2, `Preset ${item.id} (${item.cat}) should generate >=2 tagged keyframes, got ${taggedCount}`);
+  }
+
+  // Video and Image share exact In, Out, and Combo catalogs separately from Text
+  for (const cat of ['in', 'out', 'combo']) {
+    assert.deepEqual(
+      getAnimationCatalogForLayerType('video', cat).map((x) => x.id),
+      getAnimationCatalogForLayerType('image', cat).map((x) => x.id),
+      `Video and Image ${cat} catalogs must stay identical`
+    );
+    assert.ok(getAnimationCatalogForLayerType('text', cat).length >= 5, `Text ${cat} catalog expanded`);
+    assert.ok(getAnimationCatalogForLayerType('video', cat).length >= 9, `Video/Image ${cat} catalog expanded`);
+  }
+});
+
+test('KeyframeEngine clamps short-clip In/Out preset durations cleanly without keyframe overlap and persists metadata', () => {
+  const proj = createEmptyProject('ShortClipClampProj', { fps: 30, width: 1080, height: 1920 });
+  const clip = TimelineEngine.createMediaLayer(proj, { id: 'img1', type: 'image', name: 'Short Img', durationMs: 1000 }, 0);
+  clip.startFrame = 0;
+  clip.endFrame = 30; // 1.0s total length
+
+  // Apply 20f In then request 24f Out -> Out clamps to 10f so In (0..20) and Out (20..30) never collide
+  KeyframeEngine.applyPreset(clip, 'rubberIn', proj.width, proj.height, 20);
+  assert.equal(clip.presetInId, 'rubberIn');
+  assert.equal(clip.presetInDurFrames, 20);
+
+  KeyframeEngine.applyPreset(clip, 'tilt3DOut', proj.width, proj.height, 24);
+  assert.equal(clip.presetOutId, 'tilt3DOut');
+  assert.equal(clip.presetOutDurFrames, 10, 'Out duration should clamp cleanly to remaining 10f');
+
+  const inFrames = Object.values(clip.keyframes).flat().filter((k) => k.presetTag === 'in').map((k) => k.frame);
+  const outFrames = Object.values(clip.keyframes).flat().filter((k) => k.presetTag === 'out').map((k) => k.frame);
+  assert.ok(Math.max(...inFrames) <= Math.min(...outFrames), 'In keyframes must finish at or before Out keyframes start');
+
+  // Clearing Out cleans both presetOutId and presetOutDurFrames while keeping In intact
+  KeyframeEngine.clearPresetCategory(clip, 'out');
+  assert.equal(clip.presetOutId, null);
+  assert.equal(clip.presetOutDurFrames, undefined);
+  assert.equal(clip.presetInId, 'rubberIn');
+  assert.equal(clip.presetInDurFrames, 20);
+
+  // Batch preset applies across unlocked visual/text layers and respects clear mode
+  const clip2 = TimelineEngine.createMediaLayer(proj, { id: 'img2', type: 'image', name: 'Img 2', durationMs: 3000 }, 30);
+  const lockedClip = TimelineEngine.createMediaLayer(proj, { id: 'img3', type: 'image', name: 'Locked', durationMs: 3000 }, 120);
+  lockedClip.locked = true;
+  const applied = KeyframeEngine.applyBatchPreset([clip, clip2, lockedClip], 'fadeOut', proj.width, proj.height, 15, 'out');
+  assert.equal(applied, 2);
+  assert.equal(clip.presetOutId, 'fadeOut');
+  assert.equal(clip2.presetOutId, 'fadeOut');
+  assert.equal(lockedClip.presetOutId || null, null);
+});
+
 
 
 

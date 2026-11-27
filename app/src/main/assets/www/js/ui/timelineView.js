@@ -199,6 +199,18 @@ export function getClipStatusBadges(layer) {
       title: `${fxCount} Efek Aktif`
     });
   }
+  if (layer.presetInId || layer.presetOutId || layer.presetComboId) {
+    const parts = [];
+    if (layer.presetInId) parts.push(`In${layer.presetInDurFrames ? ` ${layer.presetInDurFrames}f` : ''}`);
+    if (layer.presetOutId) parts.push(`Out${layer.presetOutDurFrames ? ` ${layer.presetOutDurFrames}f` : ''}`);
+    if (layer.presetComboId) parts.push(`Cmb${layer.presetComboDurFrames ? ` ${layer.presetComboDurFrames}f` : ''}`);
+    badges.push({
+      kind: 'anim',
+      icon: 'bi-magic',
+      text: parts.join('·'),
+      title: `Animasi: ${parts.join(' | ')}`
+    });
+  }
   const kfCount = KeyframeEngine.getAllKeyframeFrames(layer).length;
   if (kfCount > 0) {
     badges.push({ kind: 'keyframe', icon: 'bi-diamond-fill', title: `${kfCount} Keyframe${kfCount > 1 ? 's' : ''}` });
@@ -1697,6 +1709,29 @@ export class TimelineView {
       contentRow.appendChild(badgeStrip);
     }
     clip.appendChild(contentRow);
+
+    const clipTotalFrames = Math.max(1, (layer.endFrame ?? 0) - (layer.startFrame ?? 0));
+    if (layer.presetInId) {
+      const inSpan = document.createElement('div');
+      inSpan.className = 'mf-clip-anim-span is-in';
+      const inPct = Math.min(100, Math.max(4, ((Number(layer.presetInDurFrames) || 24) / clipTotalFrames) * 100));
+      inSpan.style.width = `${inPct.toFixed(1)}%`;
+      clip.appendChild(inSpan);
+    }
+    if (layer.presetOutId) {
+      const outSpan = document.createElement('div');
+      outSpan.className = 'mf-clip-anim-span is-out';
+      const outPct = Math.min(100, Math.max(4, ((Number(layer.presetOutDurFrames) || 24) / clipTotalFrames) * 100));
+      outSpan.style.width = `${outPct.toFixed(1)}%`;
+      clip.appendChild(outSpan);
+    }
+    if (layer.presetComboId) {
+      const comboSpan = document.createElement('div');
+      comboSpan.className = 'mf-clip-anim-span is-combo';
+      const comboPct = Math.min(100, Math.max(6, ((Number(layer.presetComboDurFrames) || clipTotalFrames) / clipTotalFrames) * 100));
+      comboSpan.style.width = `${comboPct.toFixed(1)}%`;
+      clip.appendChild(comboSpan);
+    }
 
     const diamonds = [];
     const kfFrames = KeyframeEngine.getAllKeyframeFrames(layer);

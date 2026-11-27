@@ -43,6 +43,7 @@ export class PanelsUI {
     this.activeFxSubTab = 'effects';
     this.activeAdjustSubTab = 'adjust';
     this.activeAnimTab = 'in';
+    this.presetDurByTab = { in: 24, out: 24, combo: 24 };
     this.activeTextSubTab = 'edit';
     this.activeTransSide = 'in';
     this.activeStickerSubTab = 'stickers';
@@ -685,6 +686,7 @@ export class PanelsUI {
     if (!opts.force && !this.isSheetOpen('sheetKeyframes')) return;
     const body = document.getElementById('keyframesBody');
     if (!body) return;
+    const prevScrollTop = opts.resetScroll ? 0 : body.scrollTop;
     const layer = this.app.getSelectedLayer();
     const canApplyToLayer = Boolean(layer && layer.type !== 'audio' && layer.type !== 'group' && layer.type !== 'camera');
     const isTextLayer = layer?.type === 'text';
@@ -728,6 +730,39 @@ export class PanelsUI {
     const activeEasing = kfAtCur?.easing || 'easeInOut';
     const bez = this.getBezierForEasingMode(activeEasing, kfAtCur?.bezier || [0.42, 0, 0.58, 1]);
     const animItems = getAnimationCatalogForLayerType(layer?.type, this.activeAnimTab);
+    const fps = Math.max(1, Number(this.app.project?.fps) || 30);
+    const clipLenFrames = layer ? Math.max(2, (layer.endFrame ?? 90) - (layer.startFrame ?? 0)) : 180;
+    const tabDurProp = this.activeAnimTab === 'in'
+      ? 'presetInDurFrames'
+      : (this.activeAnimTab === 'out' ? 'presetOutDurFrames' : 'presetComboDurFrames');
+    const savedLayerDur = Number(layer?.[tabDurProp]);
+    const rawTabDur = (Number.isFinite(savedLayerDur) && savedLayerDur > 0)
+      ? savedLayerDur
+      : (this.presetDurByTab?.[this.activeAnimTab] || 24);
+    const effectiveDur = layer
+      ? KeyframeEngine.getClampedPresetDuration(layer, this.activeAnimTab, rawTabDur)
+      : Math.max(3, Math.min(600, rawTabDur));
+    const maxTabDur = layer
+      ? Math.max(3, KeyframeEngine.getClampedPresetDuration(layer, this.activeAnimTab, Math.min(600, clipLenFrames)))
+      : 180;
+    const minTabDur = Math.min(3, maxTabDur);
+    const curSecText = (effectiveDur / fps).toFixed(2);
+    const activeTabPresetId = this.activeAnimTab === 'in'
+      ? layer?.presetInId
+      : (this.activeAnimTab === 'out' ? layer?.presetOutId : layer?.presetComboId);
+    const getPresetLabel = (id) => (id ? (ANIMATION_CATALOG.find((x) => x.id === id)?.label || id) : 'Kosong');
+    const slotList = [
+      { cat: 'in', title: 'In', id: layer?.presetInId || null, dur: layer?.presetInDurFrames },
+      { cat: 'out', title: 'Out', id: layer?.presetOutId || null, dur: layer?.presetOutDurFrames },
+      { cat: 'combo', title: 'Combo', id: layer?.presetComboId || null, dur: layer?.presetComboDurFrames }
+    ];
+    const matchingBatchLayers = canApplyToLayer && (isTextLayer || isMediaLayer)
+      ? (this.app.project?.layers || []).filter((l) => !l.locked && (isTextLayer ? l.type === 'text' : (l.type === 'video' || l.type === 'image')))
+      : [];
+    const quickSecOptions = [0.3, 0.5, 0.8, 1.2];
+    const flashDurCls = this._flashAnimDurCard ? 'is-highlight' : '';
+    this._flashAnimDurCard = false;
+
     const isPresetActive = (id) => Boolean(layer && (
       layer.presetInId === id || layer.presetOutId === id || layer.presetComboId === id || layer.activePresetId === id
     ));
@@ -739,52 +774,106 @@ export class PanelsUI {
     const copiedGroup = this.app.timelineView?.copiedKfGroup;
 
     body.innerHTML = `
-      <div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mb-2">
-        <div class="btn-group btn-group-sm" role="group">
-          <button type="button" class="btn ${this.activeAnimTab === 'in' ? 'btn-info text-dark fw-semibold' : 'btn-dark border-secondary-subtle'}" data-anim-tab="in">In</button>
-          <button type="button" class="btn ${this.activeAnimTab === 'out' ? 'btn-info text-dark fw-semibold' : 'btn-dark border-secondary-subtle'}" data-anim-tab="out">Out</button>
-          <button type="button" class="btn ${this.activeAnimTab === 'combo' ? 'btn-info text-dark fw-semibold' : 'btn-dark border-secondary-subtle'}" data-anim-tab="combo">Combo</button>
-        </div>
-        <div class="d-flex align-items-center gap-2">
-          ${isMediaLayer ? `
-            <button type="button" id="btnJumpToTransitions" class="btn btn-xs btn-outline-info py-1 px-2" title="Buka Transisi antar klip Video/Gambar">
-              <i class="bi bi-intersect me-1"></i>Transisi Antar Klip
-            </button>
-          ` : ''}
+      <div class="mf-anim-browser-wrap mb-2">
+        <div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mb-2">
+          <div class="btn-group btn-group-sm" role="group">
+            <button type="button" class="btn ${this.activeAnimTab === 'in' ? 'btn-info text-dark fw-semibold' : 'btn-dark border-secondary-subtle'}" data-anim-tab="in">In (${getAnimationCatalogForLayerType(layer?.type, 'in').length})</button>
+            <button type="button" class="btn ${this.activeAnimTab === 'out' ? 'btn-info text-dark fw-semibold' : 'btn-dark border-secondary-subtle'}" data-anim-tab="out">Out (${getAnimationCatalogForLayerType(layer?.type, 'out').length})</button>
+            <button type="button" class="btn ${this.activeAnimTab === 'combo' ? 'btn-info text-dark fw-semibold' : 'btn-dark border-secondary-subtle'}" data-anim-tab="combo">Combo (${getAnimationCatalogForLayerType(layer?.type, 'combo').length})</button>
+          </div>
           <div class="d-flex align-items-center gap-1">
-            <span class="small text-secondary">Dur(f)</span>
-            <input id="presetDurFrames" type="number" min="6" max="180" value="24" class="form-control form-control-sm" style="width:62px;" />
+            ${isMediaLayer ? `
+              <button type="button" id="btnJumpToTransitions" class="btn btn-xs btn-outline-info py-1 px-2" title="Buka Transisi antar klip Video/Gambar">
+                <i class="bi bi-intersect me-1"></i>Transisi Antar Klip
+              </button>
+            ` : ''}
+            ${canApplyToLayer && activeTabPresetId && matchingBatchLayers.length >= 2 ? `
+              <button type="button" id="btnApplyAnimAll" class="btn btn-xs btn-outline-info py-1 px-2" title="Terapkan preset ${this.activeAnimTab.toUpperCase()} ini ke semua item sejenis">
+                <i class="bi bi-layers me-1"></i>Ke Semua (${matchingBatchLayers.length})
+              </button>
+            ` : ''}
           </div>
         </div>
-      </div>
 
-      <div class="small text-secondary mb-2" style="font-size:0.7rem;">
-        <i class="bi ${isTextLayer ? 'bi-type text-primary' : 'bi-play-circle text-info'} me-1"></i>${
-          isTextLayer
-            ? `<strong>Animasi Teks</strong> — khusus teks &amp; tipografi. Tap untuk <strong>preview</strong>, tekan <strong class="text-info">+</strong> untuk menerapkan ke <strong>${this.esc(layer.name)}</strong>.`
-            : isMediaLayer
-              ? `<strong>Animasi Per Item (Video &amp; Gambar)</strong> — menganimasikan item <strong>${this.esc(layer.name)}</strong> sendiri. Tap untuk <strong>preview</strong>, tekan <strong class="text-info">+</strong> untuk menerapkan.`
-              : canApplyToLayer
-                ? `Tap kartu untuk <strong>preview</strong> animasi, tekan tombol <strong class="text-info">+</strong> di pojok kanan bawah untuk menerapkan ke <strong>${this.esc(layer.name)}</strong>.`
-                : 'Tap kartu untuk <strong>preview</strong> animasi. Pilih item video, gambar, teks, atau shape di timeline lalu tekan <strong class="text-info">+</strong> untuk menerapkan.'
-        }
-      </div>
-
-      <div class="mf-tile-grid mb-2">
-        ${animItems.map((a) => `
-          <div role="button" tabindex="0" class="mf-preview-tile has-add-btn ${isPresetActive(a.id) ? 'active' : ''}" data-anim-preview="${a.id}" aria-label="Preview ${a.label}">
-            <div class="mf-tile-stage">
-              ${isTextLayer
-                ? `<div class="mf-anim-chip mf-anim-text-chip ${a.animClass}" style="background:linear-gradient(135deg, ${a.color}, #7c4dff);">Teks</div>`
-                : `<div class="mf-anim-clip-chip ${a.animClass}" style="background:linear-gradient(135deg, ${a.color}, #2563eb);"><i class="bi bi-image-fill"></i></div>`
-              }
-            </div>
-            <div class="mf-tile-label">${a.label}</div>
-            <button type="button" class="mf-tile-add-btn" data-preset="${a.id}" title="Apply ${a.label}" aria-label="Apply ${a.label}">
-              <i class="bi bi-plus-lg"></i>
-            </button>
+        ${canApplyToLayer ? `
+          <div class="mf-anim-slot-bar mb-2">
+            ${slotList.map((s) => `
+              <div role="button" tabindex="0" class="mf-anim-slot-pill ${this.activeAnimTab === s.cat ? 'is-tab' : ''} ${s.id ? 'has-val' : ''}" data-anim-slot="${s.cat}" title="Buka tab ${s.title}">
+                <div class="text-truncate">
+                  <span class="fw-semibold text-info">${s.title}:</span>
+                  <span>${this.esc(getPresetLabel(s.id))}${s.id && s.dur ? ` (${(s.dur / fps).toFixed(1)}s)` : ''}</span>
+                </div>
+                ${s.id ? `<button type="button" class="btn-close btn-close-white flex-shrink-0" style="font-size:0.45rem;" data-clear-preset-cat="${s.cat}" aria-label="Hapus ${s.title}"></button>` : ''}
+              </div>
+            `).join('')}
           </div>
-        `).join('')}
+        ` : ''}
+
+        <div class="small text-secondary mb-2" style="font-size:0.7rem;">
+          <i class="bi ${isTextLayer ? 'bi-type text-primary' : 'bi-play-circle text-info'} me-1"></i>${
+            isTextLayer
+              ? `<strong>Animasi Teks</strong> — khusus teks &amp; tipografi. Tap untuk <strong>preview</strong>, tekan <strong class="text-info">+</strong> untuk menerapkan ke <strong>${this.esc(layer.name)}</strong>.`
+              : isMediaLayer
+                ? `<strong>Animasi Per Item (Video &amp; Gambar)</strong> — menganimasikan item <strong>${this.esc(layer.name)}</strong> sendiri. Tap untuk <strong>preview</strong>, tekan <strong class="text-info">+</strong> untuk menerapkan.`
+                : canApplyToLayer
+                  ? `Tap kartu untuk <strong>preview</strong> animasi, tekan tombol <strong class="text-info">+</strong> di pojok kanan bawah untuk menerapkan ke <strong>${this.esc(layer.name)}</strong>.`
+                  : 'Tap kartu untuk <strong>preview</strong> animasi. Pilih item video, gambar, teks, atau shape di timeline lalu tekan <strong class="text-info">+</strong> untuk menerapkan.'
+          }
+        </div>
+
+        <div class="mf-tile-grid mb-2">
+          ${canApplyToLayer ? `
+            <div role="button" tabindex="0" class="mf-preview-tile ${!activeTabPresetId ? 'active' : ''}" data-clear-tile="${this.activeAnimTab}" aria-label="Tanpa animasi ${this.activeAnimTab}">
+              <div class="mf-tile-stage">
+                <i class="bi bi-slash-circle text-secondary fs-5"></i>
+              </div>
+              <div class="mf-tile-label">Tanpa</div>
+            </div>
+          ` : ''}
+          ${animItems.map((a) => `
+            <div role="button" tabindex="0" class="mf-preview-tile has-add-btn ${isPresetActive(a.id) ? 'active' : ''}" data-anim-preview="${a.id}" aria-label="Preview ${a.label}">
+              <div class="mf-tile-stage">
+                ${isTextLayer
+                  ? `<div class="mf-anim-chip mf-anim-text-chip ${a.animClass}" style="background:linear-gradient(135deg, ${a.color}, #7c4dff);">Teks</div>`
+                  : `<div class="mf-anim-clip-chip ${a.animClass}" style="background:linear-gradient(135deg, ${a.color}, #2563eb);"><i class="bi bi-image-fill"></i></div>`
+                }
+              </div>
+              <div class="mf-tile-label">${a.label}</div>
+              <button type="button" class="mf-tile-add-btn" data-preset="${a.id}" title="Apply ${a.label}" aria-label="Apply ${a.label}">
+                <i class="bi bi-plus-lg"></i>
+              </button>
+            </div>
+          `).join('')}
+        </div>
+
+        <div id="animDurCard" class="mf-anim-dur-card is-sticky ${flashDurCls}">
+          <div class="d-flex align-items-center justify-content-between gap-2 mb-1">
+            <span class="small fw-semibold text-info text-truncate" style="font-size:0.72rem;">
+              <i class="bi bi-stopwatch me-1"></i>Durasi ${this.activeAnimTab.toUpperCase()}${activeTabPresetId ? ` • ${this.esc(getPresetLabel(activeTabPresetId))}` : ''}
+            </span>
+            <div class="d-flex align-items-center gap-1 flex-shrink-0">
+              <span id="lblPresetDurSec" class="badge text-bg-dark border border-info-subtle font-monospace" style="font-size:0.66rem;">${curSecText}s</span>
+              <input id="presetDurFrames" type="number" min="${minTabDur}" max="${maxTabDur}" value="${effectiveDur}" class="form-control form-control-sm text-center px-1" style="width:52px;" title="Durasi dalam frame" />
+              <span class="small text-secondary" style="font-size:0.66rem;">f</span>
+            </div>
+          </div>
+          <div class="d-flex align-items-center gap-1 mb-1">
+            <button type="button" id="btnAnimDurMinus" class="btn btn-xs btn-outline-secondary px-2" title="Kurangi 0.1 detik">-0.1s</button>
+            <input id="presetDurRange" type="range" class="form-range flex-grow-1 mx-1" min="${minTabDur}" max="${maxTabDur}" step="1" value="${effectiveDur}" />
+            <button type="button" id="btnAnimDurPlus" class="btn btn-xs btn-outline-secondary px-2" title="Tambah 0.1 detik">+0.1s</button>
+          </div>
+          <div class="d-flex flex-wrap align-items-center justify-content-between gap-1">
+            <div class="btn-group btn-group-xs">
+              ${quickSecOptions.map((sec) => {
+                const qf = Math.max(minTabDur, Math.min(maxTabDur, Math.round(sec * fps)));
+                const isCur = Math.abs(effectiveDur - qf) <= 1;
+                return `<button type="button" class="btn btn-xs ${isCur ? 'btn-info text-dark fw-semibold' : 'btn-outline-secondary'}" data-dur-sec="${sec}">${sec}s</button>`;
+              }).join('')}
+              <button type="button" id="btnAnimDurFull" class="btn btn-xs ${Math.abs(effectiveDur - maxTabDur) <= 1 ? 'btn-info text-dark fw-semibold' : 'btn-outline-secondary'}" data-dur-full="1" title="Pakai durasi penuh yang tersedia">Penuh</button>
+            </div>
+            <span class="small text-secondary" style="font-size:0.62rem;">Maks ${(maxTabDur / fps).toFixed(1)}s</span>
+          </div>
+        </div>
       </div>
 
       ${layer ? `
@@ -931,6 +1020,149 @@ export class PanelsUI {
       };
     });
 
+    body.querySelectorAll('[data-anim-slot]').forEach((slotEl) => {
+      slotEl.onclick = (e) => {
+        if (e.target.closest('[data-clear-preset-cat]')) return;
+        this.app.stopTemplateLivePreview();
+        this.activeAnimTab = slotEl.dataset.animSlot;
+        this.renderKeyframesPanel();
+      };
+    });
+
+    const durRangeEl = body.querySelector('#presetDurRange');
+    const durNumEl = body.querySelector('#presetDurFrames');
+    const durSecLbl = body.querySelector('#lblPresetDurSec');
+    const durFullBtn = body.querySelector('#btnAnimDurFull');
+    const syncDurationControlsUI = (framesVal) => {
+      if (durRangeEl) durRangeEl.value = String(framesVal);
+      if (durNumEl) durNumEl.value = String(framesVal);
+      if (durSecLbl) durSecLbl.textContent = `${(framesVal / fps).toFixed(2)}s`;
+      body.querySelectorAll('[data-dur-sec]').forEach((chip) => {
+        const qf = Math.max(minTabDur, Math.min(maxTabDur, Math.round(Number(chip.dataset.durSec) * fps)));
+        const active = Math.abs(framesVal - qf) <= 1;
+        chip.className = `btn btn-xs ${active ? 'btn-info text-dark fw-semibold' : 'btn-outline-secondary'}`;
+      });
+      if (durFullBtn) {
+        const fullActive = Math.abs(framesVal - maxTabDur) <= 1;
+        durFullBtn.className = `btn btn-xs ${fullActive ? 'btn-info text-dark fw-semibold' : 'btn-outline-secondary'}`;
+      }
+    };
+
+    const applyTabDuration = (rawVal, { live = false } = {}) => {
+      const clamped = layer
+        ? KeyframeEngine.getClampedPresetDuration(layer, this.activeAnimTab, rawVal)
+        : Math.max(minTabDur, Math.min(maxTabDur, Math.round(Number(rawVal) || 24)));
+      if (!this.presetDurByTab) this.presetDurByTab = { in: 24, out: 24, combo: 24 };
+      this.presetDurByTab[this.activeAnimTab] = clamped;
+      syncDurationControlsUI(clamped);
+      const previewingTile = body.querySelector('[data-anim-preview].is-previewing');
+      if (previewingTile && !live) {
+        this.app.startTemplateLivePreview({
+          kind: 'animation',
+          presetId: previewingTile.dataset.animPreview,
+          durationFrames: clamped,
+          layerId: canApplyToLayer ? layer.id : null
+        });
+      }
+      if (canApplyToLayer && activeTabPresetId) {
+        if (live) {
+          KeyframeEngine.applyPreset(layer, activeTabPresetId, this.app.project.width, this.app.project.height, clamped);
+          this.app.renderPreview();
+          this.app.refreshTimelineOnly();
+        } else {
+          this.app.mutateProject(() => {
+            KeyframeEngine.applyPreset(layer, activeTabPresetId, this.app.project.width, this.app.project.height, clamped);
+          });
+        }
+      }
+      return clamped;
+    };
+
+    let sliderUndoPushed = false;
+    durRangeEl?.addEventListener('input', (e) => {
+      if (canApplyToLayer && activeTabPresetId && !sliderUndoPushed) {
+        this.app.pushUndo();
+        sliderUndoPushed = true;
+      }
+      applyTabDuration(Number(e.target.value), { live: true });
+    });
+    durRangeEl?.addEventListener('change', (e) => {
+      const clamped = applyTabDuration(Number(e.target.value), { live: sliderUndoPushed });
+      if (sliderUndoPushed) {
+        sliderUndoPushed = false;
+        this.app.scheduleAutosave();
+        this.renderKeyframesPanel();
+      } else if (canApplyToLayer && activeTabPresetId) {
+        this.app.showToast(`Durasi ${this.activeAnimTab.toUpperCase()}: ${(clamped / fps).toFixed(2)}s`);
+      }
+    });
+    durNumEl?.addEventListener('change', (e) => {
+      const clamped = applyTabDuration(Number(e.target.value), { live: false });
+      if (canApplyToLayer && activeTabPresetId) {
+        this.app.showToast(`Durasi ${this.activeAnimTab.toUpperCase()}: ${(clamped / fps).toFixed(2)}s`);
+      }
+    });
+    const stepFrames = Math.max(1, Math.round(fps * 0.1));
+    body.querySelector('#btnAnimDurMinus')?.addEventListener('click', () => {
+      const curF = Number(body.querySelector('#presetDurFrames')?.value) || effectiveDur;
+      const clamped = applyTabDuration(Math.max(minTabDur, curF - stepFrames), { live: false });
+      if (canApplyToLayer && activeTabPresetId) {
+        this.app.showToast(`Durasi ${this.activeAnimTab.toUpperCase()}: ${(clamped / fps).toFixed(2)}s`);
+      }
+    });
+    body.querySelector('#btnAnimDurPlus')?.addEventListener('click', () => {
+      const curF = Number(body.querySelector('#presetDurFrames')?.value) || effectiveDur;
+      const clamped = applyTabDuration(Math.min(maxTabDur, curF + stepFrames), { live: false });
+      if (canApplyToLayer && activeTabPresetId) {
+        this.app.showToast(`Durasi ${this.activeAnimTab.toUpperCase()}: ${(clamped / fps).toFixed(2)}s`);
+      }
+    });
+    durFullBtn?.addEventListener('click', () => {
+      const clamped = applyTabDuration(maxTabDur, { live: false });
+      if (canApplyToLayer && activeTabPresetId) {
+        this.app.showToast(`Durasi ${this.activeAnimTab.toUpperCase()}: ${(clamped / fps).toFixed(2)}s (Penuh)`);
+      }
+    });
+    body.querySelectorAll('[data-dur-sec]').forEach((chip) => {
+      chip.onclick = () => {
+        const targetFrames = Math.round(Number(chip.dataset.durSec) * fps);
+        const clamped = applyTabDuration(targetFrames, { live: false });
+        if (canApplyToLayer && activeTabPresetId) {
+          this.app.showToast(`Durasi ${this.activeAnimTab.toUpperCase()}: ${(clamped / fps).toFixed(2)}s`);
+        }
+      };
+    });
+
+    body.querySelector('#btnApplyAnimAll')?.addEventListener('click', () => {
+      if (!canApplyToLayer || !activeTabPresetId || matchingBatchLayers.length < 2) return;
+      this.app.stopTemplateLivePreview({ skipRender: true });
+      const durF = Number(body.querySelector('#presetDurFrames')?.value) || effectiveDur || 24;
+      const count = matchingBatchLayers.length;
+      this.app.mutateProject(() => {
+        KeyframeEngine.applyBatchPreset(
+          matchingBatchLayers,
+          activeTabPresetId,
+          this.app.project.width,
+          this.app.project.height,
+          durF,
+          this.activeAnimTab
+        );
+      });
+      this.app.showToast(`"${getPresetLabel(activeTabPresetId)}" diterapkan ke ${count} item`);
+    });
+
+    body.querySelectorAll('[data-clear-tile]').forEach((tile) => {
+      tile.onclick = () => {
+        if (!canApplyToLayer) return;
+        this.app.stopTemplateLivePreview({ skipRender: true });
+        const cat = tile.dataset.clearTile;
+        this.app.mutateProject(() => {
+          KeyframeEngine.clearPresetCategory(layer, cat);
+        });
+        this.app.showToast(`Animasi ${cat.toUpperCase()} dihapus`);
+      };
+    });
+
     if (layer) {
       const revealBtn = body.querySelector('#btnRevealKfLanes');
       if (revealBtn) {
@@ -964,7 +1196,8 @@ export class PanelsUI {
       });
 
       body.querySelectorAll('[data-clear-preset-cat]').forEach((btn) => {
-        btn.onclick = () => {
+        btn.onclick = (e) => {
+          e.stopPropagation();
           const cat = btn.dataset.clearPresetCat;
           this.app.mutateProject(() => {
             KeyframeEngine.clearPresetCategory(layer, cat);
@@ -1151,17 +1384,29 @@ export class PanelsUI {
           this.app.showToast('Pilih item video, gambar, teks, atau shape di timeline terlebih dahulu');
           return;
         }
-        const durF = Number(body.querySelector('#presetDurFrames')?.value) || 24;
+        const rawDur = Number(body.querySelector('#presetDurFrames')?.value) || effectiveDur || 24;
         const pid = btn.dataset.preset;
+        const pCat = KeyframeEngine.getPresetCategory(pid);
+        const durF = KeyframeEngine.getClampedPresetDuration(layer, pCat, rawDur);
+        if (!this.presetDurByTab) this.presetDurByTab = { in: 24, out: 24, combo: 24 };
+        if (pCat !== 'none') {
+          this.activeAnimTab = pCat;
+          this.presetDurByTab[pCat] = durF;
+        }
+        this._flashAnimDurCard = true;
         const tileLabel = btn.closest('.mf-preview-tile')?.querySelector('.mf-tile-label')?.textContent || pid;
         this.app.mutateProject(() => {
           layer.activePresetId = pid;
           layer.kfExpanded = true;
           KeyframeEngine.applyPreset(layer, pid, this.app.project.width, this.app.project.height, durF);
         });
-        this.app.showToast(`Preset "${tileLabel}" diterapkan sebagai keyframe`);
+        this.app.showToast(`Preset "${tileLabel}" (${(durF / fps).toFixed(2)}s) diterapkan — atur durasi di bawah`);
       };
     });
+
+    if (prevScrollTop > 0) {
+      body.scrollTop = prevScrollTop;
+    }
   }
 
   drawBezierGraph(svg, bez, kfAtCur, rootEl, layer, prop, frame, curVal, easingMode = 'cubicBezier') {
@@ -2213,7 +2458,9 @@ export class PanelsUI {
             layer.textTemplateId = tpl.id;
             Object.assign(layer.textProps, tpl.textProps, { text: layer.textProps.text || tpl.textProps.text });
             if (tpl.presetIn) {
-              KeyframeEngine.applyPreset(layer, tpl.presetIn, this.app.project.width, this.app.project.height, 18);
+              const inDur = this.presetDurByTab?.in || 18;
+              layer.activePresetId = tpl.presetIn;
+              KeyframeEngine.applyPreset(layer, tpl.presetIn, this.app.project.width, this.app.project.height, inDur);
             }
           });
           this.app.showToast(`Applied "${tpl.label}" template`);

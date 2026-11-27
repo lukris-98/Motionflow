@@ -141,33 +141,59 @@ export const CUBIC_BEZIER_PRESETS = [
 export const ANIMATION_PRESETS = [
   { id: 'textPopBounce', cat: 'in', target: 'text', label: 'Pop Teks', icon: 'bi-type' },
   { id: 'textSlideUpFade', cat: 'in', target: 'text', label: 'Muncul Bawah', icon: 'bi-arrow-up-short' },
+  { id: 'textSlideLeftIn', cat: 'in', target: 'text', label: 'Masuk Kiri', icon: 'bi-arrow-right-short' },
+  { id: 'textSlideRightIn', cat: 'in', target: 'text', label: 'Masuk Kanan', icon: 'bi-arrow-left-short' },
   { id: 'textZoomFocus', cat: 'in', target: 'text', label: 'Fokus Teks', icon: 'bi-zoom-in' },
   { id: 'textTypeReveal', cat: 'in', target: 'text', label: 'Kilap Masuk', icon: 'bi-stars' },
+  { id: 'textDropBounce', cat: 'in', target: 'text', label: 'Jatuh Mantul', icon: 'bi-arrow-down-short' },
+  { id: 'textFlipUp3D', cat: 'in', target: 'text', label: 'Lipat 3D', icon: 'bi-badge-3d' },
+  { id: 'textElasticPop', cat: 'in', target: 'text', label: 'Elastis Pop', icon: 'bi-lightning-charge' },
   { id: 'textFadeDown', cat: 'out', target: 'text', label: 'Turun Pudar', icon: 'bi-arrow-down-short' },
+  { id: 'textFadeUpOut', cat: 'out', target: 'text', label: 'Naik Pudar', icon: 'bi-arrow-up-short' },
+  { id: 'textSlideLeftOut', cat: 'out', target: 'text', label: 'Geser Kiri', icon: 'bi-box-arrow-left' },
+  { id: 'textSlideRightOut', cat: 'out', target: 'text', label: 'Geser Kanan', icon: 'bi-box-arrow-right' },
   { id: 'textZoomFadeOut', cat: 'out', target: 'text', label: 'Kecil Pudar', icon: 'bi-zoom-out' },
+  { id: 'textZoomBurstOut', cat: 'out', target: 'text', label: 'Ledak Zoom', icon: 'bi-arrows-fullscreen' },
+  { id: 'textFlipDown3D', cat: 'out', target: 'text', label: 'Lipat 3D Out', icon: 'bi-badge-3d' },
+  { id: 'textShrinkSpinOut', cat: 'out', target: 'text', label: 'Putar Kecil', icon: 'bi-arrow-counterclockwise' },
   { id: 'textPulseGlow', cat: 'combo', target: 'text', label: 'Denyut Teks', icon: 'bi-heart-pulse' },
   { id: 'textWaveFloat', cat: 'combo', target: 'text', label: 'Ayun Teks', icon: 'bi-stopwatch' },
   { id: 'textWiggle', cat: 'combo', target: 'text', label: 'Getar Teks', icon: 'bi-vibrate' },
+  { id: 'textFloatBob', cat: 'combo', target: 'text', label: 'Melayang', icon: 'bi-wind' },
+  { id: 'textFlipCard3D', cat: 'combo', target: 'text', label: 'Ayun 3D', icon: 'bi-badge-3d' },
   { id: 'fadeIn', cat: 'in', label: 'Fade In', icon: 'bi-brightness-high' },
   { id: 'fadeOut', cat: 'out', label: 'Fade Out', icon: 'bi-brightness-low' },
   { id: 'slideInLeft', cat: 'in', label: 'Slide In Left', icon: 'bi-box-arrow-in-right' },
   { id: 'slideInRight', cat: 'in', label: 'Slide In Right', icon: 'bi-box-arrow-in-left' },
   { id: 'slideInUp', cat: 'in', label: 'Slide Up', icon: 'bi-arrow-up-square' },
   { id: 'slideInDown', cat: 'in', label: 'Slide Down', icon: 'bi-arrow-down-square' },
+  { id: 'diagSlideIn', cat: 'in', label: 'Geser Serong', icon: 'bi-arrow-up-right-square' },
   { id: 'slideOutLeft', cat: 'out', label: 'Slide Out Left', icon: 'bi-box-arrow-left' },
   { id: 'slideOutRight', cat: 'out', label: 'Slide Out Right', icon: 'bi-box-arrow-right' },
+  { id: 'slideOutUp', cat: 'out', label: 'Slide Up Out', icon: 'bi-box-arrow-up' },
   { id: 'slideOutDown', cat: 'out', label: 'Drop Out', icon: 'bi-box-arrow-down' },
   { id: 'zoomIn', cat: 'in', label: 'Zoom In', icon: 'bi-zoom-in' },
+  { id: 'zoomCrashIn', cat: 'in', label: 'Zoom Hantam', icon: 'bi-fullscreen-exit' },
   { id: 'zoomOut', cat: 'out', label: 'Zoom Out', icon: 'bi-zoom-out' },
+  { id: 'zoomCrashOut', cat: 'out', label: 'Zoom Keluar', icon: 'bi-fullscreen' },
   { id: 'bounceIn', cat: 'in', label: 'Bounce In', icon: 'bi-activity' },
+  { id: 'rubberIn', cat: 'in', label: 'Karet Kenyal', icon: 'bi-aspect-ratio' },
+  { id: 'shrinkBounceOut', cat: 'out', label: 'Kecil Mantul', icon: 'bi-dash-circle' },
   { id: 'spinIn', cat: 'in', label: 'Spin In', icon: 'bi-arrow-clockwise' },
   { id: 'spinOut', cat: 'out', label: 'Spin Out', icon: 'bi-arrow-counterclockwise' },
+  { id: 'tilt3DIn', cat: 'in', label: 'Flip 3D In', icon: 'bi-badge-3d' },
+  { id: 'tilt3DOut', cat: 'out', label: 'Flip 3D Out', icon: 'bi-badge-3d' },
+  { id: 'swingIn', cat: 'in', label: 'Ayun Masuk', icon: 'bi-stopwatch' },
+  { id: 'swingOut', cat: 'out', label: 'Ayun Keluar', icon: 'bi-stopwatch' },
   { id: 'popUp', cat: 'in', label: 'Pop Up', icon: 'bi-stars' },
   { id: 'rotate360', cat: 'combo', label: 'Rotate 360°', icon: 'bi-arrow-repeat' },
   { id: 'bounce', cat: 'combo', label: 'Bounce Pop', icon: 'bi-activity' },
   { id: 'shake', cat: 'combo', label: 'Shake', icon: 'bi-vibrate' },
   { id: 'pulseLoop', cat: 'combo', label: 'Heartbeat', icon: 'bi-heart-pulse' },
   { id: 'swing', cat: 'combo', label: 'Pendulum', icon: 'bi-stopwatch' },
+  { id: 'kenBurnsZoom', cat: 'combo', label: 'Ken Burns', icon: 'bi-arrows-angle-expand' },
+  { id: 'swayFloat', cat: 'combo', label: 'Goyang Halus', icon: 'bi-wind' },
+  { id: 'bounceFallLoop', cat: 'combo', label: 'Lompat Beat', icon: 'bi-music-note-beamed' },
   { id: 'float3D', cat: 'combo', label: '3D Float', icon: 'bi-badge-3d' }
 ];
 
@@ -676,8 +702,53 @@ export const KeyframeEngine = {
   },
 
   getPresetCategory(presetId) {
+    if (!presetId || presetId === 'none') return 'none';
     const spec = ANIMATION_PRESETS.find((p) => p.id === presetId);
     return spec?.cat || 'combo';
+  },
+
+  getClampedPresetDuration(layer, category, requestedFrames = 24) {
+    if (!layer) return Math.max(3, Math.round(Number(requestedFrames) || 24));
+    const clipLen = Math.max(2, Math.round((layer.endFrame ?? 0) - (layer.startFrame ?? 0)));
+    const raw = Math.max(Math.min(clipLen, 3), Math.round(Number(requestedFrames) || 24));
+    if (category === 'combo') {
+      return Math.min(clipLen, raw);
+    }
+    const otherPresetId = category === 'in' ? layer.presetOutId : layer.presetInId;
+    if (!otherPresetId) {
+      return Math.min(clipLen, raw);
+    }
+    let otherDur = category === 'in' ? Number(layer.presetOutDurFrames) : Number(layer.presetInDurFrames);
+    if (!Number.isFinite(otherDur) || otherDur <= 0) {
+      otherDur = 0;
+      if (layer.keyframes) {
+        if (category === 'in') {
+          let minOut = layer.endFrame;
+          for (const arr of Object.values(layer.keyframes)) {
+            if (!Array.isArray(arr)) continue;
+            for (const k of arr) {
+              if (k.presetTag === 'out' && k.frame < minOut) minOut = k.frame;
+            }
+          }
+          otherDur = Math.max(0, layer.endFrame - minOut);
+        } else {
+          let maxIn = layer.startFrame;
+          for (const arr of Object.values(layer.keyframes)) {
+            if (!Array.isArray(arr)) continue;
+            for (const k of arr) {
+              if (k.presetTag === 'in' && k.frame > maxIn) maxIn = k.frame;
+            }
+          }
+          otherDur = Math.max(0, maxIn - layer.startFrame);
+        }
+      }
+    }
+    if (otherDur > 0 && raw + otherDur > clipLen) {
+      const remaining = clipLen - otherDur;
+      if (remaining >= 3) return Math.min(raw, remaining);
+      return Math.max(2, Math.floor(clipLen / 2));
+    }
+    return Math.min(clipLen, raw);
   },
 
   clearPresetCategory(layer, category) {
@@ -692,133 +763,294 @@ export const KeyframeEngine = {
         layer.keyframes[prop] = next;
       }
     }
-    if (category === 'in') layer.presetInId = null;
-    else if (category === 'out') layer.presetOutId = null;
-    else if (category === 'combo') layer.presetComboId = null;
+    if (category === 'in') {
+      if (layer.activePresetId === layer.presetInId) layer.activePresetId = null;
+      layer.presetInId = null;
+      delete layer.presetInDurFrames;
+    } else if (category === 'out') {
+      if (layer.activePresetId === layer.presetOutId) layer.activePresetId = null;
+      layer.presetOutId = null;
+      delete layer.presetOutDurFrames;
+    } else if (category === 'combo') {
+      if (layer.activePresetId === layer.presetComboId) layer.activePresetId = null;
+      layer.presetComboId = null;
+      delete layer.presetComboDurFrames;
+    }
+    if (!layer.activePresetId) {
+      layer.activePresetId = layer.presetInId || layer.presetOutId || layer.presetComboId || null;
+    }
     return removed;
+  },
+
+  applyBatchPreset(layers, presetId, projectWidth, projectHeight, durationFrames = 24, category = null) {
+    if (!Array.isArray(layers)) return 0;
+    let count = 0;
+    for (const l of layers) {
+      if (!l || l.locked || l.type === 'audio' || l.type === 'group' || l.type === 'adjustment' || l.type === 'camera') continue;
+      if (presetId === 'none' || !presetId) {
+        if (category && category !== 'none') {
+          this.clearPresetCategory(l, category);
+          count++;
+        }
+      } else {
+        l.activePresetId = presetId;
+        l.kfExpanded = true;
+        this.applyPreset(l, presetId, projectWidth, projectHeight, durationFrames);
+        count++;
+      }
+    }
+    return count;
   },
 
   applyPreset(layer, presetId, projectWidth, projectHeight, durationFrames = 24) {
     const cat = this.getPresetCategory(presetId);
+    if (cat === 'none') return;
     this.clearPresetCategory(layer, cat);
 
-    if (cat === 'in') layer.presetInId = presetId;
-    else if (cat === 'out') layer.presetOutId = presetId;
-    else layer.presetComboId = presetId;
+    const dur = this.getClampedPresetDuration(layer, cat, durationFrames);
+    if (cat === 'in') {
+      layer.presetInId = presetId;
+      layer.presetInDurFrames = dur;
+    } else if (cat === 'out') {
+      layer.presetOutId = presetId;
+      layer.presetOutDurFrames = dur;
+    } else {
+      layer.presetComboId = presetId;
+      layer.presetComboDurFrames = dur;
+    }
 
     const start = layer.startFrame;
-    const dur = Math.max(6, Math.round(durationFrames));
     const end = Math.min(layer.endFrame, start + dur);
     const outStart = Math.max(layer.startFrame, layer.endFrame - dur);
     const outEnd = layer.endFrame;
-    const base = layer.transform;
+    const base = layer.transform || {};
+    const baseOp = base.opacity ?? 1;
+    const baseScaleX = base.scaleX ?? 1;
+    const baseScaleY = base.scaleY ?? 1;
+    const baseX = base.x ?? 0;
+    const baseY = base.y ?? 0;
+    const baseRot = base.rotation ?? 0;
+    const baseRotX = base.rotX ?? 0;
+    const baseRotY = base.rotY ?? 0;
     const fullEnd = layer.endFrame;
     const tagOpts = { presetTag: cat };
     const sk = (prop, f, val, easing = 'easeInOut') =>
       this.setKeyframe(layer, prop, f, val, easing, [0.42, 0, 0.58, 1], tagOpts);
+    const inFadeEnd = Math.min(end, start + Math.max(3, Math.round((end - start) * 0.55)));
+    const outFadeStart = Math.max(outStart, outEnd - Math.max(3, Math.round((outEnd - outStart) * 0.55)));
 
     switch (presetId) {
       case 'fadeIn':
         sk('opacity', start, 0, 'easeOut');
-        sk('opacity', end, base.opacity ?? 1, 'linear');
+        sk('opacity', end, baseOp, 'linear');
         break;
       case 'fadeOut':
-        sk('opacity', outStart, base.opacity ?? 1, 'easeIn');
+        sk('opacity', outStart, baseOp, 'easeIn');
         sk('opacity', outEnd, 0, 'linear');
         break;
       case 'slideInLeft':
-        sk('x', start, -projectWidth * 0.65, 'easeOut');
-        sk('x', end, base.x, 'linear');
+        sk('x', start, baseX - projectWidth * 0.65, 'easeOut');
+        sk('x', end, baseX, 'linear');
         sk('opacity', start, 0, 'easeOut');
-        sk('opacity', Math.min(end, start + 8), base.opacity ?? 1, 'linear');
+        sk('opacity', Math.min(end, start + 8), baseOp, 'linear');
         break;
       case 'slideInRight':
-        sk('x', start, projectWidth * 0.65, 'easeOut');
-        sk('x', end, base.x, 'linear');
+        sk('x', start, baseX + projectWidth * 0.65, 'easeOut');
+        sk('x', end, baseX, 'linear');
+        sk('opacity', start, 0, 'easeOut');
+        sk('opacity', Math.min(end, start + 8), baseOp, 'linear');
         break;
       case 'slideInUp':
-        sk('y', start, projectHeight * 0.55, 'easeOut');
-        sk('y', end, base.y, 'linear');
+        sk('y', start, baseY + projectHeight * 0.55, 'easeOut');
+        sk('y', end, baseY, 'linear');
         sk('opacity', start, 0, 'easeOut');
-        sk('opacity', Math.min(end, start + 8), base.opacity ?? 1, 'linear');
+        sk('opacity', Math.min(end, start + 8), baseOp, 'linear');
         break;
       case 'slideInDown':
-        sk('y', start, -projectHeight * 0.55, 'easeOut');
-        sk('y', end, base.y, 'linear');
+        sk('y', start, baseY - projectHeight * 0.55, 'easeOut');
+        sk('y', end, baseY, 'linear');
         sk('opacity', start, 0, 'easeOut');
-        sk('opacity', Math.min(end, start + 8), base.opacity ?? 1, 'linear');
+        sk('opacity', Math.min(end, start + 8), baseOp, 'linear');
+        break;
+      case 'diagSlideIn':
+        sk('x', start, baseX - projectWidth * 0.45, 'easeOut');
+        sk('x', end, baseX, 'linear');
+        sk('y', start, baseY + projectHeight * 0.28, 'easeOut');
+        sk('y', end, baseY, 'linear');
+        sk('rotation', start, baseRot - 8, 'easeOut');
+        sk('rotation', end, baseRot, 'linear');
+        sk('opacity', start, 0, 'easeOut');
+        sk('opacity', inFadeEnd, baseOp, 'linear');
         break;
       case 'slideOutLeft':
-        sk('x', outStart, base.x, 'easeIn');
-        sk('x', outEnd, -projectWidth * 0.65, 'linear');
+        sk('x', outStart, baseX, 'easeIn');
+        sk('x', outEnd, baseX - projectWidth * 0.65, 'linear');
         break;
       case 'slideOutRight':
-        sk('x', outStart, base.x, 'easeIn');
-        sk('x', outEnd, projectWidth * 0.65, 'linear');
+        sk('x', outStart, baseX, 'easeIn');
+        sk('x', outEnd, baseX + projectWidth * 0.65, 'linear');
+        break;
+      case 'slideOutUp':
+        sk('y', outStart, baseY, 'easeIn');
+        sk('y', outEnd, baseY - projectHeight * 0.55, 'linear');
+        sk('opacity', outFadeStart, baseOp, 'easeIn');
+        sk('opacity', outEnd, 0, 'linear');
         break;
       case 'slideOutDown':
-        sk('y', outStart, base.y, 'easeIn');
-        sk('y', outEnd, projectHeight * 0.6, 'linear');
-        sk('opacity', outStart, base.opacity ?? 1, 'easeIn');
+        sk('y', outStart, baseY, 'easeIn');
+        sk('y', outEnd, baseY + projectHeight * 0.6, 'linear');
+        sk('opacity', outStart, baseOp, 'easeIn');
         sk('opacity', outEnd, 0, 'linear');
         break;
       case 'zoomIn':
         sk('scaleX', start, 0.1, 'easeOut');
         sk('scaleY', start, 0.1, 'easeOut');
-        sk('scaleX', end, base.scaleX, 'linear');
-        sk('scaleY', end, base.scaleY, 'linear');
+        sk('scaleX', end, baseScaleX, 'linear');
+        sk('scaleY', end, baseScaleY, 'linear');
+        sk('opacity', start, 0, 'easeOut');
+        sk('opacity', inFadeEnd, baseOp, 'linear');
+        break;
+      case 'zoomCrashIn':
+        sk('scaleX', start, baseScaleX * 1.85, 'easeOut');
+        sk('scaleY', start, baseScaleY * 1.85, 'easeOut');
+        sk('scaleX', end, baseScaleX, 'linear');
+        sk('scaleY', end, baseScaleY, 'linear');
+        sk('opacity', start, 0, 'easeOut');
+        sk('opacity', inFadeEnd, baseOp, 'linear');
         break;
       case 'zoomOut':
-        sk('scaleX', outStart, base.scaleX, 'easeIn');
-        sk('scaleY', outStart, base.scaleY, 'easeIn');
+        sk('scaleX', outStart, baseScaleX, 'easeIn');
+        sk('scaleY', outStart, baseScaleY, 'easeIn');
         sk('scaleX', outEnd, 0.05, 'linear');
         sk('scaleY', outEnd, 0.05, 'linear');
+        sk('opacity', outFadeStart, baseOp, 'easeIn');
+        sk('opacity', outEnd, 0, 'linear');
+        break;
+      case 'zoomCrashOut':
+        sk('scaleX', outStart, baseScaleX, 'easeIn');
+        sk('scaleY', outStart, baseScaleY, 'easeIn');
+        sk('scaleX', outEnd, baseScaleX * 1.68, 'linear');
+        sk('scaleY', outEnd, baseScaleY * 1.68, 'linear');
+        sk('opacity', outStart, baseOp, 'easeIn');
+        sk('opacity', outEnd, 0, 'linear');
         break;
       case 'spinIn':
-        sk('rotation', start, base.rotation - 180, 'easeOut');
-        sk('rotation', end, base.rotation, 'linear');
+        sk('rotation', start, baseRot - 180, 'easeOut');
+        sk('rotation', end, baseRot, 'linear');
         sk('scaleX', start, 0.2, 'easeOut');
         sk('scaleY', start, 0.2, 'easeOut');
-        sk('scaleX', end, base.scaleX, 'linear');
-        sk('scaleY', end, base.scaleY, 'linear');
+        sk('scaleX', end, baseScaleX, 'linear');
+        sk('scaleY', end, baseScaleY, 'linear');
+        sk('opacity', start, 0, 'easeOut');
+        sk('opacity', inFadeEnd, baseOp, 'linear');
         break;
       case 'spinOut':
-        sk('rotation', outStart, base.rotation, 'easeIn');
-        sk('rotation', outEnd, base.rotation + 180, 'linear');
-        sk('scaleX', outStart, base.scaleX, 'easeIn');
-        sk('scaleY', outStart, base.scaleY, 'easeIn');
+        sk('rotation', outStart, baseRot, 'easeIn');
+        sk('rotation', outEnd, baseRot + 180, 'linear');
+        sk('scaleX', outStart, baseScaleX, 'easeIn');
+        sk('scaleY', outStart, baseScaleY, 'easeIn');
         sk('scaleX', outEnd, 0.05, 'linear');
         sk('scaleY', outEnd, 0.05, 'linear');
+        sk('opacity', outFadeStart, baseOp, 'easeIn');
+        sk('opacity', outEnd, 0, 'linear');
         break;
+      case 'tilt3DIn':
+        sk('rotY', start, baseRotY - 72, 'easeOutBack');
+        sk('rotY', end, baseRotY, 'linear');
+        sk('scaleX', start, baseScaleX * 0.78, 'easeOut');
+        sk('scaleY', start, baseScaleY * 0.78, 'easeOut');
+        sk('scaleX', end, baseScaleX, 'linear');
+        sk('scaleY', end, baseScaleY, 'linear');
+        sk('opacity', start, 0, 'easeOut');
+        sk('opacity', inFadeEnd, baseOp, 'linear');
+        break;
+      case 'tilt3DOut':
+        sk('rotY', outStart, baseRotY, 'easeIn');
+        sk('rotY', outEnd, baseRotY + 75, 'linear');
+        sk('scaleX', outStart, baseScaleX, 'easeIn');
+        sk('scaleY', outStart, baseScaleY, 'easeIn');
+        sk('scaleX', outEnd, baseScaleX * 0.75, 'linear');
+        sk('scaleY', outEnd, baseScaleY * 0.75, 'linear');
+        sk('opacity', outStart, baseOp, 'easeIn');
+        sk('opacity', outEnd, 0, 'linear');
+        break;
+      case 'swingIn': {
+        const mid = start + Math.max(2, Math.round((end - start) * 0.62));
+        sk('rotation', start, baseRot - 18, 'easeOut');
+        sk('rotation', mid, baseRot + 5, 'easeInOut');
+        sk('rotation', end, baseRot, 'linear');
+        sk('scaleX', start, baseScaleX * 0.74, 'easeOut');
+        sk('scaleY', start, baseScaleY * 0.74, 'easeOut');
+        sk('scaleX', end, baseScaleX, 'linear');
+        sk('scaleY', end, baseScaleY, 'linear');
+        sk('opacity', start, 0, 'easeOut');
+        sk('opacity', inFadeEnd, baseOp, 'linear');
+        break;
+      }
+      case 'swingOut':
+        sk('rotation', outStart, baseRot, 'easeIn');
+        sk('rotation', outEnd, baseRot + 18, 'linear');
+        sk('y', outStart, baseY, 'easeIn');
+        sk('y', outEnd, baseY + Math.round(projectHeight * 0.16), 'linear');
+        sk('opacity', outStart, baseOp, 'easeIn');
+        sk('opacity', outEnd, 0, 'linear');
+        break;
+      case 'rubberIn': {
+        const m1 = start + Math.max(1, Math.round((end - start) * 0.45));
+        const m2 = start + Math.max(2, Math.round((end - start) * 0.75));
+        sk('scaleX', start, baseScaleX * 0.45, 'easeOut');
+        sk('scaleY', start, baseScaleY * 1.42, 'easeOut');
+        sk('scaleX', m1, baseScaleX * 1.24, 'easeInOut');
+        sk('scaleY', m1, baseScaleY * 0.82, 'easeInOut');
+        sk('scaleX', m2, baseScaleX * 0.92, 'easeInOut');
+        sk('scaleY', m2, baseScaleY * 1.07, 'easeInOut');
+        sk('scaleX', end, baseScaleX, 'linear');
+        sk('scaleY', end, baseScaleY, 'linear');
+        sk('opacity', start, 0, 'easeOut');
+        sk('opacity', Math.min(end, start + Math.max(3, Math.round((end - start) * 0.35))), baseOp, 'linear');
+        break;
+      }
+      case 'shrinkBounceOut': {
+        const m1 = outStart + Math.max(1, Math.round((outEnd - outStart) * 0.32));
+        sk('scaleX', outStart, baseScaleX, 'easeOut');
+        sk('scaleY', outStart, baseScaleY, 'easeOut');
+        sk('scaleX', m1, baseScaleX * 1.12, 'easeIn');
+        sk('scaleY', m1, baseScaleY * 1.12, 'easeIn');
+        sk('scaleX', outEnd, 0.08, 'linear');
+        sk('scaleY', outEnd, 0.08, 'linear');
+        sk('opacity', m1, baseOp, 'easeIn');
+        sk('opacity', outEnd, 0, 'linear');
+        break;
+      }
       case 'popUp':
       case 'bounceIn': {
         const mid1 = start + Math.round((end - start) * 0.55);
         const mid2 = start + Math.round((end - start) * 0.8);
         sk('scaleX', start, 0.15, 'easeOut');
         sk('scaleY', start, 0.15, 'easeOut');
-        sk('scaleX', mid1, base.scaleX * 1.18, 'easeInOut');
-        sk('scaleY', mid1, base.scaleY * 1.18, 'easeInOut');
-        sk('scaleX', mid2, base.scaleX * 0.94, 'easeInOut');
-        sk('scaleY', mid2, base.scaleY * 0.94, 'easeInOut');
-        sk('scaleX', end, base.scaleX, 'linear');
-        sk('scaleY', end, base.scaleY, 'linear');
+        sk('scaleX', mid1, baseScaleX * 1.18, 'easeInOut');
+        sk('scaleY', mid1, baseScaleY * 1.18, 'easeInOut');
+        sk('scaleX', mid2, baseScaleX * 0.94, 'easeInOut');
+        sk('scaleY', mid2, baseScaleY * 0.94, 'easeInOut');
+        sk('scaleX', end, baseScaleX, 'linear');
+        sk('scaleY', end, baseScaleY, 'linear');
         break;
       }
       case 'rotate360':
-        sk('rotation', start, base.rotation, 'easeInOut');
-        sk('rotation', end, base.rotation + 360, 'linear');
+        sk('rotation', start, baseRot, 'easeInOut');
+        sk('rotation', end, baseRot + 360, 'linear');
         break;
       case 'bounce': {
         const mid1 = start + Math.round((end - start) * 0.45);
         const mid2 = start + Math.round((end - start) * 0.72);
         sk('scaleX', start, 0.2, 'easeOut');
         sk('scaleY', start, 0.2, 'easeOut');
-        sk('scaleX', mid1, base.scaleX * 1.18, 'easeInOut');
-        sk('scaleY', mid1, base.scaleY * 1.18, 'easeInOut');
-        sk('scaleX', mid2, base.scaleX * 0.94, 'easeInOut');
-        sk('scaleY', mid2, base.scaleY * 0.94, 'easeInOut');
-        sk('scaleX', end, base.scaleX, 'linear');
-        sk('scaleY', end, base.scaleY, 'linear');
+        sk('scaleX', mid1, baseScaleX * 1.18, 'easeInOut');
+        sk('scaleY', mid1, baseScaleY * 1.18, 'easeInOut');
+        sk('scaleX', mid2, baseScaleX * 0.94, 'easeInOut');
+        sk('scaleY', mid2, baseScaleY * 0.94, 'easeInOut');
+        sk('scaleX', end, baseScaleX, 'linear');
+        sk('scaleY', end, baseScaleY, 'linear');
         break;
       }
       case 'shake': {
@@ -829,117 +1061,253 @@ export const KeyframeEngine = {
           let f = Math.min(layer.endFrame, start + Math.round((i / (offsets.length - 1)) * span));
           if (f <= prevF) f = Math.min(layer.endFrame, prevF + 1);
           if (f > prevF) {
-            sk('x', f, base.x + dx, 'linear');
+            sk('x', f, baseX + dx, 'linear');
             prevF = f;
           }
         });
         break;
       }
       case 'pulseLoop': {
-        const half = Math.max(4, Math.round((fullEnd - start) / 2));
-        const q1 = start + Math.round(half / 2);
-        sk('scaleX', start, base.scaleX, 'easeInOut');
-        sk('scaleY', start, base.scaleY, 'easeInOut');
-        sk('scaleX', q1, base.scaleX * 1.12, 'easeInOut');
-        sk('scaleY', q1, base.scaleY * 1.12, 'easeInOut');
-        sk('scaleX', start + half, base.scaleX, 'easeInOut');
-        sk('scaleY', start + half, base.scaleY, 'easeInOut');
-        sk('scaleX', fullEnd, base.scaleX, 'linear');
-        sk('scaleY', fullEnd, base.scaleY, 'linear');
+        const span = Math.max(3, end - start);
+        const half = Math.max(2, Math.round(span / 2));
+        const q1 = start + Math.max(1, Math.round(half / 2));
+        sk('scaleX', start, baseScaleX, 'easeInOut');
+        sk('scaleY', start, baseScaleY, 'easeInOut');
+        sk('scaleX', q1, baseScaleX * 1.12, 'easeInOut');
+        sk('scaleY', q1, baseScaleY * 1.12, 'easeInOut');
+        sk('scaleX', Math.min(end, start + half), baseScaleX, 'easeInOut');
+        sk('scaleY', Math.min(end, start + half), baseScaleY, 'easeInOut');
+        sk('scaleX', end, baseScaleX, 'linear');
+        sk('scaleY', end, baseScaleY, 'linear');
         break;
       }
       case 'swing': {
-        const t1 = start + Math.round((fullEnd - start) * 0.25);
-        const t2 = start + Math.round((fullEnd - start) * 0.5);
-        const t3 = start + Math.round((fullEnd - start) * 0.75);
-        sk('rotation', start, base.rotation - 10, 'easeInOut');
-        sk('rotation', t1, base.rotation + 10, 'easeInOut');
-        sk('rotation', t2, base.rotation - 8, 'easeInOut');
-        sk('rotation', t3, base.rotation + 8, 'easeInOut');
-        sk('rotation', fullEnd, base.rotation, 'linear');
+        const span = Math.max(4, end - start);
+        const t1 = start + Math.round(span * 0.25);
+        const t2 = start + Math.round(span * 0.5);
+        const t3 = start + Math.round(span * 0.75);
+        sk('rotation', start, baseRot - 10, 'easeInOut');
+        sk('rotation', t1, baseRot + 10, 'easeInOut');
+        sk('rotation', t2, baseRot - 8, 'easeInOut');
+        sk('rotation', t3, baseRot + 8, 'easeInOut');
+        sk('rotation', end, baseRot, 'linear');
+        break;
+      }
+      case 'kenBurnsZoom':
+        sk('scaleX', start, baseScaleX, 'easeInOut');
+        sk('scaleY', start, baseScaleY, 'easeInOut');
+        sk('scaleX', end, baseScaleX * 1.18, 'linear');
+        sk('scaleY', end, baseScaleY * 1.18, 'linear');
+        sk('x', start, baseX - 16, 'easeInOut');
+        sk('x', end, baseX + 16, 'linear');
+        break;
+      case 'swayFloat': {
+        const mid = start + Math.max(1, Math.round((end - start) * 0.5));
+        sk('x', start, baseX - 16, 'easeInOut');
+        sk('x', mid, baseX + 16, 'easeInOut');
+        sk('x', end, baseX - 16, 'linear');
+        sk('rotation', start, baseRot - 2.5, 'easeInOut');
+        sk('rotation', mid, baseRot + 2.5, 'easeInOut');
+        sk('rotation', end, baseRot - 2.5, 'linear');
+        break;
+      }
+      case 'bounceFallLoop': {
+        const span = Math.max(4, end - start);
+        const t1 = start + Math.round(span * 0.25);
+        const t2 = start + Math.round(span * 0.5);
+        const t3 = start + Math.round(span * 0.75);
+        sk('y', start, baseY, 'easeOut');
+        sk('y', t1, baseY - 24, 'easeIn');
+        sk('y', t2, baseY, 'easeOut');
+        sk('y', t3, baseY - 16, 'easeIn');
+        sk('y', end, baseY, 'linear');
         break;
       }
       case 'float3D': {
-        const mid = start + Math.round((fullEnd - start) * 0.5);
+        const mid = start + Math.max(1, Math.round((end - start) * 0.5));
         sk('rotY', start, -12, 'easeInOut');
         sk('rotY', mid, 12, 'easeInOut');
-        sk('rotY', fullEnd, -12, 'linear');
-        sk('y', start, base.y - 12, 'easeInOut');
-        sk('y', mid, base.y + 12, 'easeInOut');
-        sk('y', fullEnd, base.y - 12, 'linear');
+        sk('rotY', end, -12, 'linear');
+        sk('y', start, baseY - 12, 'easeInOut');
+        sk('y', mid, baseY + 12, 'easeInOut');
+        sk('y', end, baseY - 12, 'linear');
         break;
       }
       case 'textPopBounce': {
         const mid1 = start + Math.round((end - start) * 0.55);
         const mid2 = start + Math.round((end - start) * 0.8);
         sk('opacity', start, 0, 'easeOut');
-        sk('opacity', Math.min(end, start + Math.max(4, Math.round((end - start) * 0.35))), base.opacity ?? 1, 'linear');
+        sk('opacity', Math.min(end, start + Math.max(4, Math.round((end - start) * 0.35))), baseOp, 'linear');
         sk('scaleX', start, 0.25, 'easeOut');
         sk('scaleY', start, 0.25, 'easeOut');
-        sk('scaleX', mid1, base.scaleX * 1.18, 'easeInOut');
-        sk('scaleY', mid1, base.scaleY * 1.18, 'easeInOut');
-        sk('scaleX', mid2, base.scaleX * 0.95, 'easeInOut');
-        sk('scaleY', mid2, base.scaleY * 0.95, 'easeInOut');
-        sk('scaleX', end, base.scaleX, 'linear');
-        sk('scaleY', end, base.scaleY, 'linear');
+        sk('scaleX', mid1, baseScaleX * 1.18, 'easeInOut');
+        sk('scaleY', mid1, baseScaleY * 1.18, 'easeInOut');
+        sk('scaleX', mid2, baseScaleX * 0.95, 'easeInOut');
+        sk('scaleY', mid2, baseScaleY * 0.95, 'easeInOut');
+        sk('scaleX', end, baseScaleX, 'linear');
+        sk('scaleY', end, baseScaleY, 'linear');
         break;
       }
       case 'textSlideUpFade':
-        sk('y', start, base.y + Math.round(projectHeight * 0.14), 'easeOut');
-        sk('y', end, base.y, 'linear');
+        sk('y', start, baseY + Math.round(projectHeight * 0.14), 'easeOut');
+        sk('y', end, baseY, 'linear');
         sk('opacity', start, 0, 'easeOut');
-        sk('opacity', Math.min(end, start + Math.max(6, Math.round((end - start) * 0.65))), base.opacity ?? 1, 'linear');
+        sk('opacity', Math.min(end, start + Math.max(6, Math.round((end - start) * 0.65))), baseOp, 'linear');
         break;
-      case 'textZoomFocus':
-        sk('scaleX', start, base.scaleX * 1.45, 'easeOut');
-        sk('scaleY', start, base.scaleY * 1.45, 'easeOut');
-        sk('scaleX', end, base.scaleX, 'linear');
-        sk('scaleY', end, base.scaleY, 'linear');
+      case 'textSlideLeftIn':
+        sk('x', start, baseX - Math.round(projectWidth * 0.42), 'easeOut');
+        sk('x', end, baseX, 'linear');
         sk('opacity', start, 0, 'easeOut');
-        sk('opacity', Math.min(end, start + Math.max(6, Math.round((end - start) * 0.6))), base.opacity ?? 1, 'linear');
+        sk('opacity', inFadeEnd, baseOp, 'linear');
+        break;
+      case 'textSlideRightIn':
+        sk('x', start, baseX + Math.round(projectWidth * 0.42), 'easeOut');
+        sk('x', end, baseX, 'linear');
+        sk('opacity', start, 0, 'easeOut');
+        sk('opacity', inFadeEnd, baseOp, 'linear');
+        break;
+      case 'textDropBounce':
+        sk('y', start, baseY - Math.round(projectHeight * 0.18), 'easeOutBack');
+        sk('y', end, baseY, 'linear');
+        sk('opacity', start, 0, 'easeOut');
+        sk('opacity', inFadeEnd, baseOp, 'linear');
+        break;
+      case 'textFlipUp3D':
+        sk('rotX', start, baseRotX - 75, 'easeOutBack');
+        sk('rotX', end, baseRotX, 'linear');
+        sk('scaleY', start, baseScaleY * 0.65, 'easeOut');
+        sk('scaleY', end, baseScaleY, 'linear');
+        sk('opacity', start, 0, 'easeOut');
+        sk('opacity', inFadeEnd, baseOp, 'linear');
+        break;
+      case 'textElasticPop': {
+        const m1 = start + Math.max(1, Math.round((end - start) * 0.5));
+        const m2 = start + Math.max(2, Math.round((end - start) * 0.78));
+        sk('scaleX', start, baseScaleX * 0.28, 'easeOut');
+        sk('scaleY', start, baseScaleY * 0.28, 'easeOut');
+        sk('scaleX', m1, baseScaleX * 1.24, 'easeInOut');
+        sk('scaleY', m1, baseScaleY * 1.24, 'easeInOut');
+        sk('scaleX', m2, baseScaleX * 0.92, 'easeInOut');
+        sk('scaleY', m2, baseScaleY * 0.92, 'easeInOut');
+        sk('scaleX', end, baseScaleX, 'linear');
+        sk('scaleY', end, baseScaleY, 'linear');
+        sk('opacity', start, 0, 'easeOut');
+        sk('opacity', Math.min(end, start + Math.max(3, Math.round((end - start) * 0.35))), baseOp, 'linear');
+        break;
+      }
+      case 'textZoomFocus':
+        sk('scaleX', start, baseScaleX * 1.45, 'easeOut');
+        sk('scaleY', start, baseScaleY * 1.45, 'easeOut');
+        sk('scaleX', end, baseScaleX, 'linear');
+        sk('scaleY', end, baseScaleY, 'linear');
+        sk('opacity', start, 0, 'easeOut');
+        sk('opacity', Math.min(end, start + Math.max(6, Math.round((end - start) * 0.6))), baseOp, 'linear');
         break;
       case 'textTypeReveal':
         sk('opacity', start, 0, 'easeOut');
-        sk('opacity', end, base.opacity ?? 1, 'linear');
-        sk('x', start, base.x - Math.round(projectWidth * 0.06), 'easeOut');
-        sk('x', end, base.x, 'linear');
+        sk('opacity', end, baseOp, 'linear');
+        sk('x', start, baseX - Math.round(projectWidth * 0.06), 'easeOut');
+        sk('x', end, baseX, 'linear');
         break;
       case 'textFadeDown':
-        sk('y', outStart, base.y, 'easeIn');
-        sk('y', outEnd, base.y + Math.round(projectHeight * 0.14), 'linear');
-        sk('opacity', outStart, base.opacity ?? 1, 'easeIn');
+        sk('y', outStart, baseY, 'easeIn');
+        sk('y', outEnd, baseY + Math.round(projectHeight * 0.14), 'linear');
+        sk('opacity', outStart, baseOp, 'easeIn');
+        sk('opacity', outEnd, 0, 'linear');
+        break;
+      case 'textFadeUpOut':
+        sk('y', outStart, baseY, 'easeIn');
+        sk('y', outEnd, baseY - Math.round(projectHeight * 0.14), 'linear');
+        sk('opacity', outStart, baseOp, 'easeIn');
+        sk('opacity', outEnd, 0, 'linear');
+        break;
+      case 'textSlideLeftOut':
+        sk('x', outStart, baseX, 'easeIn');
+        sk('x', outEnd, baseX - Math.round(projectWidth * 0.48), 'linear');
+        sk('opacity', outStart, baseOp, 'easeIn');
+        sk('opacity', outEnd, 0, 'linear');
+        break;
+      case 'textSlideRightOut':
+        sk('x', outStart, baseX, 'easeIn');
+        sk('x', outEnd, baseX + Math.round(projectWidth * 0.48), 'linear');
+        sk('opacity', outStart, baseOp, 'easeIn');
         sk('opacity', outEnd, 0, 'linear');
         break;
       case 'textZoomFadeOut':
-        sk('scaleX', outStart, base.scaleX, 'easeIn');
-        sk('scaleY', outStart, base.scaleY, 'easeIn');
-        sk('scaleX', outEnd, Math.max(0.1, base.scaleX * 0.55), 'linear');
-        sk('scaleY', outEnd, Math.max(0.1, base.scaleY * 0.55), 'linear');
-        sk('opacity', outStart, base.opacity ?? 1, 'easeIn');
+        sk('scaleX', outStart, baseScaleX, 'easeIn');
+        sk('scaleY', outStart, baseScaleY, 'easeIn');
+        sk('scaleX', outEnd, Math.max(0.1, baseScaleX * 0.55), 'linear');
+        sk('scaleY', outEnd, Math.max(0.1, baseScaleY * 0.55), 'linear');
+        sk('opacity', outStart, baseOp, 'easeIn');
+        sk('opacity', outEnd, 0, 'linear');
+        break;
+      case 'textZoomBurstOut':
+        sk('scaleX', outStart, baseScaleX, 'easeIn');
+        sk('scaleY', outStart, baseScaleY, 'easeIn');
+        sk('scaleX', outEnd, baseScaleX * 1.55, 'linear');
+        sk('scaleY', outEnd, baseScaleY * 1.55, 'linear');
+        sk('opacity', outStart, baseOp, 'easeIn');
+        sk('opacity', outEnd, 0, 'linear');
+        break;
+      case 'textFlipDown3D':
+        sk('rotX', outStart, baseRotX, 'easeIn');
+        sk('rotX', outEnd, baseRotX + 78, 'linear');
+        sk('scaleY', outStart, baseScaleY, 'easeIn');
+        sk('scaleY', outEnd, baseScaleY * 0.6, 'linear');
+        sk('opacity', outStart, baseOp, 'easeIn');
+        sk('opacity', outEnd, 0, 'linear');
+        break;
+      case 'textShrinkSpinOut':
+        sk('rotation', outStart, baseRot, 'easeIn');
+        sk('rotation', outEnd, baseRot - 160, 'linear');
+        sk('scaleX', outStart, baseScaleX, 'easeIn');
+        sk('scaleY', outStart, baseScaleY, 'easeIn');
+        sk('scaleX', outEnd, 0.1, 'linear');
+        sk('scaleY', outEnd, 0.1, 'linear');
+        sk('opacity', outFadeStart, baseOp, 'easeIn');
         sk('opacity', outEnd, 0, 'linear');
         break;
       case 'textPulseGlow': {
-        const half = Math.max(4, Math.round((fullEnd - start) / 2));
-        const q1 = start + Math.round(half / 2);
-        sk('scaleX', start, base.scaleX, 'easeInOut');
-        sk('scaleY', start, base.scaleY, 'easeInOut');
-        sk('scaleX', q1, base.scaleX * 1.1, 'easeInOut');
-        sk('scaleY', q1, base.scaleY * 1.1, 'easeInOut');
-        sk('scaleX', start + half, base.scaleX, 'easeInOut');
-        sk('scaleY', start + half, base.scaleY, 'easeInOut');
-        sk('scaleX', fullEnd, base.scaleX, 'linear');
-        sk('scaleY', fullEnd, base.scaleY, 'linear');
+        const span = Math.max(3, end - start);
+        const half = Math.max(2, Math.round(span / 2));
+        const q1 = start + Math.max(1, Math.round(half / 2));
+        sk('scaleX', start, baseScaleX, 'easeInOut');
+        sk('scaleY', start, baseScaleY, 'easeInOut');
+        sk('scaleX', q1, baseScaleX * 1.1, 'easeInOut');
+        sk('scaleY', q1, baseScaleY * 1.1, 'easeInOut');
+        sk('scaleX', Math.min(end, start + half), baseScaleX, 'easeInOut');
+        sk('scaleY', Math.min(end, start + half), baseScaleY, 'easeInOut');
+        sk('scaleX', end, baseScaleX, 'linear');
+        sk('scaleY', end, baseScaleY, 'linear');
         break;
       }
       case 'textWaveFloat': {
-        const t1 = start + Math.round((fullEnd - start) * 0.25);
-        const t2 = start + Math.round((fullEnd - start) * 0.5);
-        const t3 = start + Math.round((fullEnd - start) * 0.75);
-        sk('rotation', start, base.rotation - 6, 'easeInOut');
-        sk('rotation', t1, base.rotation + 6, 'easeInOut');
-        sk('rotation', t2, base.rotation - 5, 'easeInOut');
-        sk('rotation', t3, base.rotation + 5, 'easeInOut');
-        sk('rotation', fullEnd, base.rotation, 'linear');
+        const span = Math.max(4, end - start);
+        const t1 = start + Math.round(span * 0.25);
+        const t2 = start + Math.round(span * 0.5);
+        const t3 = start + Math.round(span * 0.75);
+        sk('rotation', start, baseRot - 6, 'easeInOut');
+        sk('rotation', t1, baseRot + 6, 'easeInOut');
+        sk('rotation', t2, baseRot - 5, 'easeInOut');
+        sk('rotation', t3, baseRot + 5, 'easeInOut');
+        sk('rotation', end, baseRot, 'linear');
+        break;
+      }
+      case 'textFloatBob': {
+        const mid = start + Math.max(1, Math.round((end - start) * 0.5));
+        sk('y', start, baseY - 10, 'easeInOut');
+        sk('y', mid, baseY + 10, 'easeInOut');
+        sk('y', end, baseY - 10, 'linear');
+        break;
+      }
+      case 'textFlipCard3D': {
+        const mid = start + Math.max(1, Math.round((end - start) * 0.5));
+        sk('rotY', start, baseRotY - 16, 'easeInOut');
+        sk('rotY', mid, baseRotY + 16, 'easeInOut');
+        sk('rotY', end, baseRotY - 16, 'linear');
+        sk('y', start, baseY - 6, 'easeInOut');
+        sk('y', mid, baseY + 6, 'easeInOut');
+        sk('y', end, baseY - 6, 'linear');
         break;
       }
       case 'textWiggle': {
@@ -950,7 +1318,7 @@ export const KeyframeEngine = {
           let f = Math.min(layer.endFrame, start + Math.round((i / (offsets.length - 1)) * span));
           if (f <= prevF) f = Math.min(layer.endFrame, prevF + 1);
           if (f > prevF) {
-            sk('x', f, base.x + dx, 'linear');
+            sk('x', f, baseX + dx, 'linear');
             prevF = f;
           }
         });

@@ -934,7 +934,7 @@ class MotionFlowApp {
 
       const cloned = cloneLayer(orig);
       previewProject.layers[idx] = cloned;
-      const durF = Math.max(6, Math.min(180, Number(spec.durationFrames) || 24));
+      const durF = Math.max(3, Math.min(600, Number(spec.durationFrames) || 24));
       KeyframeEngine.applyPreset(
         cloned,
         spec.presetId,
@@ -943,15 +943,18 @@ class MotionFlowApp {
         durF
       );
       const cat = KeyframeEngine.getPresetCategory(spec.presetId);
+      const appliedDur = cat === 'in'
+        ? (cloned.presetInDurFrames || durF)
+        : (cat === 'out' ? (cloned.presetOutDurFrames || durF) : (cloned.presetComboDurFrames || durF));
       if (cat === 'in') {
         winStart = cloned.startFrame;
-        winEnd = Math.min(cloned.endFrame, cloned.startFrame + durF + 4);
+        winEnd = Math.min(cloned.endFrame, cloned.startFrame + appliedDur + 4);
       } else if (cat === 'out') {
         winEnd = cloned.endFrame;
-        winStart = Math.max(cloned.startFrame, cloned.endFrame - durF - 4);
+        winStart = Math.max(cloned.startFrame, cloned.endFrame - appliedDur - 4);
       } else {
         winStart = cloned.startFrame;
-        const loopCap = Math.min(90, Math.max(durF + 6, cloned.endFrame - cloned.startFrame));
+        const loopCap = Math.min(90, Math.max(appliedDur + 6, cloned.endFrame - cloned.startFrame));
         winEnd = Math.min(cloned.endFrame, cloned.startFrame + loopCap);
       }
     } else if (spec.kind === 'transition') {
