@@ -14,8 +14,13 @@ export class RendererEngine {
     this.imageCache = new Map();       // mediaId -> HTMLImageElement
     this.gifCache = new Map();         // mediaId -> { frames, totalMs } | 'loading'
     this.videoCache = new Map();       // mediaId -> HTMLVideoElement
+    this.videoLastFrameCache = new Map(); // mediaId -> { canvas, width, height }
+    this.videoThumbFallbackCache = new Map(); // mediaId -> HTMLImageElement
     this.rasterCache = new Map();      // layerId -> { key, canvas }
     this.bgGradientCache = { key: '', canvas: null };
+    this._videoHostEl = null;
+    this._safeTexCanvas = null;
+    this.onMediaFrameReady = null;
 
     this.glPreview = this.createWebGLCompositor(this.canvas);
     this.ctx2dFallback = this.glPreview ? null : this.canvas.getContext('2d', { alpha: false });
@@ -40,12 +45,15 @@ export class RendererEngine {
     if (!mediaId) return;
     this.imageCache.delete(mediaId);
     this.gifCache.delete(mediaId);
+    this.videoLastFrameCache.delete(mediaId);
+    this.videoThumbFallbackCache.delete(mediaId);
     const vid = this.videoCache.get(mediaId);
     if (vid) {
       try {
         vid.pause();
         vid.removeAttribute('src');
         vid.load();
+        vid.remove();
       } catch {}
       this.videoCache.delete(mediaId);
     }
@@ -607,6 +615,12 @@ export class RendererEngine {
       uHsl: gl.getUniformLocation(prog, 'uHsl[0]'),
       uColorTint: gl.getUniformLocation(prog, 'uColorTint'),
       zeroHsl: new Float32Array(24),
+      fxFboA: null,
+      fxFboB: null,
+      fxTexA: null,
+      fxTexB: null,
+      fxW: 0,
+      fxH: 0,
       textures: new Map()
     };
   }
@@ -616,6 +630,45 @@ export class RendererEngine {
     gl.bindBuffer(gl.ARRAY_BUFFER, buf);
     gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 16, 0);
     gl.vertexAttribPointer(aUv, 2, gl.FLOAT, false, 16, 8);
+  }
+
+  ensureFxPingPong(compositor, w, h) {
+    const { gl } = compositor;
+    const fw = Math.max(2, Math.min(1920, Math.round(w)));
+    const fh = Math.max(2, Math.min(1920, Math.round(h)));
+    const createTarget = () => {
+      const tex = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, fw, fh, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+      const fbo = gl.createFramebuffer();
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+      return { tex, fbo };
+    };
+    if (!compositor.fxFboA || !compositor.fxFboB) {
+      const a = createTarget();
+      const b = createTarget();
+      compositor.fxTexA = a.tex;
+      compositor.fxFboA = a.fbo;
+      compositor.fxTexB = b.tex;
+      compositor.fxFboB = b.fbo;
+      compositor.fxW = fw;
+      compositor.fxH = fh;
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      return;
+    }
+    if (compositor.fxW !== fw || compositor.fxH !== fh) {
+      gl.bindTexture(gl.TEXTURE_2D, compositor.fxTexA);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, fw, fh, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+      gl.bindTexture(gl.TEXTURE_2D, compositor.fxTexB);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, fw, fh, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+      compositor.fxW = fw;
+      compositor.fxH = fh;
+    }
   }
 
   copyFramebufferToAdjustmentTex(compositor, w, h) {
@@ -648,7 +701,27 @@ export class RendererEngine {
     } else {
       gl.bindTexture(gl.TEXTURE_2D, tex);
     }
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, sourceEl);
+    try {
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, sourceEl);
+    } catch {
+      const sw = sourceEl?.videoWidth || sourceEl?.naturalWidth || sourceEl?.width || 0;
+      const sh = sourceEl?.videoHeight || sourceEl?.naturalHeight || sourceEl?.height || 0;
+      if (sw > 0 && sh > 0) {
+        if (!this._safeTexCanvas) this._safeTexCanvas = document.createElement('canvas');
+        const tw = Math.min(1920, sw);
+        const th = Math.min(1920, sh);
+        if (this._safeTexCanvas.width !== tw || this._safeTexCanvas.height !== th) {
+          this._safeTexCanvas.width = tw;
+          this._safeTexCanvas.height = th;
+        }
+        const sctx = this._safeTexCanvas.getContext('2d');
+        sctx.clearRect(0, 0, tw, th);
+        sctx.drawImage(sourceEl, 0, 0, tw, th);
+        try {
+          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, this._safeTexCanvas);
+        } catch {}
+      }
+    }
     return tex;
   }
 
@@ -695,21 +768,174 @@ export class RendererEngine {
     return (found || entry.frames[entry.frames.length - 1]).canvas;
   }
 
+  _ensureHiddenVideoHost() {
+    if (typeof document === 'undefined' || !document.body) return null;
+    if (this._videoHostEl && this._videoHostEl.isConnected) return this._videoHostEl;
+    let host = document.getElementById('mfHiddenVideoHost');
+    if (!host) {
+      host = document.createElement('div');
+      host.id = 'mfHiddenVideoHost';
+      host.style.cssText = 'position:fixed;left:-9999px;top:0;width:2px;height:2px;opacity:0.001;pointer-events:none;overflow:hidden;z-index:-1;';
+      host.setAttribute('aria-hidden', 'true');
+      document.body.appendChild(host);
+    }
+    this._videoHostEl = host;
+    return host;
+  }
+
+  captureVideoFallbackFrame(mediaId, vid) {
+    if (!mediaId || !vid || vid.readyState < 2 || !vid.videoWidth || !vid.videoHeight) return null;
+    let entry = this.videoLastFrameCache.get(mediaId);
+    if (!entry) {
+      entry = { canvas: document.createElement('canvas'), width: 0, height: 0 };
+      this.videoLastFrameCache.set(mediaId, entry);
+    }
+    const vw = vid.videoWidth;
+    const vh = vid.videoHeight;
+    if (entry.canvas.width !== vw || entry.canvas.height !== vh) {
+      entry.canvas.width = vw;
+      entry.canvas.height = vh;
+    }
+    entry.width = vw;
+    entry.height = vh;
+    try {
+      const ctx = entry.canvas.getContext('2d');
+      ctx.drawImage(vid, 0, 0, vw, vh);
+      return entry;
+    } catch {
+      return null;
+    }
+  }
+
   getVideoElement(mediaItem) {
-    if (!mediaItem) return null;
-    if (this.videoCache.has(mediaItem.id)) return this.videoCache.get(mediaItem.id);
+    if (!mediaItem || !mediaItem.url) return null;
+    if (this.videoCache.has(mediaItem.id)) {
+      const existing = this.videoCache.get(mediaItem.id);
+      if (existing.dataset.srcUrl === mediaItem.url) return existing;
+      try {
+        existing.pause();
+        existing.remove();
+      } catch {}
+      this.videoCache.delete(mediaItem.id);
+    }
     const vid = document.createElement('video');
-    vid.crossOrigin = 'anonymous';
+    const urlStr = String(mediaItem.url);
+    const isExternalHttp = typeof window !== 'undefined' &&
+      /^https?:\/\//i.test(urlStr) &&
+      !urlStr.startsWith(window.location.origin);
+    if (isExternalHttp) {
+      vid.crossOrigin = 'anonymous';
+    }
     vid.muted = true;
+    vid.defaultMuted = true;
     vid.playsInline = true;
+    vid.setAttribute('playsinline', '');
+    vid.setAttribute('webkit-playsinline', '');
     vid.preload = 'auto';
-    vid.src = mediaItem.url;
+    vid.dataset.srcUrl = urlStr;
+
+    const notifyReady = () => {
+      if (vid.readyState >= 2 && vid.videoWidth > 0) {
+        this.captureVideoFallbackFrame(mediaItem.id, vid);
+      }
+      this.onMediaFrameReady?.(mediaItem);
+    };
+    vid.addEventListener('loadedmetadata', notifyReady);
+    vid.addEventListener('loadeddata', notifyReady);
+    vid.addEventListener('canplay', notifyReady);
+    vid.addEventListener('seeked', () => {
+      if (vid._pendingSeekTime !== undefined && vid._pendingSeekTime !== null) {
+        const nextT = vid._pendingSeekTime;
+        vid._pendingSeekTime = null;
+        if (Math.abs(vid.currentTime - nextT) > 0.025) {
+          try { vid.currentTime = nextT; } catch {}
+          return;
+        }
+      }
+      notifyReady();
+    });
+
+    vid.src = urlStr;
+    const host = this._ensureHiddenVideoHost();
+    if (host) host.appendChild(vid);
+    try { vid.load(); } catch {}
     this.videoCache.set(mediaItem.id, vid);
     return vid;
   }
 
+  _computeVideoTargetTime(layer, frame, fps, vid, mediaItem) {
+    const baseSec = (layer.mediaOffsetFrames || 0) / fps;
+    const elapsedSec = TimelineEngine.integrateSpeedCurveSourceFrames(layer, frame - layer.startFrame) / fps;
+    const spanSec = TimelineEngine.integrateSpeedCurveSourceFrames(layer, Math.max(1, layer.endFrame - layer.startFrame)) / fps;
+    const knownDur = vid?.duration && isFinite(vid.duration) && vid.duration > 0
+      ? vid.duration
+      : (mediaItem?.durationMs ? mediaItem.durationMs / 1000 : null);
+    let targetTime;
+    if (layer.reversed) {
+      const endWindow = knownDur ? Math.min(knownDur - 0.02, baseSec + spanSec) : baseSec + spanSec;
+      targetTime = Math.max(0, endWindow - elapsedSec);
+    } else {
+      targetTime = Math.max(0, baseSec + elapsedSec);
+    }
+    return knownDur ? Math.max(0, Math.min(knownDur - 0.02, targetTime)) : Math.max(0, targetTime);
+  }
+
+  syncVideoPlayback(project, frame, mediaMap, isPlaying, shuttleRate = 1) {
+    const fps = Math.max(1, project?.fps || 30);
+    const activeMediaIds = new Set();
+
+    if (isPlaying && shuttleRate > 0 && project && Array.isArray(project.layers)) {
+      for (const layer of project.layers) {
+        if (layer.type !== 'video' || !layer.visible || !layer.mediaId) continue;
+        if (frame < layer.startFrame || frame > layer.endFrame) continue;
+        const mediaItem = mediaMap.get(layer.mediaId);
+        if (!mediaItem) continue;
+        const vid = this.getVideoElement(mediaItem);
+        if (!vid) continue;
+        activeMediaIds.add(mediaItem.id);
+
+        const targetTime = this._computeVideoTargetTime(layer, frame, fps, vid, mediaItem);
+        if (layer.reversed) {
+          if (!vid.paused) vid.pause();
+          if (!vid.seeking && Math.abs(vid.currentTime - targetTime) > 0.03) {
+            try { vid.currentTime = targetTime; } catch {}
+          }
+          continue;
+        }
+
+        const dur = Math.max(1, layer.endFrame - layer.startFrame);
+        const normT = Math.max(0, Math.min(1, (frame - layer.startFrame) / dur));
+        const rate = Math.max(
+          0.25,
+          Math.min(4.0, shuttleRate * (layer.speed || 1) * TimelineEngine.evaluateLayerSpeedFactor(layer, normT))
+        );
+        vid.muted = true;
+        if (Math.abs((vid.playbackRate || 1) - rate) > 0.04) {
+          try { vid.playbackRate = rate; } catch {}
+        }
+
+        if (vid.readyState >= 1) {
+          if (vid.paused) {
+            if (!vid.seeking && Math.abs(vid.currentTime - targetTime) > 0.07) {
+              try { vid.currentTime = targetTime; } catch {}
+            }
+            vid.play().catch(() => {});
+          } else if (!vid.seeking && Math.abs(vid.currentTime - targetTime) > 0.28) {
+            try { vid.currentTime = targetTime; } catch {}
+          }
+        }
+      }
+    }
+
+    for (const [id, vid] of this.videoCache.entries()) {
+      if (!activeMediaIds.has(id) && !vid.paused) {
+        try { vid.pause(); } catch {}
+      }
+    }
+  }
+
   async seekVideosForFrame(project, frame, mediaMap, awaitSeek = false) {
-    const fps = project.fps || 30;
+    const fps = Math.max(1, project.fps || 30);
     const promises = [];
 
     for (const layer of project.layers) {
@@ -719,36 +945,34 @@ export class RendererEngine {
       if (!mediaItem) continue;
       const vid = this.getVideoElement(mediaItem);
       if (!vid) continue;
-
-      const baseSec = (layer.mediaOffsetFrames || 0) / fps;
-      const elapsedSec = TimelineEngine.integrateSpeedCurveSourceFrames(layer, frame - layer.startFrame) / fps;
-      const spanSec = TimelineEngine.integrateSpeedCurveSourceFrames(layer, Math.max(1, layer.endFrame - layer.startFrame)) / fps;
-      let targetTime;
-      if (layer.reversed) {
-        const endWindow = vid.duration && isFinite(vid.duration)
-          ? Math.min(vid.duration - 0.01, baseSec + spanSec)
-          : baseSec + spanSec;
-        targetTime = Math.max(0, endWindow - elapsedSec);
-      } else {
-        targetTime = Math.max(0, baseSec + elapsedSec);
+      if (!awaitSeek && !vid.paused) {
+        try { vid.pause(); } catch {}
       }
-      const clampedTime = vid.duration && isFinite(vid.duration) ? Math.max(0, Math.min(vid.duration - 0.01, targetTime)) : Math.max(0, targetTime);
+
+      const clampedTime = this._computeVideoTargetTime(layer, frame, fps, vid, mediaItem);
       if (!isFinite(clampedTime) || clampedTime < 0) continue;
 
-      const seekThreshold = awaitSeek ? 0.004 : 0.014;
+      const seekThreshold = awaitSeek ? 0.004 : 0.022;
       if (Math.abs(vid.currentTime - clampedTime) > seekThreshold) {
         if (awaitSeek) {
+          vid._pendingSeekTime = null;
           promises.push(
             new Promise((resolve) => {
               const done = () => {
                 vid.removeEventListener('seeked', done);
+                if (vid.readyState >= 2 && vid.videoWidth > 0) {
+                  this.captureVideoFallbackFrame(mediaItem.id, vid);
+                }
                 resolve();
               };
               vid.addEventListener('seeked', done, { once: true });
-              vid.currentTime = clampedTime;
-              setTimeout(done, 180);
+              try { vid.currentTime = clampedTime; } catch { resolve(); }
+              setTimeout(done, 220);
             })
           );
+        } else if (vid.seeking) {
+          // Coalesce rapid scrub seeks so hardware decoder actually finishes frames
+          vid._pendingSeekTime = clampedTime;
         } else {
           try { vid.currentTime = clampedTime; } catch {}
         }
@@ -999,9 +1223,27 @@ export class RendererEngine {
     }
     if (layer.type === 'video') {
       const item = mediaMap.get(layer.mediaId);
+      if (!item) return null;
       const vid = this.getVideoElement(item);
-      if (vid && vid.readyState >= 2) {
+      if (vid && vid.readyState >= 2 && vid.videoWidth > 0) {
+        this.captureVideoFallbackFrame(item.id, vid);
         return { el: vid, w: layer.width || vid.videoWidth, h: layer.height || vid.videoHeight };
+      }
+      const cachedFrame = this.videoLastFrameCache.get(item.id);
+      if (cachedFrame && cachedFrame.width > 0) {
+        return { el: cachedFrame.canvas, w: layer.width || cachedFrame.width, h: layer.height || cachedFrame.height };
+      }
+      if (item.thumbUrl) {
+        let thumbImg = this.videoThumbFallbackCache.get(item.id);
+        if (!thumbImg) {
+          thumbImg = new Image();
+          thumbImg.onload = () => this.onMediaFrameReady?.(item);
+          thumbImg.src = item.thumbUrl;
+          this.videoThumbFallbackCache.set(item.id, thumbImg);
+        }
+        if (thumbImg.complete && thumbImg.naturalWidth > 0) {
+          return { el: thumbImg, w: layer.width || item.width || thumbImg.naturalWidth, h: layer.height || item.height || thumbImg.naturalHeight };
+        }
       }
       return null;
     }
@@ -1366,14 +1608,59 @@ export class RendererEngine {
         const fx = layer.fx || {};
         const mask = layer.mask || {};
         const crop = layer.crop || {};
-        const vfx = layer.vfx || {};
-        const vfxSpec = VIDEO_EFFECT_PRESETS.find((v) => v.id === vfx.type);
-        const vfxShaderId = vfxSpec ? vfxSpec.shaderId : 0;
-        const vfxTime = ((subFrame - layer.startFrame) / fps) * (vfx.speed || 1);
+        const vfxList = TimelineEngine.getActiveVfxList(layer);
+        const lastVfx = vfxList.length > 0 ? vfxList[vfxList.length - 1] : { type: 'none', intensity: 0.65, speed: 1 };
         const keyRgb = this.hexToRgb01(fx.chromaColor || '#00FF00');
         const outRgb = this.hexToRgb01(fx.outlineColor || '#FFFFFF');
         const maskSpec = MASK_PRESETS.find((m) => m.id === mask.type);
         const maskShaderType = maskSpec ? maskSpec.shaderType : 0;
+
+        // If 2+ stacked VFX are active, run pre-passes 0..N-2 through ping-pong FBOs first
+        if (vfxList.length > 1) {
+          const passW = isAdjustment ? outW : Math.min(outW, Math.max(64, Math.round(texelW)));
+          const passH = isAdjustment ? outH : Math.min(outH, Math.max(64, Math.round(texelH)));
+          this.ensureFxPingPong(compositor, passW, passH);
+          const srcTex = isAdjustment
+            ? compositor.adjTex
+            : compositor.textures.get(layer.mediaId || layer.id);
+          this._resetDefaultShaderUniforms(compositor);
+          this.bindCompositorQuadBuffer(compositor, compositor.fboPosBuf);
+          gl.disable(gl.BLEND);
+          gl.viewport(0, 0, compositor.fxW, compositor.fxH);
+          gl.uniformMatrix4fv(uMvp, false, Mat4.scale(Mat4.identity(), 2, 2, 1));
+          gl.uniform2f(uTexel, 1 / Math.max(1, passW), 1 / Math.max(1, passH));
+
+          let curSrcTex = srcTex;
+          let targetIdx = 0;
+          for (let vi = 0; vi < vfxList.length - 1; vi++) {
+            const vItem = vfxList[vi];
+            const spec = VIDEO_EFFECT_PRESETS.find((v) => v.id === vItem.type);
+            const sId = spec ? spec.shaderId : 0;
+            const vTime = ((subFrame - layer.startFrame) / fps) * (vItem.speed || 1);
+            const targetFbo = targetIdx === 0 ? compositor.fxFboA : compositor.fxFboB;
+            const nextTex = targetIdx === 0 ? compositor.fxTexA : compositor.fxTexB;
+            gl.bindFramebuffer(gl.FRAMEBUFFER, targetFbo);
+            gl.clearColor(0, 0, 0, 0);
+            gl.clear(gl.COLOR_BUFFER_BIT);
+            gl.activeTexture(gl.TEXTURE0);
+            gl.bindTexture(gl.TEXTURE_2D, curSrcTex);
+            gl.uniform3f(uVfx, sId, vItem.intensity ?? 0.65, vTime);
+            gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+            curSrcTex = nextTex;
+            targetIdx = 1 - targetIdx;
+          }
+
+          gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+          gl.viewport(0, 0, outW, outH);
+          gl.enable(gl.BLEND);
+          gl.activeTexture(gl.TEXTURE0);
+          gl.bindTexture(gl.TEXTURE_2D, curSrcTex);
+          this.bindCompositorQuadBuffer(compositor, isAdjustment ? compositor.fboPosBuf : compositor.posBuf);
+        }
+
+        const vfxSpec = VIDEO_EFFECT_PRESETS.find((v) => v.id === lastVfx.type);
+        const vfxShaderId = vfxSpec ? vfxSpec.shaderId : 0;
+        const vfxTime = ((subFrame - layer.startFrame) / fps) * (lastVfx.speed || 1);
 
         gl.uniformMatrix4fv(uMvp, false, mvp);
         gl.uniform1f(uAlpha, alpha);
@@ -1431,7 +1718,7 @@ export class RendererEngine {
             );
           }
         }
-        gl.uniform3f(uVfx, vfxShaderId, vfx.intensity ?? 0.65, vfxTime);
+        gl.uniform3f(uVfx, vfxShaderId, lastVfx.intensity ?? 0.65, vfxTime);
         gl.uniform2f(uWipe, trState.wipeType, trState.wipeProgress);
         if (uHsl) {
           if (Array.isArray(fx.hsl) && fx.hsl.length === 8) {

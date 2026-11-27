@@ -27,6 +27,7 @@ export function createBaseLayer(type, name, project, overrides = {}) {
     mediaOffsetFrames: 0,
     speed: 1.0,
     speedCurve: overrides.speedCurve || 'none',
+    customSpeedCurve: Array.isArray(overrides.customSpeedCurve) ? deepClone(overrides.customSpeedCurve) : null,
     visible: true,
     locked: false,
     trackCompact: Boolean(overrides.trackCompact),
@@ -67,6 +68,17 @@ export function createBaseLayer(type, name, project, overrides = {}) {
       speed: 1.0,
       ...(overrides.vfx || {})
     },
+    vfxStack: Array.isArray(overrides.vfxStack)
+      ? deepClone(overrides.vfxStack)
+      : (overrides.vfx && overrides.vfx.type && overrides.vfx.type !== 'none'
+          ? [{
+              id: uid('vfx'),
+              type: overrides.vfx.type,
+              intensity: overrides.vfx.intensity ?? 0.65,
+              speed: overrides.vfx.speed ?? 1.0,
+              enabled: true
+            }]
+          : []),
     fx: {
       brightness: 0,
       contrast: 1,
@@ -203,7 +215,7 @@ export const TimelineEngine = {
   createMediaLayer(project, mediaItem, startFrame = 0, overrides = {}) {
     const fps = project.fps || 30;
     const rawDurFrames = Math.max(15, Math.round(((mediaItem.durationMs || 4000) / 1000) * fps));
-    const endFrame = Math.min(project.durationFrames, startFrame + rawDurFrames);
+    const endFrame = startFrame + rawDurFrames;
 
     // Fit nicely into canvas while preserving aspect ratio
     const maxW = project.width * 0.85;
@@ -212,8 +224,12 @@ export const TimelineEngine = {
     const mh = mediaItem.height || 360;
     const fitScale = mediaItem.type === 'audio' ? 1 : Math.min(maxW / mw, maxH / mh, 1);
 
+    const role = mediaItem.type === 'audio'
+      ? null
+      : (overrides.trackRole === 'main' ? 'main' : (overrides.trackRole ?? null));
+
     return createBaseLayer(mediaItem.type, mediaItem.name || 'Media Clip', project, {
-      trackRole: overrides.trackRole ?? null,
+      trackRole: role,
       startFrame,
       endFrame: Math.max(startFrame + 15, endFrame),
       mediaId: mediaItem.id,
@@ -316,10 +332,12 @@ export const TimelineEngine = {
     if (!vidLayer || vidLayer.type !== 'video' || !vidLayer.mediaId) return null;
     const ap = vidLayer.audioProps || {};
     const audioLayer = createBaseLayer('audio', `${vidLayer.name} (Audio)`, project, {
+      trackRole: null,
       startFrame: vidLayer.startFrame,
       endFrame: vidLayer.endFrame,
       mediaId: vidLayer.mediaId,
       speedCurve: vidLayer.speedCurve || 'none',
+      customSpeedCurve: Array.isArray(vidLayer.customSpeedCurve) ? deepClone(vidLayer.customSpeedCurve) : null,
       reversed: Boolean(vidLayer.reversed),
       audioProps: {
         volume: ap.volume ?? 1.0,
@@ -333,6 +351,7 @@ export const TimelineEngine = {
     });
     audioLayer.mediaOffsetFrames = vidLayer.mediaOffsetFrames || 0;
     audioLayer.speed = vidLayer.speed || 1;
+    audioLayer.detachedFromLayerId = vidLayer.id;
     if (Array.isArray(vidLayer.keyframes?.volume) && vidLayer.keyframes.volume.length > 0) {
       audioLayer.keyframes.volume = deepClone(vidLayer.keyframes.volume);
     }
@@ -348,7 +367,9 @@ export const TimelineEngine = {
       };
     }
     vidLayer.audioProps.muted = true;
+    vidLayer.audioDetached = true;
     project.layers.push(audioLayer);
+    this.normalizeTrackZOrder(project);
     return audioLayer;
   },
 
@@ -418,7 +439,10 @@ export const TimelineEngine = {
     const rawStart = Math.max(0, Math.round(newStartFrame));
 
     const snapInfo = this.snapFrameWithMeta(project, layerId, rawStart, len, playheadFrame, threshold, snapEnabled);
-    const targetStart = snapInfo.startFrame;
+    let targetStart = snapInfo.startFrame;
+    if (layer.trackRole === 'main' && project.settings?.rippleMode === false) {
+      targetStart = this.resolveNonOverlappingMainStart(project, layerId, len, targetStart);
+    }
     const delta = targetStart - oldStart;
     layer.startFrame = targetStart;
     layer.endFrame = targetStart + len;
@@ -626,36 +650,93 @@ export const TimelineEngine = {
     }
   },
 
-  evaluateSpeedCurveFactor(curveId, normT) {
-    const curve = SPEED_CURVE_PRESETS[curveId];
-    if (!curve || curveId === 'none') return 1.0;
-    const t = Math.max(0, Math.min(1, normT));
-    const pts = curve.pts;
-    for (let i = 0; i < pts.length - 1; i++) {
-      const [t0, v0] = pts[i];
-      const [t1, v1] = pts[i + 1];
+  evaluateCurveArrayFactor(pts, normT) {
+    if (!Array.isArray(pts) || pts.length === 0) return 1.0;
+    const t = Math.max(0, Math.min(1, Number(normT) || 0));
+    const normPts = pts
+      .map((p) => Array.isArray(p)
+        ? [Math.max(0, Math.min(1, Number(p[0]) || 0)), Math.max(0.15, Math.min(5.0, Number(p[1]) || 1))]
+        : [Math.max(0, Math.min(1, Number(p?.t) || 0)), Math.max(0.15, Math.min(5.0, Number(p?.v) || 1))])
+      .sort((a, b) => a[0] - b[0]);
+    if (normPts.length === 1) return normPts[0][1];
+    if (t <= normPts[0][0]) return normPts[0][1];
+    if (t >= normPts[normPts.length - 1][0]) return normPts[normPts.length - 1][1];
+
+    for (let i = 0; i < normPts.length - 1; i++) {
+      const [t0, v0] = normPts[i];
+      const [t1, v1] = normPts[i + 1];
       if (t >= t0 && t <= t1) {
-        const span = Math.max(1e-4, t1 - t0);
-        const u = (t - t0) / span;
-        return v0 + (v1 - v0) * u;
+        const h = Math.max(1e-4, t1 - t0);
+        const u = (t - t0) / h;
+        if (normPts.length === 2) {
+          return v0 + (v1 - v0) * u;
+        }
+        // Smooth Catmull-Rom / cubic Hermite interpolation clamped gently inside [0.15, 5.0]
+        const pPrev = normPts[Math.max(0, i - 1)];
+        const pNext = normPts[Math.min(normPts.length - 1, i + 2)];
+        const m0 = i === 0 ? (v1 - v0) / h : (v1 - pPrev[1]) / Math.max(1e-4, t1 - pPrev[0]);
+        const m1 = i === normPts.length - 2 ? (v1 - v0) / h : (pNext[1] - v0) / Math.max(1e-4, pNext[0] - t0);
+        const u2 = u * u;
+        const u3 = u2 * u;
+        const h00 = 2 * u3 - 3 * u2 + 1;
+        const h10 = u3 - 2 * u2 + u;
+        const h01 = -2 * u3 + 3 * u2;
+        const h11 = u3 - u2;
+        const val = h00 * v0 + h10 * h * m0 + h01 * v1 + h11 * h * m1;
+        const minNeighbor = Math.min(v0, v1) * 0.85;
+        const maxNeighbor = Math.max(v0, v1) * 1.15;
+        return Math.max(0.15, Math.min(5.0, Math.max(minNeighbor, Math.min(maxNeighbor, val))));
       }
     }
-    return pts[pts.length - 1][1] ?? 1.0;
+    return normPts[normPts.length - 1][1] ?? 1.0;
+  },
+
+  getLayerSpeedCurvePoints(layer) {
+    if (Array.isArray(layer?.customSpeedCurve) && layer.customSpeedCurve.length >= 2) {
+      return layer.customSpeedCurve
+        .map((p) => Array.isArray(p)
+          ? [Math.max(0, Math.min(1, Number(p[0]) || 0)), Math.max(0.15, Math.min(5.0, Number(p[1]) || 1))]
+          : [Math.max(0, Math.min(1, Number(p?.t) || 0)), Math.max(0.15, Math.min(5.0, Number(p?.v) || 1))])
+        .sort((a, b) => a[0] - b[0]);
+    }
+    const curve = SPEED_CURVE_PRESETS[layer?.speedCurve || 'none'];
+    if (curve && Array.isArray(curve.pts)) {
+      return curve.pts.map(([t, v]) => [t, v]);
+    }
+    return [[0, 1], [1, 1]];
+  },
+
+  evaluateLayerSpeedFactor(layer, normT) {
+    if (!layer) return 1.0;
+    const hasCustom = Array.isArray(layer.customSpeedCurve) && layer.customSpeedCurve.length >= 2;
+    if (!hasCustom && (!layer.speedCurve || layer.speedCurve === 'none')) return 1.0;
+    return this.evaluateCurveArrayFactor(this.getLayerSpeedCurvePoints(layer), normT);
+  },
+
+  evaluateSpeedCurveFactor(curveIdOrPts, normT) {
+    if (Array.isArray(curveIdOrPts)) {
+      return this.evaluateCurveArrayFactor(curveIdOrPts, normT);
+    }
+    const curve = SPEED_CURVE_PRESETS[curveIdOrPts];
+    if (!curve || curveIdOrPts === 'none') return 1.0;
+    return this.evaluateCurveArrayFactor(curve.pts, normT);
   },
 
   integrateSpeedCurveSourceFrames(layer, localTimelineFrames) {
     const dur = Math.max(1, layer.endFrame - layer.startFrame);
     const clampedLocal = Math.max(0, Math.min(dur, localTimelineFrames));
     const baseSpeed = Math.max(0.25, Math.min(4.0, layer.speed || 1));
-    if (!layer.speedCurve || layer.speedCurve === 'none') {
+    const hasCustom = Array.isArray(layer?.customSpeedCurve) && layer.customSpeedCurve.length >= 2;
+    if (!hasCustom && (!layer.speedCurve || layer.speedCurve === 'none')) {
       return clampedLocal * baseSpeed;
     }
+    const pts = this.getLayerSpeedCurvePoints(layer);
     const steps = Math.max(8, Math.min(64, Math.ceil(clampedLocal)));
     const dt = clampedLocal / steps;
     let sum = 0;
     for (let i = 0; i < steps; i++) {
       const midT = ((i + 0.5) * dt) / dur;
-      sum += this.evaluateSpeedCurveFactor(layer.speedCurve, midT) * baseSpeed * dt;
+      sum += this.evaluateCurveArrayFactor(pts, midT) * baseSpeed * dt;
     }
     return sum;
   },
@@ -829,14 +910,330 @@ export const TimelineEngine = {
     }
   },
 
+  getActiveVfxList(layer) {
+    if (!layer) return [];
+    const stack = Array.isArray(layer.vfxStack) ? layer.vfxStack : [];
+    if (stack.length > 0) {
+      // Preserve direct mutations to layer.vfx when only 1 stack item exists
+      if (stack.length === 1 && !layer._vfxStackExplicit && layer.vfx) {
+        if (!layer.vfx.type || layer.vfx.type === 'none') {
+          return [];
+        }
+        if (stack[0].type !== layer.vfx.type) {
+          return [{
+            id: stack[0].id || 'primary',
+            type: layer.vfx.type,
+            intensity: layer.vfx.intensity ?? 0.65,
+            speed: layer.vfx.speed ?? 1.0,
+            enabled: true
+          }];
+        }
+      }
+      const enabled = stack.filter((v) => v && v.enabled !== false && v.type && v.type !== 'none');
+      if (enabled.length > 0) return enabled;
+    }
+    if (layer.vfx && layer.vfx.type && layer.vfx.type !== 'none') {
+      return [{
+        id: 'primary',
+        type: layer.vfx.type,
+        intensity: layer.vfx.intensity ?? 0.65,
+        speed: layer.vfx.speed ?? 1.0,
+        enabled: true
+      }];
+    }
+    return [];
+  },
+
+  normalizeLayerVfxStack(layer) {
+    if (!layer) return [];
+    if (!Array.isArray(layer.vfxStack)) layer.vfxStack = [];
+    if (layer.vfxStack.length === 0 && layer.vfx && layer.vfx.type && layer.vfx.type !== 'none') {
+      layer.vfxStack.push({
+        id: uid('vfx'),
+        type: layer.vfx.type,
+        intensity: layer.vfx.intensity ?? 0.65,
+        speed: layer.vfx.speed ?? 1.0,
+        enabled: true
+      });
+    }
+    layer.vfxStack = layer.vfxStack
+      .filter((v) => v && v.type && v.type !== 'none')
+      .map((v) => ({
+        id: v.id || uid('vfx'),
+        type: v.type,
+        intensity: Math.max(0.05, Math.min(1.5, Number(v.intensity ?? 0.65))),
+        speed: Math.max(0.2, Math.min(3.0, Number(v.speed ?? 1.0))),
+        enabled: v.enabled !== false
+      }));
+    const firstActive = layer.vfxStack.find((v) => v.enabled !== false);
+    if (!layer.vfx) layer.vfx = { type: 'none', intensity: 0.65, speed: 1.0 };
+    if (firstActive) {
+      layer.vfx.type = firstActive.type;
+      layer.vfx.intensity = firstActive.intensity;
+      layer.vfx.speed = firstActive.speed;
+    } else {
+      layer.vfx.type = 'none';
+    }
+    return layer.vfxStack;
+  },
+
+  setPrimaryLayerVfx(layer, typeId, intensity = null, speed = null) {
+    if (!layer) return [];
+    layer._vfxStackExplicit = true;
+    this.normalizeLayerVfxStack(layer);
+    if (!typeId || typeId === 'none') {
+      layer.vfxStack = [];
+      layer.vfx = { type: 'none', intensity: 0.65, speed: 1.0 };
+      return [];
+    }
+    const existing = layer.vfxStack[0];
+    if (existing) {
+      existing.type = typeId;
+      existing.enabled = true;
+      if (intensity !== null) existing.intensity = Number(intensity);
+      if (speed !== null) existing.speed = Number(speed);
+    } else {
+      layer.vfxStack.push({
+        id: uid('vfx'),
+        type: typeId,
+        intensity: intensity ?? layer.vfx?.intensity ?? 0.65,
+        speed: speed ?? layer.vfx?.speed ?? 1.0,
+        enabled: true
+      });
+    }
+    return this.normalizeLayerVfxStack(layer);
+  },
+
+  addLayerVfx(layer, typeId, intensity = 0.65, speed = 1.0) {
+    if (!layer || !typeId || typeId === 'none') return null;
+    layer._vfxStackExplicit = true;
+    this.normalizeLayerVfxStack(layer);
+    const entry = {
+      id: uid('vfx'),
+      type: typeId,
+      intensity: Math.max(0.05, Math.min(1.5, Number(intensity) || 0.65)),
+      speed: Math.max(0.2, Math.min(3.0, Number(speed) || 1.0)),
+      enabled: true
+    };
+    layer.vfxStack.push(entry);
+    this.normalizeLayerVfxStack(layer);
+    return entry;
+  },
+
+  removeLayerVfx(layer, vfxId) {
+    if (!layer) return false;
+    layer._vfxStackExplicit = true;
+    this.normalizeLayerVfxStack(layer);
+    const prevLen = layer.vfxStack.length;
+    layer.vfxStack = layer.vfxStack.filter((v) => v.id !== vfxId);
+    this.normalizeLayerVfxStack(layer);
+    return layer.vfxStack.length !== prevLen;
+  },
+
+  toggleLayerVfx(layer, vfxId) {
+    if (!layer) return false;
+    layer._vfxStackExplicit = true;
+    this.normalizeLayerVfxStack(layer);
+    const item = layer.vfxStack.find((v) => v.id === vfxId);
+    if (!item) return false;
+    item.enabled = item.enabled === false;
+    this.normalizeLayerVfxStack(layer);
+    return true;
+  },
+
+  updateLayerVfx(layer, vfxId, patch = {}) {
+    if (!layer) return false;
+    layer._vfxStackExplicit = true;
+    this.normalizeLayerVfxStack(layer);
+    const item = layer.vfxStack.find((v) => v.id === vfxId);
+    if (!item) return false;
+    if (patch.intensity !== undefined) item.intensity = Math.max(0.05, Math.min(1.5, Number(patch.intensity)));
+    if (patch.speed !== undefined) item.speed = Math.max(0.2, Math.min(3.0, Number(patch.speed)));
+    if (patch.enabled !== undefined) item.enabled = Boolean(patch.enabled);
+    if (patch.type !== undefined) item.type = patch.type;
+    this.normalizeLayerVfxStack(layer);
+    return true;
+  },
+
+  countActiveEffects(layer) {
+    if (!layer) return 0;
+    let count = this.getActiveVfxList(layer).length;
+    if (layer.filterId && layer.filterId !== 'normal') count++;
+    const fx = layer.fx || {};
+    const hasAdj =
+      Math.abs(fx.brightness || 0) > 0.01 ||
+      Math.abs((fx.contrast ?? 1) - 1) > 0.01 ||
+      Math.abs((fx.saturation ?? 1) - 1) > 0.01 ||
+      Math.abs(fx.temperature || 0) > 0.01 ||
+      Math.abs(fx.tint || 0) > 0.01 ||
+      Math.abs(fx.exposure || 0) > 0.01 ||
+      Math.abs(fx.blur || 0) > 0.05 ||
+      Math.abs(fx.vignette || 0) > 0.01 ||
+      Math.abs(fx.grain || 0) > 0.01 ||
+      Math.abs(fx.sharpen || 0) > 0.01;
+    if (hasAdj && (!layer.filterId || layer.filterId === 'normal')) count++;
+    if (layer.mask?.type && layer.mask.type !== 'none') count++;
+    if (fx.chromaEnabled) count++;
+    if (layer.colorMatch?.enabled) count++;
+    return count;
+  },
+
+  setMarkerColor(project, markerId, color) {
+    if (!Array.isArray(project?.markers)) return false;
+    const m = project.markers.find((item) => item && typeof item === 'object' && item.id === markerId);
+    if (!m) return false;
+    m.color = String(color || '#34d399');
+    return true;
+  },
+
+  removeMarkerById(project, markerId) {
+    if (!Array.isArray(project?.markers)) return false;
+    const prev = project.markers.length;
+    project.markers = project.markers.filter((item, idx) => {
+      const id = typeof item === 'object' ? item?.id : `mkr_${idx}`;
+      return id !== markerId;
+    });
+    return project.markers.length !== prev;
+  },
+
+  getCutPointFrames(project) {
+    const set = new Set([0]);
+    if (!project) return [0];
+    if (Number.isFinite(project.durationFrames)) {
+      set.add(Math.max(0, Math.round(project.durationFrames)));
+    }
+    if (Array.isArray(project.layers)) {
+      for (const l of project.layers) {
+        if (Number.isFinite(l.startFrame)) set.add(Math.max(0, Math.round(l.startFrame)));
+        if (Number.isFinite(l.endFrame)) set.add(Math.max(0, Math.round(l.endFrame)));
+      }
+    }
+    if (Array.isArray(project.markers)) {
+      for (const m of project.markers) {
+        const f = typeof m === 'number' ? m : Number(m?.frame);
+        if (Number.isFinite(f)) set.add(Math.max(0, Math.round(f)));
+      }
+    }
+    return Array.from(set).sort((a, b) => a - b);
+  },
+
+  cloneLayersForClipboard(project, layerIds) {
+    if (!project || !Array.isArray(layerIds) || layerIds.length === 0) return [];
+    const idSet = new Set(layerIds);
+    return project.layers
+      .filter((l) => idSet.has(l.id))
+      .map((l) => deepClone(l));
+  },
+
+  pasteLayersAtFrame(project, clipboardLayers, targetFrame = 0) {
+    if (!project || !Array.isArray(clipboardLayers) || clipboardLayers.length === 0) return [];
+    const minStart = Math.min(...clipboardLayers.map((l) => Number(l.startFrame) || 0));
+    const anchor = Math.max(0, Math.round(targetFrame));
+    const idMap = new Map();
+    const pasted = clipboardLayers.map((orig) => {
+      const copy = deepClone(orig);
+      const oldId = copy.id;
+      copy.id = uid('layer');
+      idMap.set(oldId, copy.id);
+      copy.name = `${copy.name} Copy`;
+      if (copy.trackRole === 'main') {
+        copy.trackRole = 'overlay';
+      }
+      const offset = (Number(copy.startFrame) || 0) - minStart;
+      const len = Math.max(5, (Number(copy.endFrame) || 0) - (Number(copy.startFrame) || 0));
+      const nextStart = anchor + offset;
+      const delta = nextStart - (Number(copy.startFrame) || 0);
+      copy.startFrame = nextStart;
+      copy.endFrame = nextStart + len;
+      if (delta !== 0) {
+        this.shiftLayerKeyframes(copy, delta);
+      }
+      if (copy.type !== 'adjustment' && copy.type !== 'audio') {
+        copy.transform.x = (copy.transform?.x || 0) + 18;
+        copy.transform.y = (copy.transform?.y || 0) + 18;
+      }
+      return copy;
+    });
+    for (const copy of pasted) {
+      if (copy.parentId && idMap.has(copy.parentId)) {
+        copy.parentId = idMap.get(copy.parentId);
+      } else if (copy.parentId && !project.layers.some((l) => l.id === copy.parentId)) {
+        copy.parentId = null;
+      }
+      project.layers.unshift(copy);
+      this.ensureProjectDuration(project, copy.endFrame);
+    }
+    this.normalizeTrackZOrder(project);
+    return pasted;
+  },
+
+  applyAutoReframe(project, layer, mode = 'smart') {
+    if (!project || !layer || layer.type === 'audio' || layer.type === 'group' || layer.type === 'adjustment') {
+      return false;
+    }
+    const projW = Math.max(1, project.width || 1080);
+    const projH = Math.max(1, project.height || 1920);
+    const clipW = Math.max(1, layer.width || projW);
+    const clipH = Math.max(1, layer.height || projH);
+
+    // Cover ratio guarantees frame fills the target aspect without black bars
+    const coverScale = Math.max(projW / clipW, projH / clipH);
+    const safeScale = Number((coverScale * (mode === 'dynamic' ? 1.12 : 1.03)).toFixed(3));
+    const maxPanX = Math.max(0, (clipW * safeScale - projW) * 0.48);
+    const maxPanY = Math.max(0, (clipH * safeScale - projH) * 0.48);
+
+    layer.transform.scaleX = safeScale;
+    layer.transform.scaleY = safeScale;
+    layer.transform.anchorX = 0;
+    layer.transform.anchorY = 0;
+
+    if (layer.trackData && Array.isArray(layer.trackData.points) && layer.trackData.points.length >= 2) {
+      const pts = layer.trackData.points;
+      const step = Math.max(1, Math.floor(pts.length / 8));
+      layer.keyframes.x = [];
+      layer.keyframes.y = [];
+      layer.keyframes.scaleX = [];
+      layer.keyframes.scaleY = [];
+      for (let i = 0; i < pts.length; i += step) {
+        const pt = pts[i];
+        const px = Math.max(-maxPanX, Math.min(maxPanX, -(Number(pt.x) || 0) * 0.75));
+        const py = Math.max(-maxPanY, Math.min(maxPanY, -(Number(pt.y) || 0) * 0.75));
+        KeyframeEngine.setKeyframe(layer, 'x', pt.frame, Number(px.toFixed(1)), 'smooth');
+        KeyframeEngine.setKeyframe(layer, 'y', pt.frame, Number(py.toFixed(1)), 'smooth');
+        KeyframeEngine.setKeyframe(layer, 'scaleX', pt.frame, safeScale, 'linear');
+        KeyframeEngine.setKeyframe(layer, 'scaleY', pt.frame, safeScale, 'linear');
+      }
+    } else if (mode === 'dynamic' && maxPanX > 12) {
+      const s = layer.startFrame;
+      const e = layer.endFrame;
+      const m = Math.round((s + e) * 0.5);
+      KeyframeEngine.setKeyframe(layer, 'x', s, Number((-maxPanX * 0.65).toFixed(1)), 'smooth');
+      KeyframeEngine.setKeyframe(layer, 'x', m, 0, 'smooth');
+      KeyframeEngine.setKeyframe(layer, 'x', e, Number((maxPanX * 0.65).toFixed(1)), 'smooth');
+      KeyframeEngine.setKeyframe(layer, 'y', s, 0, 'linear');
+      KeyframeEngine.setKeyframe(layer, 'scaleX', s, safeScale, 'linear');
+      KeyframeEngine.setKeyframe(layer, 'scaleY', s, safeScale, 'linear');
+    } else {
+      layer.transform.x = 0;
+      layer.transform.y = 0;
+      if (layer.keyframes) {
+        delete layer.keyframes.x;
+        delete layer.keyframes.y;
+      }
+    }
+    return true;
+  },
+
   copyAttributesFromLayer(layer) {
     if (!layer) return null;
+    this.normalizeLayerVfxStack(layer);
     return {
       filterId: layer.filterId || 'normal',
       filterIntensity: layer.filterIntensity ?? 1,
       blendMode: layer.blendMode || 'normal',
       fx: deepClone(layer.fx || {}),
       vfx: deepClone(layer.vfx || { type: 'none', intensity: 0.65, speed: 1 }),
+      vfxStack: deepClone(layer.vfxStack || []),
       mask: deepClone(layer.mask || { type: 'none', scaleX: 0.85, scaleY: 0.85, offsetX: 0, offsetY: 0, rotation: 0, feather: 0.05, invert: false }),
       transitions: deepClone(layer.transitions || { inType: 'none', inFrames: 15, outType: 'none', outFrames: 15 })
     };
@@ -849,6 +1246,9 @@ export const TimelineEngine = {
     layer.blendMode = attrs.blendMode || 'normal';
     layer.fx = deepClone(attrs.fx || {});
     layer.vfx = deepClone(attrs.vfx || { type: 'none', intensity: 0.65, speed: 1 });
+    layer.vfxStack = deepClone(attrs.vfxStack || []);
+    layer._vfxStackExplicit = Boolean(attrs.vfxStack && attrs.vfxStack.length);
+    this.normalizeLayerVfxStack(layer);
     layer.mask = deepClone(attrs.mask || layer.mask);
     layer.transitions = deepClone(attrs.transitions || layer.transitions);
     return true;
@@ -856,6 +1256,7 @@ export const TimelineEngine = {
 
   applyFilterAndAdjustToAll(project, sourceLayer) {
     if (!project || !sourceLayer) return 0;
+    this.normalizeLayerVfxStack(sourceLayer);
     let count = 0;
     for (const l of project.layers) {
       if (l.id === sourceLayer.id || l.type === 'audio' || l.type === 'group' || l.type === 'adjustment') continue;
@@ -863,6 +1264,9 @@ export const TimelineEngine = {
       l.filterIntensity = sourceLayer.filterIntensity ?? 1;
       l.fx = deepClone(sourceLayer.fx || {});
       l.vfx = deepClone(sourceLayer.vfx || l.vfx);
+      l.vfxStack = deepClone(sourceLayer.vfxStack || []);
+      l._vfxStackExplicit = Boolean(sourceLayer.vfxStack && sourceLayer.vfxStack.length);
+      this.normalizeLayerVfxStack(l);
       count++;
     }
     return count;
@@ -949,8 +1353,10 @@ export const TimelineEngine = {
   },
 
   /**
-   * Ensures Z-order in project.layers renders Overlays/Text/Shapes ABOVE Main Track,
-   * while Audio sits below Main Track, preserving relative order inside each group.
+   * Ensures 3-zone structure & Z-order:
+   * - Top (overlays): non-audio layers (text, shape, adjustment, overlay image/video, group)
+   * - Middle (mainTrack): ONLY video & image with trackRole === 'main'
+   * - Bottom (audios): ONLY audio layers
    */
   normalizeTrackZOrder(project) {
     if (!project || !Array.isArray(project.layers)) return;
@@ -958,12 +1364,17 @@ export const TimelineEngine = {
     const mainTrack = [];
     const audios = [];
     for (const l of project.layers) {
-      if (l.type === 'audio') audios.push(l);
-      else if (l.trackRole === 'main') mainTrack.push(l);
-      else overlays.push(l);
+      if (!l) continue;
+      if (l.type === 'audio') {
+        l.trackRole = null;
+        audios.push(l);
+      } else if (l.trackRole === 'main' && (l.type === 'video' || l.type === 'image')) {
+        mainTrack.push(l);
+      } else {
+        if (l.trackRole === 'main') l.trackRole = 'overlay';
+        overlays.push(l);
+      }
     }
-    // Keep mainTrack sorted reverse-chronologically in layers[] or sequential (rendered bottom-up doesn't matter when contiguous,
-    // reverse chronological ensures earlier clip sits last if overlapped cleanly during transitions)
     mainTrack.sort((a, b) => (b.startFrame - a.startFrame) || (b.endFrame - a.endFrame));
     project.layers = [...overlays, ...mainTrack, ...audios];
   },
@@ -1034,6 +1445,13 @@ export const TimelineEngine = {
 
   addToMainTrack(project, layer, options = {}) {
     if (!project || !layer) return null;
+    // Strict Main Track rule: ONLY video and image items allowed on Main Track
+    if (layer.type !== 'video' && layer.type !== 'image') {
+      layer.trackRole = layer.type === 'audio' ? null : 'overlay';
+      this.addLayer(project, layer);
+      this.normalizeTrackZOrder(project);
+      return layer;
+    }
     layer.trackRole = 'main';
     const len = Math.max(15, (layer.endFrame || 0) - (layer.startFrame || 0));
     const currentEnd = this.getMainTrackEndFrame(project);
@@ -1047,7 +1465,6 @@ export const TimelineEngine = {
 
     if (options.insertFrame !== undefined && options.insertFrame !== null && project.settings?.rippleMode !== false) {
       const ordered = this.getMainTrackClips(project);
-      // Put newly inserted clip before any existing clip that started at/after insertFrame
       const existingOthers = ordered.filter((c) => c.id !== layer.id);
       const insertIdx = existingOthers.findIndex((c) => (c.startFrame + c.endFrame) * 0.5 >= startF);
       const nextSeq = insertIdx >= 0
@@ -1075,11 +1492,57 @@ export const TimelineEngine = {
     return true;
   },
 
+  resolveNonOverlappingMainStart(project, movingLayerId, len, desiredStart) {
+    const safeLen = Math.max(5, Math.round(len || 5));
+    const raw = Math.max(0, Math.round(desiredStart || 0));
+    const others = this.getMainTrackClips(project).filter((c) => c.id !== movingLayerId);
+    if (others.length === 0) return raw;
+
+    const slots = [];
+    let cursor = 0;
+    for (const c of others) {
+      if (c.startFrame - cursor >= safeLen) {
+        slots.push([cursor, c.startFrame - safeLen]);
+      }
+      cursor = Math.max(cursor, c.endFrame);
+    }
+    slots.push([cursor, Infinity]);
+
+    let bestStart = cursor;
+    let bestDist = Infinity;
+    for (const [minS, maxS] of slots) {
+      const clamped = Math.max(minS, Math.min(maxS, raw));
+      const dist = Math.abs(clamped - raw);
+      if (dist < bestDist) {
+        bestDist = dist;
+        bestStart = clamped;
+      }
+    }
+    return bestStart;
+  },
+
   trimMainOrClip(project, layerId, edge, newFrame, snapEnabled = true, playheadFrame = 0, threshold = 4) {
     const layer = project?.layers?.find((l) => l.id === layerId);
     if (!layer || layer.locked) return { startFrame: 0, endFrame: 0, snapInfo: { snapped: false, guideFrame: null, kind: null, label: null } };
-    if (layer.trackRole !== 'main' || project.settings?.rippleMode === false) {
+    if (layer.trackRole !== 'main') {
       return this.trimClip(project, layerId, edge, newFrame, snapEnabled, playheadFrame, threshold);
+    }
+    if (project.settings?.rippleMode === false) {
+      const others = this.getMainTrackClips(project).filter((c) => c.id !== layerId);
+      const prevClip = [...others].reverse().find((c) => c.endFrame <= layer.startFrame);
+      const nextClip = others.find((c) => c.startFrame >= layer.endFrame);
+      const res = this.trimClip(project, layerId, edge, newFrame, snapEnabled, playheadFrame, threshold);
+      const minLen = 5;
+      if (edge === 'left' && prevClip && layer.startFrame < prevClip.endFrame) {
+        const clampedStart = Math.min(layer.endFrame - minLen, prevClip.endFrame);
+        const diff = clampedStart - layer.startFrame;
+        layer.startFrame = clampedStart;
+        layer.mediaOffsetFrames = Math.max(0, (layer.mediaOffsetFrames || 0) + Math.round(diff * (layer.speed || 1)));
+      }
+      if (edge === 'right' && nextClip && layer.endFrame > nextClip.startFrame) {
+        layer.endFrame = Math.max(layer.startFrame + minLen, nextClip.startFrame);
+      }
+      return { startFrame: layer.startFrame, endFrame: layer.endFrame, snapInfo: res.snapInfo };
     }
 
     const mainSeq = this.getMainTrackClips(project);
@@ -1371,7 +1834,8 @@ export const TimelineEngine = {
     const len = Math.max(5, (layer.endFrame || 0) - oldStart);
     let changed = false;
 
-    if (targetRole === 'main' && (layer.type === 'video' || layer.type === 'image')) {
+    if (targetRole === 'main') {
+      if (layer.type !== 'video' && layer.type !== 'image') return false;
       layer.trackRole = 'main';
       if (!project.layers.some((l) => l.id === layer.id)) {
         project.layers.push(layer);
@@ -1384,7 +1848,7 @@ export const TimelineEngine = {
       if (project.settings?.rippleMode !== false) {
         this.reflowMainTrack(project, 0, nextSeq.map((c) => c.id));
       } else {
-        const nextS = Math.max(0, Math.round(targetStartFrame ?? oldStart));
+        const nextS = this.resolveNonOverlappingMainStart(project, layer.id, len, targetStartFrame ?? oldStart);
         layer.startFrame = nextS;
         layer.endFrame = nextS + len;
         this.shiftLayerKeyframes(layer, nextS - oldStart);
@@ -1423,7 +1887,9 @@ export const TimelineEngine = {
     }
 
     if (Number.isInteger(targetLayerIndex)) {
-      if (this.moveLayerToIndex(project, layer.id, targetLayerIndex)) {
+      const targetLayer = project.layers[targetLayerIndex];
+      const sameZone = targetLayer && ((layer.type === 'audio') === (targetLayer.type === 'audio'));
+      if (sameZone && this.moveLayerToIndex(project, layer.id, targetLayerIndex)) {
         this.normalizeTrackZOrder(project);
         changed = true;
       }
@@ -1512,15 +1978,29 @@ export const TimelineEngine = {
       return true;
     }
 
-    const total = Math.max(4, Math.min(120, Math.round(Number(totalDurationFrames) || 24)));
-    const half = Math.max(2, Math.round(total / 2));
+    // Center-pulled symmetric duration: split half into left outFrames and half into right inFrames
     const lenL = Math.max(4, (left.endFrame || 0) - (left.startFrame || 0));
     const lenR = Math.max(4, (right.endFrame || 0) - (right.startFrame || 0));
+    const maxPerSide = Math.max(2, Math.min(Math.floor(lenL * 0.45), Math.floor(lenR * 0.45)));
+    const total = Math.max(4, Math.min(maxPerSide * 2, Math.min(120, Math.round(Number(totalDurationFrames) || 24))));
+    const halfLeft = Math.floor(total / 2);
+    const halfRight = total - halfLeft;
     left.transitions.outType = typeId;
-    left.transitions.outFrames = Math.min(half, Math.max(2, Math.floor(lenL * 0.45)));
+    left.transitions.outFrames = Math.max(2, Math.min(maxPerSide, halfLeft));
     right.transitions.inType = typeId;
-    right.transitions.inFrames = Math.min(half, Math.max(2, Math.floor(lenR * 0.45)));
+    right.transitions.inFrames = Math.max(2, Math.min(maxPerSide, halfRight));
     return true;
+  },
+
+  resizeTransitionJunction(project, leftId, rightId, totalDurationFrames) {
+    if (!project || !Array.isArray(project.layers)) return false;
+    const left = project.layers.find((l) => l.id === leftId);
+    const right = project.layers.find((l) => l.id === rightId);
+    if (!left || !right) return false;
+    const activeType = (left.transitions?.outType && left.transitions.outType !== 'none')
+      ? left.transitions.outType
+      : (right.transitions?.inType && right.transitions.inType !== 'none' ? right.transitions.inType : 'crossfade');
+    return this.applyTransitionBetweenClips(project, leftId, rightId, activeType, totalDurationFrames);
   },
 
   applyTransitionToAllJunctions(project, typeId, totalDurationFrames = 24) {

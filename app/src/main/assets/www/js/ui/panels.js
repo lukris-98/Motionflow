@@ -54,6 +54,9 @@ export class PanelsUI {
     this.filterThumbCache = new Map();
     this._landscapeImg = null;
     this._landscapeImgState = 'idle';
+    this.selectedVfxId = null;
+    this.selectedSpeedPtIdx = 1;
+    this.beatSensitivity = 0.55;
   }
 
   _ensureLandscapeImageLoaded() {
@@ -361,7 +364,7 @@ export class PanelsUI {
         </div>
         <div class="d-flex flex-wrap gap-1">
           ${layer.type === 'video' ? `<button id="inspMotionTrack" class="btn btn-sm btn-outline-warning" title="Motion / Camera Track"><i class="bi bi-crosshair"></i></button>` : ''}
-          ${layer.type === 'video' ? `<button id="inspDetachAudio" class="btn btn-sm btn-outline-warning" title="Detach Audio Track"><i class="bi bi-music-note"></i></button>` : ''}
+          ${layer.type === 'video' ? `<button id="inspDetachAudio" class="btn btn-sm btn-outline-warning" title="Pisah Audio ke Track Bawah"><i class="bi bi-music-note"></i></button>` : ''}
           ${(layer.type === 'video' || layer.type === 'image') ? `<button id="inspFreeze" class="btn btn-sm btn-outline-info" title="Freeze Frame at Playhead"><i class="bi bi-snow"></i></button>` : ''}
           ${(layer.type === 'video' || layer.type === 'image' || layer.type === 'audio') ? `<button id="inspReplace" class="btn btn-sm btn-outline-light" title="Replace Clip Media"><i class="bi bi-arrow-left-right"></i></button>` : ''}
           ${layer.type === 'group' ? `<button id="inspUngroup" class="btn btn-sm btn-outline-warning" title="Ungroup Children"><i class="bi bi-diagram-2"></i></button>` : ''}
@@ -389,6 +392,7 @@ export class PanelsUI {
         <button id="inspRotPlus90" class="btn btn-xs btn-outline-light py-1 px-2"><i class="bi bi-arrow-clockwise me-1"></i>+90°</button>
         <button id="inspFlipX" class="btn btn-xs ${layer.flipX ? 'btn-info text-dark fw-semibold' : 'btn-outline-light'} py-1 px-2"><i class="bi bi-symmetry-vertical me-1"></i>Mirror H</button>
         <button id="inspFlipY" class="btn btn-xs ${layer.flipY ? 'btn-info text-dark fw-semibold' : 'btn-outline-light'} py-1 px-2"><i class="bi bi-symmetry-horizontal me-1"></i>Flip V</button>
+        ${(layer.type === 'video' || layer.type === 'image') ? `<button id="inspAutoReframe" class="btn btn-xs btn-outline-info py-1 px-2"><i class="bi bi-aspect-ratio me-1"></i>Auto Reframe</button>` : ''}
       </div>
 
       <div class="row g-2 mb-2">
@@ -469,6 +473,7 @@ export class PanelsUI {
     body.querySelector('#inspRotPlus90')?.addEventListener('click', () => this.app.rotateSelected90(90));
     body.querySelector('#inspFlipX')?.addEventListener('click', () => this.app.flipSelected('x'));
     body.querySelector('#inspFlipY')?.addEventListener('click', () => this.app.flipSelected('y'));
+    body.querySelector('#inspAutoReframe')?.addEventListener('click', () => this.app.autoReframeLayer(layer.id, 'smart'));
     body.querySelector('#inspMotionTrack')?.addEventListener('click', () => this.app.openTrackerUI(layer.id));
     body.querySelector('#inspDetachAudio')?.addEventListener('click', () => this.app.detachAudioFromSelected());
     body.querySelector('#inspFreeze')?.addEventListener('click', () => this.app.freezeSelectedFrame());
@@ -1009,6 +1014,342 @@ export class PanelsUI {
     });
   }
 
+  _speedVToY(v) {
+    const lv = Math.log2(Math.max(0.25, Math.min(5.0, Number(v) || 1)));
+    return 104 - ((lv + 2) / 4.321928) * 90;
+  }
+
+  _speedYToV(y) {
+    const norm = Math.max(0, Math.min(1, (104 - y) / 90));
+    const val = Math.pow(2, norm * 4.321928 - 2);
+    return Number(Math.max(0.25, Math.min(5.0, val)).toFixed(2));
+  }
+
+  _buildSpeedCurveSvgPaths(pts) {
+    const toX = (t) => 14 + Math.max(0, Math.min(1, t)) * 252;
+    const samples = [];
+    for (let i = 0; i <= 40; i++) {
+      const u = i / 40;
+      const v = TimelineEngine.evaluateCurveArrayFactor(pts, u);
+      samples.push([toX(u), this._speedVToY(v)]);
+    }
+    const lineD = samples.map(([x, y], idx) => `${idx === 0 ? 'M' : 'L'} ${x.toFixed(1)} ${y.toFixed(1)}`).join(' ');
+    const areaD = `${lineD} L ${samples[samples.length - 1][0].toFixed(1)} 106 L ${samples[0][0].toFixed(1)} 106 Z`;
+    return { lineD, areaD, toX };
+  }
+
+  renderSpeedCurveEditorHtml(layer) {
+    const curCurve = layer.speedCurve || 'none';
+    const hasCustom = Array.isArray(layer.customSpeedCurve) && layer.customSpeedCurve.length >= 2;
+    const pts = TimelineEngine.getLayerSpeedCurvePoints(layer);
+    const activeIdx = Math.max(0, Math.min(pts.length - 1, this.selectedSpeedPtIdx || 0));
+    const activePt = pts[activeIdx] || [0, 1];
+    const canDelPt = pts.length > 2 && activeIdx > 0 && activeIdx < pts.length - 1;
+    const { lineD, areaD, toX } = this._buildSpeedCurveSvgPaths(pts);
+    const y1x = this._speedVToY(1.0).toFixed(1);
+    const y2x = this._speedVToY(2.0).toFixed(1);
+    const y05x = this._speedVToY(0.5).toFixed(1);
+
+    const miniCurveSvg = (presetPts) => {
+      const d = presetPts.map(([t, v], idx) => {
+        const x = 4 + t * 56;
+        const y = 26 - Math.min(3, Math.max(0.2, v)) * 7.5;
+        return `${idx === 0 ? 'M' : 'L'} ${x.toFixed(1)} ${y.toFixed(1)}`;
+      }).join(' ');
+      return `<svg viewBox="0 0 64 28" style="width:60px;height:24px;display:block;margin:0 auto;"><path d="${d}" fill="none" stroke="#00e5ff" stroke-width="2" stroke-linecap="round"/></svg>`;
+    };
+
+    return `
+      <div>
+        <div class="d-flex justify-content-between align-items-center mb-1">
+          <label class="form-label small text-secondary mb-0">
+            <i class="bi bi-bezier2 text-info me-1"></i>Speed Curve ${hasCustom ? '<span class="badge bg-info text-dark ms-1" style="font-size:0.55rem;">Custom</span>' : ''}
+          </label>
+          <div class="d-flex align-items-center gap-1">
+            <span id="lblCurveActivePt" class="badge bg-dark border border-info-subtle text-info">${Number(activePt[1]).toFixed(2)}x @ ${Math.round(activePt[0] * 100)}%</span>
+            <button id="btnSpeedCurveDelPt" type="button" class="btn btn-xs btn-outline-warning py-0 px-2" ${canDelPt ? '' : 'disabled'}>Del Pt</button>
+            <button id="btnSpeedCurveReset" type="button" class="btn btn-xs btn-outline-secondary py-0 px-2">Reset 1x</button>
+          </div>
+        </div>
+        <div class="mf-speed-curve-editor mb-2">
+          <svg id="svgSpeedCurveEditor" viewBox="0 0 280 118" class="mf-speed-curve-svg">
+            <defs>
+              <linearGradient id="mfSpeedFill" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stop-color="#00e5ff" stop-opacity="0.34"/>
+                <stop offset="100%" stop-color="#00e5ff" stop-opacity="0.02"/>
+              </linearGradient>
+            </defs>
+            <line x1="14" y1="${y2x}" x2="266" y2="${y2x}" stroke="rgba(255,255,255,0.08)" stroke-width="1"/>
+            <line x1="14" y1="${y1x}" x2="266" y2="${y1x}" stroke="rgba(0,229,255,0.35)" stroke-dasharray="4 3" stroke-width="1"/>
+            <line x1="14" y1="${y05x}" x2="266" y2="${y05x}" stroke="rgba(255,255,255,0.08)" stroke-width="1"/>
+            <text x="2" y="${Number(y2x) + 3}" fill="#6e7f9c" font-size="7.5">2x</text>
+            <text x="2" y="${Number(y1x) + 3}" fill="#00e5ff" font-size="7.5">1x</text>
+            <text x="2" y="${Number(y05x) + 3}" fill="#6e7f9c" font-size="7.5">.5</text>
+            <path id="svgSpeedArea" d="${areaD}" fill="url(#mfSpeedFill)"/>
+            <path id="svgSpeedPath" d="${lineD}" fill="none" stroke="#00e5ff" stroke-width="2.4" stroke-linecap="round"/>
+            ${pts.map(([t, v], idx) => `
+              <circle class="mf-speed-pt" data-pt-idx="${idx}" cx="${toX(t).toFixed(1)}" cy="${this._speedVToY(v).toFixed(1)}"
+                r="${idx === activeIdx ? 6.5 : 5}"
+                fill="${idx === activeIdx ? '#ffffff' : '#00e5ff'}"
+                stroke="#071018" stroke-width="2" />
+            `).join('')}
+          </svg>
+          <div class="text-secondary d-flex justify-content-between px-1" style="font-size:0.62rem;">
+            <span>Geser titik untuk lengkungan Bezier halus</span>
+            <span>Tap garis untuk tambah titik</span>
+          </div>
+        </div>
+        <div class="d-flex gap-1 overflow-x-auto pb-1">
+          ${Object.entries(SPEED_CURVE_PRESETS).map(([key, preset]) => `
+            <button type="button" class="mf-speed-curve-card ${!hasCustom && curCurve === key ? 'active' : ''}" data-speed-curve="${key}">
+              ${miniCurveSvg(preset.pts)}
+              <div style="font-size:0.62rem;" class="text-light text-truncate">${preset.label}</div>
+            </button>
+          `).join('')}
+        </div>
+      </div>
+    `;
+  }
+
+  bindSpeedCurveEditorEvents(body, layer) {
+    body.querySelectorAll('[data-speed-curve]').forEach((btn) => {
+      btn.onclick = () => {
+        const curveId = btn.dataset.speedCurve;
+        const presetPts = SPEED_CURVE_PRESETS[curveId]?.pts || [[0, 1], [1, 1]];
+        this.selectedSpeedPtIdx = Math.min(1, presetPts.length - 1);
+        this.app.mutateProject(() => {
+          layer.speedCurve = curveId;
+          layer.customSpeedCurve = curveId === 'none' ? null : presetPts.map(([t, v]) => [t, v]);
+        });
+        this.app.showToast(`Speed Curve: ${SPEED_CURVE_PRESETS[curveId]?.label || curveId}`);
+      };
+    });
+
+    body.querySelector('#btnSpeedCurveReset')?.addEventListener('click', () => {
+      this.selectedSpeedPtIdx = 0;
+      this.app.mutateProject(() => {
+        layer.speedCurve = 'none';
+        layer.customSpeedCurve = null;
+      });
+      this.app.showToast('Speed Curve reset to 1.0x Normal');
+    });
+
+    body.querySelector('#btnSpeedCurveDelPt')?.addEventListener('click', () => {
+      const pts = TimelineEngine.getLayerSpeedCurvePoints(layer).map(([t, v]) => [t, v]);
+      const idx = this.selectedSpeedPtIdx;
+      if (pts.length <= 2 || idx <= 0 || idx >= pts.length - 1) return;
+      pts.splice(idx, 1);
+      this.selectedSpeedPtIdx = Math.max(0, idx - 1);
+      this.app.mutateProject(() => {
+        layer.speedCurve = 'custom';
+        layer.customSpeedCurve = pts;
+      });
+    });
+
+    const svg = body.querySelector('#svgSpeedCurveEditor');
+    if (!svg) return;
+
+    const clientToSvg = (e) => {
+      const rect = svg.getBoundingClientRect();
+      const sx = ((e.clientX - rect.left) / Math.max(1, rect.width)) * 280;
+      const sy = ((e.clientY - rect.top) / Math.max(1, rect.height)) * 118;
+      return { sx, sy };
+    };
+
+    const repaintSvgInPlace = (pts, activeIdx) => {
+      const { lineD, areaD, toX } = this._buildSpeedCurveSvgPaths(pts);
+      const pathEl = svg.querySelector('#svgSpeedPath');
+      const areaEl = svg.querySelector('#svgSpeedArea');
+      if (pathEl) pathEl.setAttribute('d', lineD);
+      if (areaEl) areaEl.setAttribute('d', areaD);
+      svg.querySelectorAll('.mf-speed-pt').forEach((c) => {
+        const idx = Number(c.dataset.ptIdx);
+        const pt = pts[idx];
+        if (!pt) return;
+        c.setAttribute('cx', toX(pt[0]).toFixed(1));
+        c.setAttribute('cy', this._speedVToY(pt[1]).toFixed(1));
+        c.setAttribute('r', idx === activeIdx ? '6.5' : '5');
+        c.setAttribute('fill', idx === activeIdx ? '#ffffff' : '#00e5ff');
+      });
+      const lbl = body.querySelector('#lblCurveActivePt');
+      const ap = pts[activeIdx];
+      if (lbl && ap) {
+        lbl.textContent = `${Number(ap[1]).toFixed(2)}x @ ${Math.round(ap[0] * 100)}%`;
+      }
+    };
+
+    let dragState = null;
+    svg.addEventListener('pointerdown', (e) => {
+      const ptEl = e.target.closest('.mf-speed-pt');
+      if (!ptEl) {
+        const { sx, sy } = clientToSvg(e);
+        const newT = Number(Math.max(0.04, Math.min(0.96, (sx - 14) / 252)).toFixed(3));
+        const newV = this._speedYToV(sy);
+        const pts = TimelineEngine.getLayerSpeedCurvePoints(layer).map(([t, v]) => [t, v]);
+        pts.push([newT, newV]);
+        pts.sort((a, b) => a[0] - b[0]);
+        this.selectedSpeedPtIdx = pts.findIndex((p) => p[0] === newT && p[1] === newV);
+        this.app.mutateProject(() => {
+          layer.speedCurve = 'custom';
+          layer.customSpeedCurve = pts;
+        });
+        return;
+      }
+      e.preventDefault();
+      e.stopPropagation();
+      const idx = Number(ptEl.dataset.ptIdx);
+      const pts = TimelineEngine.getLayerSpeedCurvePoints(layer).map(([t, v]) => [t, v]);
+      if (idx < 0 || idx >= pts.length) return;
+      this.selectedSpeedPtIdx = idx;
+      const prevState = {
+        speedCurve: layer.speedCurve || 'none',
+        customSpeedCurve: layer.customSpeedCurve ? layer.customSpeedCurve.map(([t, v]) => [t, v]) : null
+      };
+      dragState = { idx, pts, prevState, moved: false };
+      try { svg.setPointerCapture(e.pointerId); } catch {}
+    });
+
+    svg.addEventListener('pointermove', (e) => {
+      if (!dragState) return;
+      dragState.moved = true;
+      const { sx, sy } = clientToSvg(e);
+      const { idx, pts } = dragState;
+      let nextT = Math.max(0, Math.min(1, (sx - 14) / 252));
+      if (idx === 0) nextT = 0;
+      else if (idx === pts.length - 1) nextT = 1;
+      else {
+        const minT = pts[idx - 1][0] + 0.03;
+        const maxT = pts[idx + 1][0] - 0.03;
+        nextT = Math.max(minT, Math.min(maxT, nextT));
+      }
+      const nextV = this._speedYToV(sy);
+      pts[idx] = [Number(nextT.toFixed(3)), nextV];
+      layer.speedCurve = 'custom';
+      layer.customSpeedCurve = pts.map(([t, v]) => [t, v]);
+      repaintSvgInPlace(pts, idx);
+      this.app.renderPreview();
+    });
+
+    const endDrag = () => {
+      if (!dragState) return;
+      const { idx, pts, prevState, moved } = dragState;
+      dragState = null;
+      if (!moved) {
+        this.renderStylePanel();
+        return;
+      }
+      const finalPts = pts.map(([t, v]) => [t, v]);
+      layer.speedCurve = prevState.speedCurve;
+      layer.customSpeedCurve = prevState.customSpeedCurve;
+      this.selectedSpeedPtIdx = idx;
+      this.app.mutateProject(() => {
+        layer.speedCurve = 'custom';
+        layer.customSpeedCurve = finalPts;
+      });
+    };
+    svg.addEventListener('pointerup', endDrag);
+    svg.addEventListener('pointercancel', endDrag);
+  }
+
+  bindTransitionDragToSeam(rootEl, tileAttr) {
+    if (!rootEl) return;
+    rootEl.querySelectorAll(`[${tileAttr}]`).forEach((tile) => {
+      tile.addEventListener('pointerdown', (e) => {
+        if (e.target.closest('.mf-tile-add-btn')) return;
+        const typeId = tile.getAttribute(tileAttr);
+        if (!typeId || typeId === 'none') return;
+        const label = tile.querySelector('.mf-tile-label')?.textContent?.trim() || typeId;
+        const startX = e.clientX;
+        const startY = e.clientY;
+        const sheetEl = tile.closest('.offcanvas');
+        let dragging = false;
+        let ghost = null;
+        let hoveredBtn = null;
+
+        const clearHover = () => {
+          if (hoveredBtn) hoveredBtn.classList.remove('drop-hover');
+          hoveredBtn = null;
+        };
+
+        const cleanup = () => {
+          window.removeEventListener('pointermove', onMove);
+          window.removeEventListener('pointerup', onUp);
+          window.removeEventListener('pointercancel', onCancel);
+          clearHover();
+          if (ghost) { ghost.remove(); ghost = null; }
+          if (sheetEl) {
+            sheetEl.style.opacity = '';
+            sheetEl.style.pointerEvents = '';
+          }
+        };
+
+        const onMove = (ev) => {
+          const dx = ev.clientX - startX;
+          const dy = ev.clientY - startY;
+          if (!dragging) {
+            // Drag upward toward timeline or outside tile stage starts Drag-to-Seam mode
+            if (dy < -24 || Math.hypot(dx, dy) > 42) {
+              dragging = true;
+              ghost = document.createElement('div');
+              ghost.className = 'mf-trans-drag-ghost';
+              ghost.innerHTML = `<i class="bi bi-intersect me-1"></i>${this.esc(label)}`;
+              document.body.appendChild(ghost);
+              if (sheetEl) {
+                sheetEl.style.opacity = '0.26';
+                sheetEl.style.pointerEvents = 'none';
+              }
+            } else {
+              return;
+            }
+          }
+          if (ghost) {
+            ghost.style.left = `${ev.clientX}px`;
+            ghost.style.top = `${ev.clientY}px`;
+          }
+          const seams = [...document.querySelectorAll('.mf-trans-seam-btn')];
+          let nearest = null;
+          let bestDist = 44;
+          for (const s of seams) {
+            const r = s.getBoundingClientRect();
+            const cx = (r.left + r.right) * 0.5;
+            const cy = (r.top + r.bottom) * 0.5;
+            const d = Math.hypot(ev.clientX - cx, ev.clientY - cy);
+            if (d < bestDist) {
+              bestDist = d;
+              nearest = s;
+            }
+          }
+          if (hoveredBtn !== nearest) {
+            clearHover();
+            if (nearest) {
+              nearest.classList.add('drop-hover');
+              hoveredBtn = nearest;
+            }
+          }
+        };
+
+        const onUp = () => {
+          const dropSeam = hoveredBtn;
+          const wasDragging = dragging;
+          cleanup();
+          if (wasDragging && dropSeam) {
+            tile.dataset.suppressClickOnce = '1';
+            const leftId = dropSeam.dataset.leftId;
+            const rightId = dropSeam.dataset.rightId;
+            if (leftId && rightId) {
+              this.app.applyTransitionFromDrag(leftId, rightId, typeId);
+            }
+          }
+        };
+
+        const onCancel = () => cleanup();
+        window.addEventListener('pointermove', onMove);
+        window.addEventListener('pointerup', onUp);
+        window.addEventListener('pointercancel', onCancel);
+      });
+    });
+  }
+
   renderStylePanel() {
     const body = document.getElementById('styleBody');
     const layer = this.app.getSelectedLayer();
@@ -1291,7 +1632,6 @@ export class PanelsUI {
       `;
     } else if (layer.type === 'audio' || layer.type === 'video') {
       const ap = layer.audioProps || { volume: 1, fadeInFrames: 0, fadeOutFrames: 0, muted: false, voiceEffect: 'none', reduceNoise: false };
-      const curCurve = layer.speedCurve || 'none';
       const beatCount = Array.isArray(this.app.project.beatMarkers) ? this.app.project.beatMarkers.length : 0;
       const voiceEffects = [
         { id: 'none', label: 'Normal' },
@@ -1304,14 +1644,6 @@ export class PanelsUI {
         { id: 'megaphone', label: 'Megaphone' },
         { id: 'synth', label: 'Synth' }
       ];
-      const curveSvg = (pts) => {
-        const d = pts.map(([t, v], idx) => {
-          const x = 4 + t * 56;
-          const y = 26 - Math.min(3, Math.max(0.2, v)) * 7.5;
-          return `${idx === 0 ? 'M' : 'L'} ${x.toFixed(1)} ${y.toFixed(1)}`;
-        }).join(' ');
-        return `<svg viewBox="0 0 64 28" style="width:60px;height:24px;display:block;margin:0 auto;"><path d="${d}" fill="none" stroke="#00e5ff" stroke-width="2" stroke-linecap="round"/></svg>`;
-      };
       innerHtml = `
         <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-2">
           <div class="d-flex flex-wrap gap-2">
@@ -1336,7 +1668,7 @@ export class PanelsUI {
             <button id="btnToggleBeatMarker" class="btn btn-xs btn-outline-warning py-1 px-2"><i class="bi bi-music-note-list me-1"></i>Beat (${beatCount})</button>
             <button id="btnAutoBeatDetect" class="btn btn-xs btn-outline-info py-1 px-2" title="Auto-detect rhythm peaks"><i class="bi bi-activity me-1"></i>Auto Beat</button>
             ${layer.type === 'video' ? `<button id="btnStyleFreeze" class="btn btn-xs btn-outline-info py-1 px-2"><i class="bi bi-snow me-1"></i>Freeze</button>` : ''}
-            ${layer.type === 'video' ? `<button id="btnStyleDetachAudio" class="btn btn-xs btn-outline-warning py-1 px-2"><i class="bi bi-music-note me-1"></i>Extract</button>` : ''}
+            ${layer.type === 'video' ? `<button id="btnStyleDetachAudio" class="btn btn-xs btn-outline-warning py-1 px-2"><i class="bi bi-music-note me-1"></i>Pisah Audio</button>` : ''}
             <button id="btnStyleReplace" class="btn btn-xs btn-outline-light py-1 px-2"><i class="bi bi-arrow-left-right"></i></button>
           </div>
         </div>
@@ -1415,17 +1747,7 @@ export class PanelsUI {
             </div>
           `;
         })() : ''}
-        <div>
-          <label class="form-label small text-secondary mb-1">CapCut Speed Curve Preset</label>
-          <div class="d-flex gap-1 overflow-x-auto pb-1">
-            ${Object.entries(SPEED_CURVE_PRESETS).map(([key, preset]) => `
-              <button type="button" class="mf-speed-curve-card ${curCurve === key ? 'active' : ''}" data-speed-curve="${key}">
-                ${curveSvg(preset.pts)}
-                <div style="font-size:0.62rem;" class="text-light text-truncate">${preset.label}</div>
-              </button>
-            `).join('')}
-          </div>
-        </div>
+        ${this.renderSpeedCurveEditorHtml(layer)}
       `;
     } else {
       innerHtml = `<div class="text-secondary small py-3 text-center">Use Color/FX, Mask/Tr, Transform &amp; Keyframes tabs to style and animate this ${layer.type} layer.</div>`;
@@ -1654,13 +1976,7 @@ export class PanelsUI {
           this.app.showToast(`Voice Effect: ${btn.textContent.trim()}`);
         };
       });
-      body.querySelectorAll('[data-speed-curve]').forEach((btn) => {
-        btn.onclick = () => {
-          const curveId = btn.dataset.speedCurve;
-          this.app.mutateProject(() => { layer.speedCurve = curveId; });
-          this.app.showToast(`Speed Curve: ${SPEED_CURVE_PRESETS[curveId]?.label || curveId}`);
-        };
-      });
+      this.bindSpeedCurveEditorEvents(body, layer);
     }
   }
 
@@ -1728,7 +2044,16 @@ export class PanelsUI {
           </div>
         `}
       </div>
+      <div class="pt-2 mt-2 border-top border-secondary-subtle d-flex align-items-center justify-content-between gap-2">
+        <span class="small text-secondary fw-semibold"><i class="bi bi-crop text-info me-1"></i>Auto Reframe</span>
+        <div class="d-flex gap-1">
+          <button id="btnRatioReframeSmart" type="button" class="btn btn-xs btn-outline-info py-1 px-2">Smart Fit</button>
+          <button id="btnRatioReframeDynamic" type="button" class="btn btn-xs mf-btn-accent py-1 px-2">Dynamic Track</button>
+        </div>
+      </div>
     `;
+    body.querySelector('#btnRatioReframeSmart')?.addEventListener('click', () => this.app.autoReframeAllClips('smart'));
+    body.querySelector('#btnRatioReframeDynamic')?.addEventListener('click', () => this.app.autoReframeAllClips('dynamic'));
     body.querySelectorAll('[data-ratio]').forEach((btn) => {
       btn.onclick = () => {
         const [w, h] = btn.dataset.ratio.split('x').map(Number);
@@ -1814,7 +2139,44 @@ export class PanelsUI {
         <button id="btnFxReset" class="btn btn-xs btn-outline-secondary py-1 px-2 flex-shrink-0">Reset</button>
       </div>
 
-      ${activeSub === 'effects' ? `
+      ${activeSub === 'effects' ? (() => {
+        const vfxStack = Array.isArray(layer.vfxStack) && layer.vfxStack.length > 0
+          ? layer.vfxStack
+          : TimelineEngine.getActiveVfxList(layer);
+        const activeEntry = vfxStack.find((item) => item.id === this.selectedVfxId) || vfxStack[0] || vfx;
+        if (activeEntry?.id && vfxStack.some((x) => x.id === activeEntry.id)) {
+          this.selectedVfxId = activeEntry.id;
+        }
+        return `
+        <div class="d-flex align-items-center justify-content-between gap-2 mb-1">
+          <span class="small text-secondary">Tap tile = set FX · Tap <strong class="text-info">+</strong> = layer/stack FX (${vfxStack.filter((x) => x.enabled !== false && x.type !== 'none').length})</span>
+          ${!isAdjustment ? `<button id="btnAddAdjLayerQuick" type="button" class="btn btn-xs btn-outline-warning py-0 px-2 flex-shrink-0"><i class="bi bi-sliders2-vertical me-1"></i>+ Adj Layer</button>` : ''}
+        </div>
+        ${vfxStack.length > 0 ? `
+          <div class="d-flex flex-column gap-1 mb-2">
+            ${vfxStack.map((item, idx) => {
+              const meta = VIDEO_EFFECT_PRESETS.find((e) => e.id === item.type);
+              const isSel = activeEntry && activeEntry.id === item.id;
+              return `
+                <div class="mf-vfx-stack-item d-flex align-items-center justify-content-between gap-2 ${isSel ? 'border-info' : ''}" data-vfx-select="${item.id}" style="cursor:pointer;">
+                  <div class="d-flex align-items-center gap-2 min-w-0">
+                    <span class="badge ${item.enabled === false ? 'bg-secondary' : 'bg-info text-dark'}" style="font-size:0.6rem;">#${idx + 1}</span>
+                    <span class="small fw-semibold text-truncate ${item.enabled === false ? 'text-secondary text-decoration-line-through' : 'text-light'}">${this.esc(meta?.label || item.type)}</span>
+                    <span class="text-secondary" style="font-size:0.64rem;">${Math.round((item.intensity ?? 0.65) * 100)}%</span>
+                  </div>
+                  <div class="d-flex align-items-center gap-1 flex-shrink-0">
+                    <button type="button" class="btn btn-xs ${item.enabled === false ? 'btn-outline-secondary' : 'btn-outline-info'} py-0 px-1" data-vfx-toggle="${item.id}" title="Toggle Effect">
+                      <i class="bi ${item.enabled === false ? 'bi-eye-slash' : 'bi-eye'}"></i>
+                    </button>
+                    <button type="button" class="btn btn-xs btn-outline-danger py-0 px-1" data-vfx-del="${item.id}" title="Remove Effect">
+                      <i class="bi bi-x-lg"></i>
+                    </button>
+                  </div>
+                </div>
+              `;
+            }).join('')}
+          </div>
+        ` : ''}
         <div class="mf-cat-scroll mb-1">
           ${effectCats.map((c) => `
             <button type="button" class="btn btn-xs ${this.activeEffectCat === c.id ? 'btn-info text-dark fw-semibold' : 'btn-dark border-secondary-subtle'} py-0 px-2 text-nowrap" data-ef-cat="${c.id}">${c.label}</button>
@@ -1822,29 +2184,35 @@ export class PanelsUI {
         </div>
         <div class="mf-tile-grid mb-2">
           ${visibleVfx.map((ef) => `
-            <button type="button" class="mf-preview-tile ${(vfx.type || 'none') === ef.id ? 'active' : ''}" data-vfx-id="${ef.id}">
+            <div role="button" tabindex="0" class="mf-preview-tile ${ef.id !== 'none' ? 'has-add-btn' : ''} ${(activeEntry?.type || 'none') === ef.id ? 'active' : ''}" data-vfx-id="${ef.id}">
               <div class="mf-tile-stage">
                 <img src="${thumbSrc}" class="mf-tile-thumb" style="filter:${ef.css};" alt="${this.esc(ef.label)}" />
                 <span class="mf-tile-badge" style="color:${ef.accent};">${ef.badge}</span>
               </div>
               <div class="mf-tile-label">${ef.label}</div>
-            </button>
+              ${ef.id !== 'none' ? `
+                <button type="button" class="mf-tile-add-btn" data-vfx-add="${ef.id}" title="Stack ${ef.label} FX" aria-label="Stack ${ef.label}">
+                  <i class="bi bi-plus-lg"></i>
+                </button>
+              ` : ''}
+            </div>
           `).join('')}
         </div>
         <div class="row g-2 align-items-end">
           <div class="col-4">
-            <label class="form-label small text-secondary mb-0">Intensity (<span id="lblVfxInt">${Math.round((vfx.intensity ?? 0.75) * 100)}%</span>)</label>
-            <input id="vfxIntensity" type="range" min="0" max="1" step="0.05" class="form-range" value="${vfx.intensity ?? 0.75}" />
+            <label class="form-label small text-secondary mb-0">Intensity (<span id="lblVfxInt">${Math.round((activeEntry?.intensity ?? 0.75) * 100)}%</span>)</label>
+            <input id="vfxIntensity" type="range" min="0.05" max="1.2" step="0.05" class="form-range" value="${activeEntry?.intensity ?? 0.75}" />
           </div>
           <div class="col-4">
-            <label class="form-label small text-secondary mb-0">Speed (<span id="lblVfxSpd">${(vfx.speed ?? 1).toFixed(1)}x</span>)</label>
-            <input id="vfxSpeed" type="range" min="0.2" max="3" step="0.1" class="form-range" value="${vfx.speed ?? 1}" />
+            <label class="form-label small text-secondary mb-0">Speed (<span id="lblVfxSpd">${(activeEntry?.speed ?? 1).toFixed(1)}x</span>)</label>
+            <input id="vfxSpeed" type="range" min="0.2" max="3" step="0.1" class="form-range" value="${activeEntry?.speed ?? 1}" />
           </div>
           <div class="col-4">
             <button id="btnFxApplyAll" type="button" class="btn btn-xs btn-outline-info w-100 py-1">Apply to All</button>
           </div>
         </div>
-      ` : activeSub === 'filters' ? `
+      `;
+      })() : activeSub === 'filters' ? `
         <div class="mf-cat-scroll mb-1">
           ${filterCats.map((c) => `
             <button type="button" class="btn btn-xs ${this.activeFilterCat === c.id ? 'btn-info text-dark fw-semibold' : 'btn-dark border-secondary-subtle'} py-0 px-2 text-nowrap" data-flt-cat="${c.id}">${c.label}</button>
@@ -2103,19 +2471,100 @@ export class PanelsUI {
       };
     });
 
-    body.querySelectorAll('[data-vfx-id]').forEach((btn) => {
-      btn.onclick = () => {
-        const vid = btn.dataset.vfxId;
-        this.app.mutateProject(() => {
-          vfx.type = vid;
-          if (!vfx.intensity) vfx.intensity = 0.75;
-        });
-        this.app.showToast(`Effect: ${VIDEO_EFFECT_PRESETS.find((e) => e.id === vid)?.label || vid}`);
+    body.querySelector('#btnAddAdjLayerQuick')?.addEventListener('click', () => {
+      this.app.mutateProject(() => {
+        const adj = TimelineEngine.createAdjustmentLayer(this.app.project, this.app.currentFrame);
+        TimelineEngine.addLayer(this.app.project, adj);
+        TimelineEngine.normalizeTrackZOrder(this.app.project);
+        this.app.selectedLayerId = adj.id;
+      });
+      this.app.showToast('Added Adjustment Layer track');
+    });
+
+    body.querySelectorAll('[data-vfx-select]').forEach((row) => {
+      row.onclick = (e) => {
+        if (e.target.closest('[data-vfx-toggle]') || e.target.closest('[data-vfx-del]')) return;
+        this.selectedVfxId = row.dataset.vfxSelect;
+        this.renderStylePanel();
+      };
+    });
+    body.querySelectorAll('[data-vfx-toggle]').forEach((btn) => {
+      btn.onclick = (e) => {
+        e.stopPropagation();
+        this.app.mutateProject(() => TimelineEngine.toggleLayerVfx(layer, btn.dataset.vfxToggle));
+      };
+    });
+    body.querySelectorAll('[data-vfx-del]').forEach((btn) => {
+      btn.onclick = (e) => {
+        e.stopPropagation();
+        const delId = btn.dataset.vfxDel;
+        if (this.selectedVfxId === delId) this.selectedVfxId = null;
+        this.app.mutateProject(() => TimelineEngine.removeLayerVfx(layer, delId));
       };
     });
 
-    this.bindLiveRange(body.querySelector('#vfxIntensity'), body.querySelector('#lblVfxInt'), vfx, 'intensity', (v) => `${Math.round(v * 100)}%`);
-    this.bindLiveRange(body.querySelector('#vfxSpeed'), body.querySelector('#lblVfxSpd'), vfx, 'speed', (v) => `${v.toFixed(1)}x`);
+    body.querySelectorAll('[data-vfx-add]').forEach((btn) => {
+      btn.onclick = (e) => {
+        e.stopPropagation();
+        const vid = btn.dataset.vfxAdd;
+        let created = null;
+        this.app.mutateProject(() => {
+          created = TimelineEngine.addLayerVfx(layer, vid, 0.7, 1.0);
+        });
+        if (created) this.selectedVfxId = created.id;
+        this.app.showToast(`Layered FX: ${VIDEO_EFFECT_PRESETS.find((p) => p.id === vid)?.label || vid}`);
+      };
+    });
+
+    body.querySelectorAll('[data-vfx-id]').forEach((btn) => {
+      btn.onclick = (e) => {
+        if (e.target.closest('[data-vfx-add]')) return;
+        const vid = btn.dataset.vfxId;
+        this.app.mutateProject(() => {
+          if (vid === 'none') {
+            TimelineEngine.setPrimaryLayerVfx(layer, 'none');
+            this.selectedVfxId = null;
+          } else if (this.selectedVfxId && Array.isArray(layer.vfxStack) && layer.vfxStack.some((x) => x.id === this.selectedVfxId)) {
+            TimelineEngine.updateLayerVfx(layer, this.selectedVfxId, { type: vid, enabled: true });
+          } else {
+            const stack = TimelineEngine.setPrimaryLayerVfx(layer, vid, vfx.intensity || 0.75, vfx.speed || 1.0);
+            this.selectedVfxId = stack[0]?.id || null;
+          }
+        });
+        this.app.showToast(`Effect: ${VIDEO_EFFECT_PRESETS.find((p) => p.id === vid)?.label || vid}`);
+      };
+    });
+
+    const vfxTarget = (Array.isArray(layer.vfxStack) && layer.vfxStack.find((x) => x.id === this.selectedVfxId))
+      || (Array.isArray(layer.vfxStack) && layer.vfxStack[0])
+      || vfx;
+    const bindVfxSlider = (el, lblEl, key, fmt) => {
+      if (!el) return;
+      let startVal = vfxTarget[key];
+      let cap = false;
+      el.addEventListener('pointerdown', () => { if (!cap) { startVal = vfxTarget[key]; cap = true; } });
+      el.addEventListener('input', (e) => {
+        const val = Number(e.target.value);
+        if (lblEl) lblEl.textContent = fmt(val);
+        vfxTarget[key] = val;
+        if (vfxTarget !== vfx) vfx[key] = val;
+        this.app.renderPreview();
+      });
+      el.addEventListener('change', (e) => {
+        const nextVal = Number(e.target.value);
+        vfxTarget[key] = startVal;
+        cap = false;
+        this.app.mutateProject(() => {
+          if (vfxTarget?.id && Array.isArray(layer.vfxStack) && layer.vfxStack.some((x) => x.id === vfxTarget.id)) {
+            TimelineEngine.updateLayerVfx(layer, vfxTarget.id, { [key]: nextVal });
+          } else {
+            vfx[key] = nextVal;
+          }
+        });
+      });
+    };
+    bindVfxSlider(body.querySelector('#vfxIntensity'), body.querySelector('#lblVfxInt'), 'intensity', (v) => `${Math.round(v * 100)}%`);
+    bindVfxSlider(body.querySelector('#vfxSpeed'), body.querySelector('#lblVfxSpd'), 'speed', (v) => `${v.toFixed(1)}x`);
 
     body.querySelectorAll('[data-fx-preset]').forEach((btn) => {
       btn.onclick = () => {
@@ -2193,6 +2642,7 @@ export class PanelsUI {
     });
 
     body.querySelector('#btnFxReset')?.addEventListener('click', () => {
+      this.selectedVfxId = null;
       this.app.mutateProject(() => {
         layer.filterId = 'normal';
         layer.filterIntensity = 1;
@@ -2202,6 +2652,7 @@ export class PanelsUI {
           chromaEnabled: false, chromaColor: '#00FF00', chromaSimilarity: 0.35, chromaSmoothness: 0.12, chromaSpill: 0.5
         });
         vfx.type = 'none';
+        TimelineEngine.setPrimaryLayerVfx(layer, 'none');
         layer.blendMode = 'normal';
       });
     });
@@ -2391,6 +2842,11 @@ export class PanelsUI {
       };
     });
     this.bindTemplatePreviewTiles(body, '[data-tr-preview]', (tile, isPreviewing) => {
+      if (tile.dataset.suppressClickOnce === '1') {
+        delete tile.dataset.suppressClickOnce;
+        tile.classList.remove('is-previewing');
+        return;
+      }
       if (!isPreviewing) {
         this.app.stopTemplateLivePreview();
         return;
@@ -2404,6 +2860,7 @@ export class PanelsUI {
         target: { mode: this.activeTransSide, layerId: layer.id }
       });
     });
+    this.bindTransitionDragToSeam(body, 'data-tr-preview');
 
     body.querySelectorAll('[data-tr-pick]').forEach((btn) => {
       btn.onclick = (e) => {
@@ -2617,6 +3074,15 @@ export class PanelsUI {
             </button>
           </div>
         </div>
+        <div class="p-2 rounded bg-dark border border-secondary-subtle mt-1 d-flex align-items-center justify-content-between gap-2">
+          <div class="flex-grow-1">
+            <label class="form-label small text-secondary mb-0">Beat Sensitivity (<span id="lblBeatSens">${Math.round((this.beatSensitivity || 0.55) * 100)}%</span>)</label>
+            <input id="rngBeatSensitivity" type="range" min="0.2" max="0.95" step="0.05" class="form-range" value="${this.beatSensitivity || 0.55}" />
+          </div>
+          <button id="btnAudHubClearBeats" type="button" class="btn btn-xs btn-outline-danger py-1 px-2 flex-shrink-0" ${(this.app.project.beatMarkers?.length || 0) ? '' : 'disabled'}>
+            Clear (${this.app.project.beatMarkers?.length || 0})
+          </button>
+        </div>
       `}
     `;
 
@@ -2651,12 +3117,22 @@ export class PanelsUI {
       this.app.detachAudioFromSelected();
       this.app.hideOpenSheets();
     });
+    body.querySelector('#rngBeatSensitivity')?.addEventListener('input', (e) => {
+      this.beatSensitivity = Number(e.target.value) || 0.55;
+      const lbl = body.querySelector('#lblBeatSens');
+      if (lbl) lbl.textContent = `${Math.round(this.beatSensitivity * 100)}%`;
+    });
+    body.querySelector('#btnAudHubClearBeats')?.addEventListener('click', () => {
+      this.app.mutateProject(() => { this.app.project.beatMarkers = []; });
+      this.renderAudioToolsPanel();
+      this.app.showToast('Cleared beat markers');
+    });
     body.querySelector('#btnAudHubAutoBeats')?.addEventListener('click', async () => {
       const target = (sel && (sel.type === 'audio' || sel.type === 'video') && sel.mediaId)
         ? sel
         : this.app.project.layers.find((l) => (l.type === 'audio' || l.type === 'video') && l.mediaId);
       if (target) {
-        await this.app.autoDetectBeatsForLayer(target);
+        await this.app.autoDetectBeatsForLayer(target, this.beatSensitivity);
         this.app.hideOpenSheets();
       }
     });
@@ -2845,6 +3321,11 @@ export class PanelsUI {
     };
 
     this.bindTemplatePreviewTiles(body, '[data-tr-sheet-preview]', (tile, isPreviewing) => {
+      if (tile.dataset.suppressClickOnce === '1') {
+        delete tile.dataset.suppressClickOnce;
+        tile.classList.remove('is-previewing');
+        return;
+      }
       if (!isPreviewing) {
         this.app.stopTemplateLivePreview();
         return;
@@ -2858,6 +3339,7 @@ export class PanelsUI {
         target: { ...this.transitionTarget }
       });
     });
+    this.bindTransitionDragToSeam(body, 'data-tr-sheet-preview');
 
     body.querySelectorAll('[data-tr-apply]').forEach((btn) => {
       btn.onclick = (e) => {

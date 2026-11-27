@@ -1110,5 +1110,185 @@ test('Per-property keyframe lanes (position, scale, rotation, opacity, volume, c
   assert.equal(textLayer.keyframes.x.length, 2);
 });
 
+test('Stacked VFX + Adjustment Layer badges, custom speed curves, multi-select clipboard, cut points/markers, symmetric transitions, and auto-reframe', () => {
+  const proj = createEmptyProject('CapCutAudit', { width: 1080, height: 1920, fps: 30, durationSec: 12 });
+  const v1 = TimelineEngine.createMediaLayer(proj, { id: 'm1', name: 'Clip 1', type: 'video', width: 1920, height: 1080, durationMs: 4000 }, 0);
+  v1.trackRole = 'main';
+  v1.startFrame = 0;
+  v1.endFrame = 120;
+  const v2 = TimelineEngine.createMediaLayer(proj, { id: 'm2', name: 'Clip 2', type: 'video', width: 1920, height: 1080, durationMs: 4000 }, 120);
+  v2.trackRole = 'main';
+  v2.startFrame = 120;
+  v2.endFrame = 240;
+  const adj = TimelineEngine.createAdjustmentLayer(proj, 30);
+  adj.startFrame = 30;
+  adj.endFrame = 150;
+  TimelineEngine.addLayer(proj, v1);
+  TimelineEngine.addLayer(proj, v2);
+  TimelineEngine.addLayer(proj, adj);
 
+  // 1. Stacked VFX & numeric status badge on clip and adjustment layer
+  TimelineEngine.setPrimaryLayerVfx(v1, 'bloom', 0.8, 1.0);
+  const addedFx = TimelineEngine.addLayerVfx(v1, 'chromatic', 0.6, 1.2);
+  assert.ok(addedFx && addedFx.id);
+  v1.filterId = 'vivid';
+  assert.equal(TimelineEngine.countActiveEffects(v1), 3);
+
+  const badgesMulti = getClipStatusBadges(v1);
+  const fxBadge = badgesMulti.find((b) => b.kind === 'fx');
+  assert.ok(fxBadge && fxBadge.stacked === true && fxBadge.text === '3');
+
+  // Toggle & remove from stack
+  assert.equal(TimelineEngine.toggleLayerVfx(v1, addedFx.id), true);
+  assert.equal(TimelineEngine.countActiveEffects(v1), 2);
+  assert.equal(TimelineEngine.removeLayerVfx(v1, addedFx.id), true);
+  assert.equal(TimelineEngine.getActiveVfxList(v1).length, 1);
+
+  // Adjustment layer supports stacked effects & filter
+  TimelineEngine.setPrimaryLayerVfx(adj, 'crt', 0.5, 1.0);
+  TimelineEngine.addLayerVfx(adj, 'vignettePulse', 0.7, 1.5);
+  assert.equal(TimelineEngine.countActiveEffects(adj), 2);
+  const adjBadge = getClipStatusBadges(adj).find((b) => b.kind === 'fx');
+  assert.ok(adjBadge && adjBadge.stacked === true && adjBadge.text === '2');
+
+  // Copy/paste attributes preserves full stacked vfxStack
+  const attrs = TimelineEngine.copyAttributesFromLayer(v1);
+  assert.equal(TimelineEngine.pasteAttributesToLayer(v2, attrs), true);
+  assert.equal(v2.filterId, 'vivid');
+  assert.equal(TimelineEngine.getActiveVfxList(v2).length, 1);
+
+  // 2. Custom Speed Curve bezier points & monotonic integration
+  v1.speedCurve = 'custom';
+  v1.customSpeedCurve = [[0, 1.0], [0.25, 2.5], [0.6, 0.4], [1, 1.2]];
+  const pts = TimelineEngine.getLayerSpeedCurvePoints(v1);
+  assert.equal(pts.length, 4);
+  const midSpeed = TimelineEngine.evaluateLayerSpeedFactor(v1, 0.25);
+  assert.ok(midSpeed > 1.8 && midSpeed <= 2.6, `Expected curve peak near 2.5, got ${midSpeed}`);
+  let prevSrc = -1;
+  for (let f = 0; f <= 120; f += 10) {
+    const src = TimelineEngine.integrateSpeedCurveSourceFrames(v1, f);
+    assert.ok(src >= prevSrc, `Expected monotonic source frame at ${f}, got ${src} < ${prevSrc}`);
+    prevSrc = src;
+  }
+
+  // 3. Multi-select clipboard preserves relative frame offsets across selected layers
+  const txt = TimelineEngine.createTextLayer(proj, 40);
+  txt.startFrame = 40;
+  txt.endFrame = 100;
+  TimelineEngine.addLayer(proj, txt);
+  const clipboard = TimelineEngine.cloneLayersForClipboard(proj, [v1.id, txt.id]);
+  assert.equal(clipboard.length, 2);
+  const pasted = TimelineEngine.pasteLayersAtFrame(proj, clipboard, 200);
+  assert.equal(pasted.length, 2);
+  const pastedV = pasted.find((l) => l.name.startsWith('Clip 1'));
+  const pastedT = pasted.find((l) => l.type === 'text');
+  assert.equal(pastedV.startFrame, 200);
+  assert.equal(pastedT.startFrame, 240); // Preserved +40f offset!
+
+  // Splitting caption/text layer creates two independent contiguous text clips
+  const splitRight = TimelineEngine.splitClipAtFrame(proj, txt.id, 70);
+  assert.ok(splitRight);
+  assert.equal(txt.endFrame, 70);
+  assert.equal(splitRight.startFrame, 70);
+  assert.equal(splitRight.endFrame, 100);
+
+  // 4. Cut points & colored markers
+  const mkr = { id: 'mkr_test', frame: 85, color: '#38bdf8', label: 'Beat' };
+  proj.markers.push(mkr);
+  assert.equal(TimelineEngine.setMarkerColor(proj, 'mkr_test', '#f43f5e'), true);
+  assert.equal(mkr.color, '#f43f5e');
+  const cuts = TimelineEngine.getCutPointFrames(proj);
+  assert.ok(cuts.includes(0) && cuts.includes(70) && cuts.includes(85) && cuts.includes(120) && cuts.includes(240));
+  assert.equal(TimelineEngine.removeMarkerById(proj, 'mkr_test'), true);
+
+  // 5. Center-pulled symmetric transition + horizontal resize
+  assert.equal(TimelineEngine.applyTransitionBetweenClips(proj, v1.id, v2.id, 'crossfade', 30), true);
+  assert.equal(v1.transitions.outType, 'crossfade');
+  assert.equal(v2.transitions.inType, 'crossfade');
+  assert.equal(v1.transitions.outFrames, 15);
+  assert.equal(v2.transitions.inFrames, 15);
+  assert.equal(TimelineEngine.resizeTransitionJunction(proj, v1.id, v2.id, 40), true);
+  assert.equal(v1.transitions.outFrames, 20);
+  assert.equal(v2.transitions.inFrames, 20);
+
+  // 6. Auto Reframe fits 16:9 clip inside 9:16 canvas without black bars and supports dynamic pan
+  assert.equal(TimelineEngine.applyAutoReframe(proj, v1, 'dynamic'), true);
+  assert.ok(v1.transform.scaleX > 1.7, `Expected vertical cover scale > 1.7, got ${v1.transform.scaleX}`);
+  assert.ok(Array.isArray(v1.keyframes.x) && v1.keyframes.x.length >= 2);
+});
+
+test('3-zone track enforcement, magnetic Main Track (zero gaps when ON, free gaps when OFF), and audio detach', () => {
+  const proj = createEmptyProject('Zone & Magnet Rules');
+
+  // 1. Main Track strictly accepts ONLY video & image; text/shape/audio are routed to their respective zones
+  const txt = TimelineEngine.createTextLayer(proj, 0);
+  const shp = TimelineEngine.createShapeLayer(proj, 'circle', 0);
+  const aud = TimelineEngine.createMediaLayer(proj, { id: 'm_aud', name: 'BGM.mp3', type: 'audio', durationMs: 4000 }, 0);
+  TimelineEngine.addToMainTrack(proj, txt);
+  TimelineEngine.addToMainTrack(proj, shp);
+  TimelineEngine.addToMainTrack(proj, aud);
+  assert.equal(TimelineEngine.getMainTrackClips(proj).length, 0);
+  assert.equal(txt.trackRole, 'overlay');
+  assert.equal(shp.trackRole, 'overlay');
+  assert.equal(aud.trackRole, null);
+
+  // Attempting to drop text onto Main Track is rejected
+  assert.equal(TimelineEngine.dropLayerInTimeline(proj, txt.id, { targetRole: 'main', dragCenterFrame: 0 }), false);
+  assert.equal(txt.trackRole, 'overlay');
+
+  // 2. Adding 3 visual clips to Main Track with Magnet ON (default) keeps them tightly contiguous with zero gaps
+  const c1 = TimelineEngine.createMediaLayer(proj, { id: 'm1', name: 'Clip 1.mp4', type: 'video', durationMs: 3000, width: 1280, height: 720 }, 0);
+  const c2 = TimelineEngine.createMediaLayer(proj, { id: 'm2', name: 'Photo 2.jpg', type: 'image', durationMs: 2000, width: 1280, height: 720 }, 0);
+  const c3 = TimelineEngine.createMediaLayer(proj, { id: 'm3', name: 'Clip 3.mp4', type: 'video', durationMs: 2500, width: 1280, height: 720 }, 0);
+  TimelineEngine.addToMainTrack(proj, c1);
+  TimelineEngine.addToMainTrack(proj, c2);
+  TimelineEngine.addToMainTrack(proj, c3);
+
+  const mainOn = TimelineEngine.getMainTrackClips(proj);
+  assert.equal(mainOn.length, 3);
+  assert.equal(mainOn[0].startFrame, 0);
+  assert.equal(mainOn[1].startFrame, mainOn[0].endFrame);
+  assert.equal(mainOn[2].startFrame, mainOn[1].endFrame);
+
+  // 3. Z-order places overlays on top, Main Track in center, audio at bottom
+  const zones = proj.layers.map((l) => (l.type === 'audio' ? 'audio' : l.trackRole === 'main' ? 'main' : 'overlay'));
+  const firstMainIdx = zones.indexOf('main');
+  const lastMainIdx = zones.lastIndexOf('main');
+  const firstAudioIdx = zones.indexOf('audio');
+  assert.ok(zones.slice(0, firstMainIdx).every((z) => z === 'overlay'));
+  assert.ok(zones.slice(firstMainIdx, lastMainIdx + 1).every((z) => z === 'main'));
+  assert.ok(firstAudioIdx > lastMainIdx);
+  assert.ok(zones.slice(firstAudioIdx).every((z) => z === 'audio'));
+
+  // 4. Turning Magnet OFF allows creating empty space/gaps on Main Track without overlapping neighbors
+  proj.settings.rippleMode = false;
+  TimelineEngine.moveClip(proj, c3.id, c2.endFrame + 45, false, 0, 0);
+  assert.equal(c3.startFrame, c2.endFrame + 45);
+  // Attempting to drag c3 backwards into c2 while Magnet OFF prevents overlap on the single row
+  TimelineEngine.moveClip(proj, c3.id, c2.endFrame - 20, false, 0, 0);
+  assert.ok(c3.startFrame >= c2.endFrame || c3.endFrame <= c2.startFrame, 'Main Track clips should not overlap when Magnet is OFF');
+
+  // Re-enabling Magnet closes gaps immediately via reflowMainTrack
+  proj.settings.rippleMode = true;
+  TimelineEngine.reflowMainTrack(proj, 0);
+  const snappedMain = TimelineEngine.getMainTrackClips(proj);
+  assert.equal(snappedMain[0].startFrame, 0);
+  assert.equal(snappedMain[1].startFrame, snappedMain[0].endFrame);
+  assert.equal(snappedMain[2].startFrame, snappedMain[1].endFrame);
+
+  // 5. Detach Audio from video moves extracted audio to bottom Audio zone, copies speed curve, and mutes video
+  c1.speedCurve = 'custom';
+  c1.customSpeedCurve = [[0, 1.0], [0.5, 2.0], [1, 1.0]];
+  const detached = TimelineEngine.detachAudioFromVideo(proj, c1.id);
+  assert.ok(detached);
+  assert.equal(detached.type, 'audio');
+  assert.equal(detached.trackRole, null);
+  assert.equal(detached.startFrame, c1.startFrame);
+  assert.equal(detached.endFrame, c1.endFrame);
+  assert.equal(detached.speedCurve, 'custom');
+  assert.deepEqual(detached.customSpeedCurve, [[0, 1.0], [0.5, 2.0], [1, 1.0]]);
+  assert.equal(c1.audioProps.muted, true);
+  assert.equal(c1.audioDetached, true);
+  assert.ok(proj.layers.indexOf(detached) > proj.layers.indexOf(c1));
+});
 

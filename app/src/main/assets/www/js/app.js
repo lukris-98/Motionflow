@@ -33,6 +33,9 @@ class MotionFlowApp {
     this.customFonts = [];
     this.mediaMap = new Map();
     this.selectedLayerId = null;
+    this.selectedLayerIds = new Set();
+    this.copiedLayers = [];
+    this.shuttleRate = 0;
     this.importIntent = 'library';
     this.mediaPickerContext = null;
     this.currentFrame = 0;
@@ -55,6 +58,9 @@ class MotionFlowApp {
       document.getElementById('previewCanvas'),
       document.getElementById('overlayCanvas')
     );
+    this.renderer.onMediaFrameReady = () => {
+      if (!this.isPlaying) this.renderPreview();
+    };
     this.exportEngine = new ExportEngine(this.renderer, this.audioEngine);
     this.trackerEngine = new TrackerEngine(this.renderer);
     this.stabilizerEngine = new StabilizerEngine(this.renderer);
@@ -193,6 +199,13 @@ class MotionFlowApp {
       },
       onCloseMainGaps: () => this.closeMainTrackGaps(),
       onSnapBypassChange: (bypassed) => this.updateSnapButtonState(bypassed),
+      onToggleMultiSelectLayer: (id) => this.toggleMultiSelectLayer(id),
+      onMarqueeSelect: (ids) => this.setMarqueeSelection(ids),
+      onOpenClipContextMenu: (id, x, y) => this.openClipContextMenu(id, x, y),
+      onResizeTransitionJunction: (leftId, rightId, totalDurFrames) => {
+        this.mutateProject(() => TimelineEngine.resizeTransitionJunction(this.project, leftId, rightId, totalDurFrames));
+      },
+      onClickMarker: (markerObj, x, y) => this.openMarkerColorPopover(markerObj, x, y),
       getPlayheadFrame: () => this.currentFrame
     });
 
@@ -248,6 +261,7 @@ class MotionFlowApp {
 
     if (this.project.layers.length > 0) {
       this.selectedLayerId = this.project.layers[0].id;
+      this.selectedLayerIds = new Set([this.selectedLayerId]);
     }
 
     this.bindUIEvents();
@@ -290,6 +304,10 @@ class MotionFlowApp {
   }
 
   onTimelineMutated() {
+    TimelineEngine.normalizeTrackZOrder(this.project);
+    if (this.project?.settings?.rippleMode !== false && this.project?.layers?.some((l) => l.trackRole === 'main')) {
+      TimelineEngine.reflowMainTrack(this.project, 0);
+    }
     this.scheduleAutosave();
     this.updateAllUI();
   }
@@ -364,7 +382,10 @@ class MotionFlowApp {
 
     this.updateUndoRedoButtons();
     this.updateTransportLabels();
+    this.timelineView.selectedLayerIds = new Set(this.selectedLayerIds);
     this.timelineView.render(this.project, this.currentFrame, this.selectedLayerId, this.audioEngine, this.mediaMap);
+    const totalGroupCount = Math.max(this.timelineView.checkedLayerIds.size, this.selectedLayerIds.size);
+    document.getElementById('btnGroupChecked')?.classList.toggle('d-none', totalGroupCount < 2);
     this.renderPreview();
     this.panels.refreshAll();
     this.panels.renderRatioPanel();
@@ -372,7 +393,10 @@ class MotionFlowApp {
   }
 
   refreshTimelineOnly() {
+    this.timelineView.selectedLayerIds = new Set(this.selectedLayerIds);
     this.timelineView.render(this.project, this.currentFrame, this.selectedLayerId, this.audioEngine, this.mediaMap);
+    const totalGroupCount = Math.max(this.timelineView.checkedLayerIds.size, this.selectedLayerIds.size);
+    document.getElementById('btnGroupChecked')?.classList.toggle('d-none', totalGroupCount < 2);
   }
 
   updateTransportLabels() {
@@ -547,7 +571,11 @@ class MotionFlowApp {
     this.currentFrame = clamped;
     this.timelineView.updatePlayhead(this.currentFrame);
     this.updateTransportLabels();
-    await this.renderer.seekVideosForFrame(this.project, this.currentFrame, this.mediaMap, false);
+    if (this.isPlaying && this.shuttleRate > 0) {
+      this.renderer.syncVideoPlayback(this.project, this.currentFrame, this.mediaMap, true, this.shuttleRate);
+    } else {
+      await this.renderer.seekVideosForFrame(this.project, this.currentFrame, this.mediaMap, false);
+    }
     if (token !== this._seekVersion) return;
     this.renderPreview();
     if (this.isPlaying) {
@@ -567,17 +595,34 @@ class MotionFlowApp {
     }
   }
 
-  play() {
-    if (this.isPlaying) return;
+  play(rate = 1) {
+    const absRate = Math.max(1, Math.min(4, Math.abs(Number(rate) || 1)));
+    const dir = Number(rate) < 0 ? -1 : 1;
+    this.shuttleRate = dir * absRate;
+    if (this.isPlaying) {
+      if (this.shuttleRate !== 1) this.audioEngine.stopAll();
+      this.renderer.syncVideoPlayback(this.project, this.currentFrame, this.mediaMap, true, this.shuttleRate);
+      return;
+    }
     this.stopTemplateLivePreview({ skipRender: true });
-    if (this.currentFrame >= this.project.durationFrames) {
+    if (dir > 0 && this.currentFrame >= this.project.durationFrames) {
       this.currentFrame = 0;
+    } else if (dir < 0 && this.currentFrame <= 0) {
+      this.currentFrame = this.project.durationFrames;
     }
     this.isPlaying = true;
     const token = ++this.playToken;
     document.getElementById('iconPlayPause').className = 'bi bi-pause-fill';
     this.lastTickMs = performance.now();
-    this.audioEngine.startPlayback(this.project, this.currentFrame, this.mediaMap);
+    if (this.shuttleRate === 1) {
+      this.audioEngine.startPlayback(this.project, this.currentFrame, this.mediaMap);
+    }
+    if (this.shuttleRate > 0) {
+      this.renderer.syncVideoPlayback(this.project, this.currentFrame, this.mediaMap, true, this.shuttleRate);
+    } else {
+      this.renderer.seekVideosForFrame(this.project, this.currentFrame, this.mediaMap, false).catch(() => {});
+    }
+    this.renderPreview();
 
     const frameIntervalMs = 1000 / (this.project.fps || 30);
     let ticking = false;
@@ -591,16 +636,29 @@ class MotionFlowApp {
       if (elapsed >= frameIntervalMs) {
         ticking = true;
         try {
-          const advance = Math.min(6, Math.floor(elapsed / frameIntervalMs));
+          const advance = Math.min(6, Math.floor(elapsed / frameIntervalMs)) * this.shuttleRate;
           this.lastTickMs = now - (elapsed % frameIntervalMs);
           this.currentFrame += advance;
           if (this.currentFrame >= this.project.durationFrames) {
             this.currentFrame = 0;
-            this.audioEngine.startPlayback(this.project, 0, this.mediaMap);
+            if (this.shuttleRate === 1) {
+              this.audioEngine.startPlayback(this.project, 0, this.mediaMap);
+            }
+          } else if (this.currentFrame <= 0) {
+            this.currentFrame = 0;
+            this.pause();
+            this.timelineView.updatePlayhead(0);
+            this.updateTransportLabels();
+            this.renderPreview();
+            return;
           }
           this.timelineView.updatePlayhead(this.currentFrame);
           this.updateTransportLabels();
-          await this.renderer.seekVideosForFrame(this.project, this.currentFrame, this.mediaMap, false);
+          if (this.shuttleRate > 0) {
+            this.renderer.syncVideoPlayback(this.project, this.currentFrame, this.mediaMap, true, this.shuttleRate);
+          } else {
+            await this.renderer.seekVideosForFrame(this.project, this.currentFrame, this.mediaMap, false);
+          }
           if (!this.isPlaying || token !== this.playToken) return;
           this.renderPreview();
         } finally {
@@ -616,16 +674,60 @@ class MotionFlowApp {
 
   pause() {
     this.isPlaying = false;
+    this.shuttleRate = 0;
     this.playToken++;
     if (this.rafId) cancelAnimationFrame(this.rafId);
     this.rafId = null;
     this.audioEngine.stopAll();
+    this.renderer.syncVideoPlayback(this.project, this.currentFrame, this.mediaMap, false, 0);
     document.getElementById('iconPlayPause').className = 'bi bi-play-fill';
+    this.renderPreview();
+  }
+
+  setShuttlePlay(dir) {
+    if (dir === 0) {
+      this.pause();
+      this.showToast('Shuttle Pause (K)');
+      return;
+    }
+    const curDir = this.shuttleRate < 0 ? -1 : this.shuttleRate > 0 ? 1 : 0;
+    const curMag = Math.abs(this.shuttleRate || 0);
+    const nextMag = (this.isPlaying && curDir === dir)
+      ? (curMag >= 4 ? 1 : curMag === 2 ? 4 : 2)
+      : 1;
+    const nextRate = dir * nextMag;
+    this.play(nextRate);
+    this.showToast(`Shuttle ${nextRate > 0 ? `+${nextRate}x` : `${nextRate}x`}`);
+  }
+
+  jumpCutPoint(dir = 1) {
+    const cuts = TimelineEngine.getCutPointFrames(this.project);
+    if (!cuts.length) return;
+    const cur = Math.round(this.currentFrame);
+    let target = cur;
+    if (dir > 0) {
+      const next = cuts.find((f) => f > cur + 1);
+      target = next !== undefined ? next : cuts[cuts.length - 1];
+    } else {
+      for (let i = cuts.length - 1; i >= 0; i--) {
+        if (cuts[i] < cur - 1) {
+          target = cuts[i];
+          break;
+        }
+      }
+      if (target === cur) target = 0;
+    }
+    this.pause();
+    this.seekToFrame(target);
+    this.showToast(`Cut Point @ F${target}`);
   }
 
   selectLayer(layerId, opts = {}) {
     if (this.selectedLayerId === layerId && !opts.force) return;
     this.selectedLayerId = layerId;
+    if (!opts.preserveMulti) {
+      this.selectedLayerIds = layerId ? new Set([layerId]) : new Set();
+    }
     if (opts.skipTimelineRender) {
       this.updateTransportLabels();
       this.renderPreview();
@@ -635,6 +737,33 @@ class MotionFlowApp {
       return;
     }
     this.updateAllUI();
+  }
+
+  toggleMultiSelectLayer(layerId) {
+    if (!layerId) return;
+    if (!this.selectedLayerIds || this.selectedLayerIds.size === 0) {
+      this.selectedLayerIds = new Set(this.selectedLayerId ? [this.selectedLayerId] : []);
+    }
+    if (this.selectedLayerIds.has(layerId)) {
+      this.selectedLayerIds.delete(layerId);
+      if (this.selectedLayerId === layerId) {
+        this.selectedLayerId = [...this.selectedLayerIds][0] || null;
+      }
+    } else {
+      this.selectedLayerIds.add(layerId);
+      this.selectedLayerId = layerId;
+    }
+    this.updateAllUI();
+  }
+
+  setMarqueeSelection(ids) {
+    const clean = Array.isArray(ids) ? ids.filter((id) => this.project.layers.some((l) => l.id === id)) : [];
+    this.selectedLayerIds = new Set(clean);
+    this.selectedLayerId = clean[0] || null;
+    this.updateAllUI();
+    if (clean.length >= 2) {
+      this.showToast(`Selected ${clean.length} clips`);
+    }
   }
 
   toggleMute(layerId) {
@@ -923,6 +1052,21 @@ class MotionFlowApp {
   }
 
   duplicateSelectedLayer() {
+    const multiIds = [...(this.selectedLayerIds || [])].filter((id) => this.project.layers.some((l) => l.id === id));
+    if (multiIds.length > 1) {
+      const clones = TimelineEngine.cloneLayersForClipboard(this.project, multiIds);
+      const maxEnd = Math.max(...clones.map((l) => Number(l.endFrame) || 0));
+      let pasted = [];
+      this.mutateProject(() => {
+        pasted = TimelineEngine.pasteLayersAtFrame(this.project, clones, maxEnd);
+        if (pasted.length > 0) {
+          this.selectedLayerIds = new Set(pasted.map((l) => l.id));
+          this.selectedLayerId = pasted[0].id;
+        }
+      });
+      if (pasted.length > 0) this.showToast(`Duplicated ${pasted.length} clips`);
+      return;
+    }
     const layer = this.getSelectedLayer();
     if (!layer) return;
     this.mutateProject(() => {
@@ -932,8 +1076,52 @@ class MotionFlowApp {
           TimelineEngine.reflowMainTrack(this.project, 0);
         }
         this.selectedLayerId = copy.id;
+        this.selectedLayerIds = new Set([copy.id]);
       }
     });
+  }
+
+  copySelectedLayers() {
+    const ids = [...(this.selectedLayerIds || [])].filter((id) => this.project.layers.some((l) => l.id === id));
+    if (ids.length === 0 && this.selectedLayerId) ids.push(this.selectedLayerId);
+    if (ids.length === 0) return this.showToast('Select clip(s) to copy');
+    this.copiedLayers = TimelineEngine.cloneLayersForClipboard(this.project, ids);
+    this.showToast(`Copied ${this.copiedLayers.length} clip(s)`);
+  }
+
+  pasteCopiedLayers() {
+    if (!Array.isArray(this.copiedLayers) || this.copiedLayers.length === 0) {
+      return this.showToast('Clipboard empty — copy a clip first (Ctrl+C)');
+    }
+    let pasted = [];
+    this.mutateProject(() => {
+      pasted = TimelineEngine.pasteLayersAtFrame(this.project, this.copiedLayers, this.currentFrame);
+      if (pasted.length > 0) {
+        this.selectedLayerIds = new Set(pasted.map((l) => l.id));
+        this.selectedLayerId = pasted[0].id;
+      }
+    });
+    if (pasted.length > 0) {
+      this.showToast(`Pasted ${pasted.length} clip(s) @ F${this.currentFrame}`);
+    }
+  }
+
+  groupSelectedLayersAction() {
+    const checked = [...(this.timelineView?.checkedLayerIds || [])];
+    const selected = [...(this.selectedLayerIds || [])];
+    const ids = checked.length >= 2 ? checked : selected;
+    if (ids.length < 2) {
+      return this.showToast('Select 2+ clips (Marquee or Ctrl+Click) to Group');
+    }
+    this.mutateProject(() => {
+      const grp = TimelineEngine.groupSelectedLayers(this.project, ids);
+      if (grp) {
+        this.selectedLayerId = grp.id;
+        this.selectedLayerIds = new Set([grp.id]);
+      }
+      this.timelineView.checkedLayerIds.clear();
+    });
+    this.showToast(`Grouped ${ids.length} layers`);
   }
 
   deleteSelectedLayer() {
@@ -948,10 +1136,136 @@ class MotionFlowApp {
       } else {
         this.selectedLayerId = this.project.layers[0]?.id || null;
       }
+      this.selectedLayerIds = this.selectedLayerId ? new Set([this.selectedLayerId]) : new Set();
     });
     if (wasMain && this.project.settings?.rippleMode !== false) {
       this.showToast('Clip deleted & Main Track gap closed');
     }
+  }
+
+  closeFloatingPopovers() {
+    document.querySelectorAll('.mf-clip-context-menu, .mf-marker-popover').forEach((el) => el.remove());
+    this.timelineView?.closeTrackWheelMenu?.();
+    if (this._popoverDismissFn) {
+      window.removeEventListener('pointerdown', this._popoverDismissFn, true);
+      this._popoverDismissFn = null;
+    }
+  }
+
+  openClipContextMenu(layerId, clientX, clientY) {
+    this.closeFloatingPopovers();
+    const layer = this.project.layers.find((l) => l.id === layerId);
+    if (!layer) return;
+    const preserveMulti = this.selectedLayerIds?.has(layerId) && this.selectedLayerIds.size > 1;
+    this.selectLayer(layerId, { force: true, preserveMulti });
+
+    const menu = document.createElement('div');
+    menu.className = 'mf-clip-context-menu';
+
+    const items = [
+      { icon: 'bi-scissors text-info', label: 'Split', fn: () => this.splitSelectedAtPlayhead() },
+      { icon: 'bi-copy', label: 'Duplicate', fn: () => this.duplicateSelectedLayer() },
+      { icon: 'bi-clipboard', label: 'Copy Clip', fn: () => this.copySelectedLayers() },
+      { icon: 'bi-eyedropper text-info', label: 'Copy FX', fn: () => this.copySelectedStyle() },
+      ...(this.copiedClipStyle ? [{ icon: 'bi-clipboard-check text-warning', label: 'Paste FX', fn: () => this.pasteStyleToSelected() }] : []),
+      { icon: 'bi-stars text-info', label: 'Effects', fn: () => this.openSheet('sheetStyle', 'fx', 'effects') },
+      { icon: 'bi-intersect text-info', label: 'Transition', fn: () => this.openTransitionsSheet({ layerId: layer.id }) },
+      ...(layer.type === 'video'
+        ? [{ icon: 'bi-music-note text-warning', label: 'Pisah Audio', fn: () => this.detachAudioFromSelected() }]
+        : []),
+      ...(layer.type === 'video' || layer.type === 'audio'
+        ? [{ icon: 'bi-speedometer2 text-info', label: 'Speed Curve', fn: () => this.openSheet('sheetStyle', 'layer') }]
+        : []),
+      ...(layer.type === 'video' || layer.type === 'image'
+        ? [{ icon: 'bi-aspect-ratio text-info', label: 'Auto Reframe', fn: () => this.autoReframeLayer(layer.id, 'smart') }]
+        : []),
+      ...(this.selectedLayerIds.size >= 2
+        ? [{ icon: 'bi-collection text-warning', label: 'Group', fn: () => this.groupSelectedLayersAction() }]
+        : layer.type === 'group'
+          ? [{ icon: 'bi-diagram-2 text-warning', label: 'Ungroup', fn: () => { this.mutateProject(() => TimelineEngine.ungroupChildren(this.project, layer.id)); } }]
+          : []),
+      { icon: 'bi-trash', label: 'Delete', danger: true, fn: () => this.deleteSelectedLayer() }
+    ];
+
+    for (const item of items) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = `mf-ctx-btn${item.danger ? ' danger' : ''}`;
+      btn.innerHTML = `<i class="bi ${item.icon} fs-6"></i><span>${item.label}</span>`;
+      btn.onclick = (ev) => {
+        ev.stopPropagation();
+        this.closeFloatingPopovers();
+        item.fn();
+      };
+      menu.appendChild(btn);
+    }
+
+    document.body.appendChild(menu);
+    const mw = menu.offsetWidth || 240;
+    const mh = menu.offsetHeight || 200;
+    const left = Math.max(8, Math.min(window.innerWidth - mw - 8, clientX - mw * 0.5));
+    const top = Math.max(8, Math.min(window.innerHeight - mh - 8, clientY - mh - 14));
+    menu.style.left = `${Math.round(left)}px`;
+    menu.style.top = `${Math.round(top)}px`;
+
+    this._popoverDismissFn = (ev) => {
+      if (!menu.contains(ev.target)) {
+        this.closeFloatingPopovers();
+      }
+    };
+    setTimeout(() => {
+      if (this._popoverDismissFn) window.addEventListener('pointerdown', this._popoverDismissFn, true);
+    }, 60);
+  }
+
+  openMarkerColorPopover(markerObj, clientX, clientY) {
+    this.closeFloatingPopovers();
+    if (!markerObj) return;
+    const pop = document.createElement('div');
+    pop.className = 'mf-marker-popover';
+    const colors = ['#34d399', '#00e5ff', '#fbbf24', '#f472b6', '#a78bfa', '#f87171'];
+    pop.innerHTML = `
+      <div class="d-flex justify-content-between align-items-center gap-2 mb-2">
+        <span class="small fw-semibold text-light">${this.panels.esc(markerObj.label || 'Marker')} · F${markerObj.frame}</span>
+        <button type="button" class="btn btn-xs btn-outline-light py-0 px-2" data-mkr-jump>Jump</button>
+      </div>
+      <div class="d-flex align-items-center gap-2 mb-2">
+        ${colors.map((c) => `
+          <button type="button" class="mf-marker-color-dot ${(markerObj.color || '#34d399').toLowerCase() === c ? 'active' : ''}" style="background:${c};" data-mkr-col="${c}" aria-label="Color ${c}"></button>
+        `).join('')}
+      </div>
+      <button type="button" class="btn btn-xs btn-outline-danger w-100 py-1" data-mkr-del><i class="bi bi-trash me-1"></i>Delete Marker</button>
+    `;
+    document.body.appendChild(pop);
+    const pw = pop.offsetWidth || 210;
+    const ph = pop.offsetHeight || 115;
+    pop.style.left = `${Math.round(Math.max(8, Math.min(window.innerWidth - pw - 8, clientX - pw * 0.5)))}px`;
+    pop.style.top = `${Math.round(Math.max(8, Math.min(window.innerHeight - ph - 8, clientY + 12)))}px`;
+
+    pop.querySelector('[data-mkr-jump]').onclick = () => {
+      this.closeFloatingPopovers();
+      this.seekToFrame(markerObj.frame);
+    };
+    pop.querySelectorAll('[data-mkr-col]').forEach((dot) => {
+      dot.onclick = () => {
+        this.mutateProject(() => TimelineEngine.setMarkerColor(this.project, markerObj.id, dot.dataset.mkrCol));
+        this.closeFloatingPopovers();
+      };
+    });
+    pop.querySelector('[data-mkr-del]').onclick = () => {
+      this.mutateProject(() => TimelineEngine.removeMarkerById(this.project, markerObj.id));
+      this.closeFloatingPopovers();
+      this.showToast('Marker removed');
+    };
+
+    this._popoverDismissFn = (ev) => {
+      if (!pop.contains(ev.target)) {
+        this.closeFloatingPopovers();
+      }
+    };
+    setTimeout(() => {
+      if (this._popoverDismissFn) window.addEventListener('pointerdown', this._popoverDismissFn, true);
+    }, 60);
   }
 
   toggleRippleMode() {
@@ -1041,8 +1355,9 @@ class MotionFlowApp {
     });
     if (audioLayer) {
       this.selectedLayerId = audioLayer.id;
+      this.selectedLayerIds = new Set([audioLayer.id]);
       this.updateAllUI();
-      this.showToast('Detached audio to separate track');
+      this.showToast('Audio dipisahkan ke track bawah');
     }
   }
 
@@ -1288,6 +1603,20 @@ class MotionFlowApp {
     }
   }
 
+  applyTransitionFromDrag(leftId, rightId, typeId) {
+    if (!leftId || !rightId || !typeId) return;
+    const durF = Math.max(8, Math.round((this.project.fps || 30) * 0.8));
+    let applied = false;
+    this.mutateProject(() => {
+      applied = TimelineEngine.applyTransitionBetweenClips(this.project, leftId, rightId, typeId, durF);
+    });
+    if (applied) {
+      this.panels.transitionTarget = { mode: 'junction', leftId, rightId, layerId: leftId };
+      this.panels.renderTransitionsPanel();
+      this.showToast(`Applied "${typeId}" transition between clips`);
+    }
+  }
+
   applyTransitionToAllFromSheet(typeId, durationFrames) {
     const junctions = TimelineEngine.findTransitionJunctions(this.project);
     if (junctions.length === 0) {
@@ -1503,15 +1832,49 @@ class MotionFlowApp {
   }
 
   pasteStyleToSelected() {
-    const layer = this.getSelectedLayer();
     if (!this.copiedClipStyle) return this.showToast('Copy a clip style first');
-    if (!layer || layer.type === 'audio' || layer.type === 'group') {
-      return this.showToast('Select a target visual clip');
+    const selectedIds = [...(this.selectedLayerIds || [])];
+    if (selectedIds.length === 0 && this.selectedLayerId) selectedIds.push(this.selectedLayerId);
+    const targets = this.project.layers.filter(
+      (l) => selectedIds.includes(l.id) && l.type !== 'audio' && l.type !== 'group'
+    );
+    if (targets.length === 0) {
+      return this.showToast('Select target visual clip(s)');
     }
     this.mutateProject(() => {
-      TimelineEngine.pasteAttributesToLayer(layer, this.copiedClipStyle);
+      targets.forEach((t) => TimelineEngine.pasteAttributesToLayer(t, this.copiedClipStyle));
     });
-    this.showToast(`Pasted style to "${layer.name}"`);
+    this.showToast(
+      targets.length > 1
+        ? `Pasted attributes to ${targets.length} clips`
+        : `Pasted style to "${targets[0].name}"`
+    );
+  }
+
+  autoReframeLayer(layerId, mode = 'smart') {
+    const layer = this.project.layers.find((l) => l.id === layerId);
+    if (!layer) return this.showToast('Select a visual clip first');
+    let ok = false;
+    this.mutateProject(() => {
+      ok = TimelineEngine.applyAutoReframe(this.project, layer, mode);
+    });
+    if (ok) {
+      this.showToast(`Auto Reframed "${layer.name}" (${this.project.width}×${this.project.height})`);
+    }
+  }
+
+  autoReframeAllClips(mode = 'smart') {
+    const visuals = this.project.layers.filter(
+      (l) => l.type === 'video' || l.type === 'image' || l.type === 'text' || l.type === 'shape'
+    );
+    if (visuals.length === 0) return this.showToast('No visual clips to reframe');
+    let count = 0;
+    this.mutateProject(() => {
+      for (const l of visuals) {
+        if (TimelineEngine.applyAutoReframe(this.project, l, mode)) count++;
+      }
+    });
+    this.showToast(`Auto Reframed ${count} clip(s) (${mode})`);
   }
 
   applyFilterAndAdjustToAllClips(sourceLayer) {
@@ -1559,14 +1922,14 @@ class MotionFlowApp {
     window.AndroidBridge.synthesizeTts(clean, voiceStyle);
   }
 
-  async autoDetectBeatsForLayer(layer) {
+  async autoDetectBeatsForLayer(layer, sensitivity = 0.55) {
     if (!layer || (layer.type !== 'audio' && layer.type !== 'video') || !layer.mediaId) {
       return this.showToast('Select an Audio or Video clip with sound first');
     }
     const mediaItem = this.mediaMap.get(layer.mediaId);
     if (!mediaItem) return this.showToast('Media source missing');
     this.showToast('Analyzing waveform beats...');
-    const beats = await this.audioEngine.detectBeatsForLayer(layer, mediaItem, this.project.fps || 30, 0.55);
+    const beats = await this.audioEngine.detectBeatsForLayer(layer, mediaItem, this.project.fps || 30, sensitivity);
     if (!beats || beats.length === 0) {
       return this.showToast('No strong beat peaks detected');
     }
@@ -1575,6 +1938,69 @@ class MotionFlowApp {
       this.project.beatMarkers = [...merged].sort((a, b) => a - b);
     });
     this.showToast(`Added ${beats.length} auto beat markers`);
+  }
+
+  async populateAutoBeatCaptionsSrt() {
+    const fps = Math.max(1, this.project.fps || 30);
+    let beats = [...(this.project.beatMarkers || [])].sort((a, b) => a - b);
+    if (beats.length < 2) {
+      const sndLayer = this.project.layers.find((l) => (l.type === 'audio' || l.type === 'video') && l.mediaId);
+      if (sndLayer) {
+        const mediaItem = this.mediaMap.get(sndLayer.mediaId);
+        if (mediaItem) {
+          const detected = await this.audioEngine.detectBeatsForLayer(sndLayer, mediaItem, fps, this.panels.beatSensitivity || 0.55);
+          if (detected?.length >= 2) {
+            beats = detected;
+            this.mutateProject(() => {
+              const merged = new Set([...(this.project.beatMarkers || []), ...detected]);
+              this.project.beatMarkers = [...merged].sort((a, b) => a - b);
+            });
+          }
+        }
+      }
+    }
+
+    const fmtSrt = (frame) => {
+      const msTotal = Math.max(0, Math.round((frame / fps) * 1000));
+      const h = Math.floor(msTotal / 3600000);
+      const m = Math.floor((msTotal % 3600000) / 60000);
+      const s = Math.floor((msTotal % 60000) / 1000);
+      const ms = msTotal % 1000;
+      const pad = (n, len = 2) => String(n).padStart(len, '0');
+      return `${pad(h)}:${pad(m)}:${pad(s)},${pad(ms, 3)}`;
+    };
+
+    const cues = [];
+    if (beats.length >= 2) {
+      const step = beats.length > 16 ? 2 : 1;
+      for (let i = 0; i < beats.length; i += step) {
+        const sf = beats[i];
+        const nextF = beats[Math.min(beats.length - 1, i + step)];
+        const ef = Math.max(sf + Math.round(fps * 0.6), Math.min(sf + Math.round(fps * 2.2), nextF > sf ? nextF - 2 : sf + fps));
+        cues.push({ sf, ef, text: `Beat Caption ${cues.length + 1}` });
+      }
+    } else {
+      const visuals = TimelineEngine.getMainTrackClips(this.project);
+      if (visuals.length > 0) {
+        visuals.forEach((v, idx) => {
+          cues.push({ sf: v.startFrame, ef: Math.max(v.startFrame + 15, v.endFrame - 2), text: `${v.name || `Scene ${idx + 1}`}` });
+        });
+      } else {
+        const total = Math.max(fps * 2, this.project.durationFrames || fps * 6);
+        const step = Math.round(fps * 2);
+        for (let f = 0; f < total && cues.length < 12; f += step) {
+          cues.push({ sf: f, ef: Math.min(total, f + step - 2), text: `Caption ${cues.length + 1}` });
+        }
+      }
+    }
+
+    const srtText = cues
+      .slice(0, 24)
+      .map((c, idx) => `${idx + 1}\n${fmtSrt(c.sf)} --> ${fmtSrt(c.ef)}\n${c.text}`)
+      .join('\n\n');
+    const box = document.getElementById('txtBatchCaptions');
+    if (box) box.value = srtText;
+    this.showToast(`Auto-generated ${Math.min(24, cues.length)} synced caption cues — edit text or tap Generate Captions`);
   }
 
   async applyAutoEditTemplate(templateId) {
@@ -1588,6 +2014,7 @@ class MotionFlowApp {
       count = TimelineEngine.autoEditArrangeClips(this.project, this.mediaItems, templateId);
       const firstVis = this.project.layers.find((l) => l.type !== 'audio');
       this.selectedLayerId = firstVis ? firstVis.id : null;
+      this.selectedLayerIds = this.selectedLayerId ? new Set([this.selectedLayerId]) : new Set();
     });
     this.hideOpenSheets();
     await this.seekToFrame(0);
@@ -1617,10 +2044,13 @@ class MotionFlowApp {
         TimelineEngine.addLayer(this.project, layer);
         lastId = layer.id;
       }
-      if (lastId) this.selectedLayerId = lastId;
+      if (lastId) {
+        this.selectedLayerId = lastId;
+        this.selectedLayerIds = new Set([lastId]);
+      }
     });
     bootstrap.Modal.getInstance(document.getElementById('modalCaptions'))?.hide();
-    this.showToast(`Generated ${cues.length} timed caption clip(s)`);
+    this.showToast(`Generated ${cues.length} timed caption clip(s) (splittable)`);
   }
 
   async openCutoutBrushForSelected() {
@@ -1827,7 +2257,7 @@ class MotionFlowApp {
         commonTransform,
         commonCopyStyle,
         ...(commonPasteStyle ? [commonPasteStyle] : []),
-        ['bi-music-note text-warning', 'Extract', () => this.detachAudioFromSelected()],
+        ['bi-music-note text-warning', 'Pisah Audio', () => this.detachAudioFromSelected()],
         ['bi-arrow-left-right', 'Replace', () => this.replaceSelectedClip()],
         ['bi-arrow-counterclockwise', 'Reverse', () => {
           this.mutateProject(() => { layer.reversed = !layer.reversed; });
@@ -2874,16 +3304,7 @@ class MotionFlowApp {
       this.stopTemplateLivePreview();
     });
 
-    document.getElementById('btnGroupChecked').onclick = () => {
-      const ids = [...this.timelineView.checkedLayerIds];
-      if (ids.length < 2) return;
-      this.mutateProject(() => {
-        const grp = TimelineEngine.groupSelectedLayers(this.project, ids);
-        if (grp) this.selectedLayerId = grp.id;
-        this.timelineView.checkedLayerIds.clear();
-      });
-      this.showToast(`Grouped ${ids.length} layers`);
-    };
+    document.getElementById('btnGroupChecked').onclick = () => this.groupSelectedLayersAction();
 
     // Top Toolbar
     document.getElementById('btnProjects').onclick = async () => {
@@ -2896,7 +3317,7 @@ class MotionFlowApp {
         this.mutateProject(() => { this.project.name = next.trim(); });
       }
     };
-    document.getElementById('btnUndo').onclick = () => {
+    this.undoAction = () => {
       const prev = this.history.undo(this.project);
       if (prev) {
         this.project = prev;
@@ -2904,11 +3325,12 @@ class MotionFlowApp {
         if (this.selectedLayerId && !this.project.layers.some((l) => l.id === this.selectedLayerId)) {
           this.selectedLayerId = this.project.layers[0]?.id || null;
         }
+        this.selectedLayerIds = this.selectedLayerId ? new Set([this.selectedLayerId]) : new Set();
         this.scheduleAutosave();
         this.updateAllUI();
       }
     };
-    document.getElementById('btnRedo').onclick = () => {
+    this.redoAction = () => {
       const next = this.history.redo(this.project);
       if (next) {
         this.project = next;
@@ -2916,10 +3338,13 @@ class MotionFlowApp {
         if (this.selectedLayerId && !this.project.layers.some((l) => l.id === this.selectedLayerId)) {
           this.selectedLayerId = this.project.layers[0]?.id || null;
         }
+        this.selectedLayerIds = this.selectedLayerId ? new Set([this.selectedLayerId]) : new Set();
         this.scheduleAutosave();
         this.updateAllUI();
       }
     };
+    document.getElementById('btnUndo').onclick = () => this.undoAction();
+    document.getElementById('btnRedo').onclick = () => this.redoAction();
 
     // Project Settings
     document.getElementById('btnProjectSettings').onclick = () => {
@@ -3002,14 +3427,79 @@ class MotionFlowApp {
     window.addEventListener('keydown', (e) => {
       const tag = e.target?.tagName;
       if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || e.target?.isContentEditable) return;
-      if (e.altKey || e.ctrlKey || e.metaKey) return;
       const key = String(e.key || '').toLowerCase();
-      if (key === 'm') {
+      if (e.ctrlKey || e.metaKey) {
+        if (e.altKey) return;
+        if (key === 'z' && e.shiftKey) {
+          e.preventDefault();
+          this.redoAction();
+        } else if (key === 'z') {
+          e.preventDefault();
+          this.undoAction();
+        } else if (key === 'y') {
+          e.preventDefault();
+          this.redoAction();
+        } else if (key === 'c') {
+          e.preventDefault();
+          this.copySelectedLayers();
+        } else if (key === 'v') {
+          e.preventDefault();
+          this.pasteCopiedLayers();
+        } else if (key === 'd') {
+          e.preventDefault();
+          this.duplicateSelectedLayer();
+        } else if (key === 'g') {
+          e.preventDefault();
+          this.groupSelectedLayersAction();
+        }
+        return;
+      }
+      if (e.altKey) return;
+      if (key === ' ') {
+        e.preventDefault();
+        this.togglePlay();
+      } else if (key === 'j') {
+        e.preventDefault();
+        this.setShuttlePlay(-1);
+      } else if (key === 'k') {
+        e.preventDefault();
+        this.setShuttlePlay(0);
+      } else if (key === 'l') {
+        e.preventDefault();
+        this.setShuttlePlay(1);
+      } else if (key === 'arrowup') {
+        e.preventDefault();
+        this.jumpCutPoint(-1);
+      } else if (key === 'arrowdown') {
+        e.preventDefault();
+        this.jumpCutPoint(1);
+      } else if (key === 'home') {
+        e.preventDefault();
+        this.seekToFrame(0);
+      } else if (key === 'end') {
+        e.preventDefault();
+        this.seekToFrame(this.project.durationFrames);
+      } else if (key === 'm') {
         e.preventDefault();
         this.toggleMarkerAtPlayhead();
       } else if (key === 'b') {
         e.preventDefault();
         this.toggleBeatAtPlayhead();
+      } else if (key === 'z' && e.shiftKey) {
+        e.preventDefault();
+        this.timelineView.zoomToFit(this.project);
+        this.refreshTimelineOnly();
+      } else if (key === '+' || key === '=') {
+        e.preventDefault();
+        this.timelineView.zoomIn(this.currentFrame);
+        this.refreshTimelineOnly();
+      } else if (key === '-') {
+        e.preventDefault();
+        this.timelineView.zoomOut(this.currentFrame);
+        this.refreshTimelineOnly();
+      } else if (key === 'delete' || key === 'backspace') {
+        e.preventDefault();
+        this.deleteSelectedLayer();
       }
     });
     document.getElementById('btnToggleRipple')?.addEventListener('click', () => {
@@ -3017,6 +3507,11 @@ class MotionFlowApp {
     });
     document.getElementById('btnZoomIn').onclick = () => { this.timelineView.zoomIn(this.currentFrame); this.refreshTimelineOnly(); };
     document.getElementById('btnZoomOut').onclick = () => { this.timelineView.zoomOut(this.currentFrame); this.refreshTimelineOnly(); };
+    document.getElementById('btnZoomFit')?.addEventListener('click', () => {
+      this.timelineView.zoomToFit(this.project);
+      this.refreshTimelineOnly();
+      this.showToast('Zoomed timeline to fit clips');
+    });
     window.addEventListener('resize', () => {
       this.timelineView.redrawRulerOnly();
       this.renderPreview();
@@ -3095,6 +3590,9 @@ class MotionFlowApp {
       const txt = await f.text();
       const box = document.getElementById('txtBatchCaptions');
       if (box) box.value = txt;
+    });
+    document.getElementById('btnAutoBeatCaptions')?.addEventListener('click', () => {
+      this.populateAutoBeatCaptionsSrt();
     });
     document.getElementById('btnApplyBatchCaptions')?.addEventListener('click', () => {
       const raw = document.getElementById('txtBatchCaptions')?.value || '';

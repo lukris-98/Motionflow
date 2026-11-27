@@ -169,7 +169,8 @@ export class AudioEngine {
     const fps = Math.max(1, Number(projectFps) || 30);
     const totalTimelineFrames = Math.max(1, ((layer?.endFrame ?? fps) - (layer?.startFrame ?? 0)));
     const baseSpeed = Math.max(0.25, Math.min(4.0, Number(layer?.speed) || 1));
-    const hasCurve = Boolean(layer?.speedCurve && layer.speedCurve !== 'none');
+    const hasCustomCurve = Array.isArray(layer?.customSpeedCurve) && layer.customSpeedCurve.length >= 2;
+    const hasCurve = hasCustomCurve || Boolean(layer?.speedCurve && layer.speedCurve !== 'none');
     const baseOffsetSec = Math.max(0, (Number(layer?.mediaOffsetFrames) || 0) / fps);
     const isReversed = Boolean(layer?.reversed);
 
@@ -191,7 +192,7 @@ export class AudioEngine {
       const dLocalFrames = ((eFrac - sFrac) * totalTimelineFrames) / safeBins;
       for (let k = 1; k <= safeBins; k++) {
         const midNormT = sFrac + ((k - 0.5) / safeBins) * (eFrac - sFrac);
-        const factor = TimelineEngine.evaluateSpeedCurveFactor(layer.speedCurve, midNormT);
+        const factor = TimelineEngine.evaluateLayerSpeedFactor(layer, midNormT);
         curElapsedSec += (factor * baseSpeed * dLocalFrames) / fps;
         timesSec[k] = isReversed ? (windowEnd - curElapsedSec) : (baseOffsetSec + curElapsedSec);
       }
@@ -405,10 +406,11 @@ export class AudioEngine {
 
   _scheduleSpeedCurve(src, layer, playFromFrame, startAtSec, fps) {
     const baseSpeed = Math.max(0.25, Math.min(4.0, layer.speed || 1));
-    if (layer.speedCurve && layer.speedCurve !== 'none') {
+    const hasCustom = Array.isArray(layer?.customSpeedCurve) && layer.customSpeedCurve.length >= 2;
+    if (hasCustom || (layer.speedCurve && layer.speedCurve !== 'none')) {
       const durFrames = Math.max(1, layer.endFrame - layer.startFrame);
       const startNorm = Math.max(0, Math.min(1, (playFromFrame - layer.startFrame) / durFrames));
-      const startRate = Math.max(0.25, Math.min(4.0, baseSpeed * TimelineEngine.evaluateSpeedCurveFactor(layer.speedCurve, startNorm)));
+      const startRate = Math.max(0.25, Math.min(4.0, baseSpeed * TimelineEngine.evaluateLayerSpeedFactor(layer, startNorm)));
       src.playbackRate.setValueAtTime(startRate, startAtSec);
       const steps = 16;
       const remFrames = Math.max(1, layer.endFrame - playFromFrame);
@@ -416,7 +418,7 @@ export class AudioEngine {
         const f = playFromFrame + (remFrames * s) / steps;
         const normT = Math.max(0, Math.min(1, (f - layer.startFrame) / durFrames));
         const tSec = startAtSec + (f - playFromFrame) / fps;
-        const r = Math.max(0.25, Math.min(4.0, baseSpeed * TimelineEngine.evaluateSpeedCurveFactor(layer.speedCurve, normT)));
+        const r = Math.max(0.25, Math.min(4.0, baseSpeed * TimelineEngine.evaluateLayerSpeedFactor(layer, normT)));
         src.playbackRate.linearRampToValueAtTime(r, tSec);
       }
     } else {

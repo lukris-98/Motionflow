@@ -151,34 +151,18 @@ export function getClipStatusBadges(layer) {
     const cleanSpd = Number(spd.toFixed(2));
     badges.push({ kind: 'speed', text: `×${cleanSpd}`, title: `Speed ${cleanSpd}x` });
   }
-  if (layer.speedCurve && layer.speedCurve !== 'none') {
-    badges.push({ kind: 'curve', icon: 'bi-lightning-fill', title: `Speed Curve (${layer.speedCurve})` });
+  if ((layer.speedCurve && layer.speedCurve !== 'none') || (Array.isArray(layer.customSpeedCurve) && layer.customSpeedCurve.length >= 2)) {
+    badges.push({ kind: 'curve', icon: 'bi-lightning-fill', title: `Speed Curve (${layer.speedCurve || 'custom'})` });
   }
-  const fx = layer.fx || {};
-  const hasAdjust =
-    Math.abs(fx.brightness || 0) > 0.01 ||
-    Math.abs((fx.contrast ?? 1) - 1) > 0.01 ||
-    Math.abs((fx.saturation ?? 1) - 1) > 0.01 ||
-    Math.abs(fx.temperature || 0) > 0.01 ||
-    Math.abs(fx.tint || 0) > 0.01 ||
-    Math.abs(fx.exposure || 0) > 0.01 ||
-    Math.abs(fx.highlights || 0) > 0.01 ||
-    Math.abs(fx.shadows || 0) > 0.01 ||
-    Math.abs(fx.fade || 0) > 0.01 ||
-    Math.abs(fx.sharpen || 0) > 0.01 ||
-    Math.abs(fx.blur || 0) > 0.01 ||
-    Math.abs(fx.vignette || 0) > 0.01 ||
-    Math.abs(fx.grain || 0) > 0.01 ||
-    (fx.outlineWidth || 0) > 0 ||
-    Boolean(fx.chromaEnabled);
-  const hasEffects =
-    (layer.vfx?.type && layer.vfx.type !== 'none') ||
-    (layer.filterId && layer.filterId !== 'normal') ||
-    (layer.mask?.type && layer.mask.type !== 'none') ||
-    Boolean(layer.colorMatch?.enabled) ||
-    hasAdjust;
-  if (hasEffects) {
-    badges.push({ kind: 'fx', icon: 'bi-stars', title: 'Effects / Filter Applied' });
+  const fxCount = TimelineEngine.countActiveEffects(layer);
+  if (fxCount > 0) {
+    badges.push({
+      kind: 'fx',
+      icon: 'bi-stars',
+      text: fxCount > 1 ? String(fxCount) : undefined,
+      stacked: fxCount > 1,
+      title: `${fxCount} Efek Aktif`
+    });
   }
   const kfCount = KeyframeEngine.getAllKeyframeFrames(layer).length;
   if (kfCount > 0) {
@@ -251,6 +235,7 @@ export class TimelineView {
     this.wrapperEl = this.dragTooltipEl?.parentElement || document.querySelector('.mf-timeline-wrapper');
 
     this.checkedLayerIds = new Set();
+    this.selectedLayerIds = new Set();
     this.selectedKf = null; // { layerId, laneKey, frame }
     this.activePointers = new Map();
     this.pinchStartDist = null;
@@ -280,7 +265,8 @@ export class TimelineView {
     this._autoScrollRafId = null;
     this._autoScrollStepFn = null;
     this._activeDragReapply = null;
-    this._zoomRefs = { clips: [], seams: [], gaps: [], addBtns: [], kfSpans: [], kfConnectors: [], kfDiamonds: [] };
+    this._activeWheel = null;
+    this._zoomRefs = { clips: [], seams: [], transSpans: [], gaps: [], addBtns: [], kfSpans: [], kfConnectors: [], kfDiamonds: [] };
 
     this._bindModifierListeners();
     this.bindRulerAndScroll();
@@ -393,12 +379,22 @@ export class TimelineView {
     this._hideTooltip('hover');
   }
 
-  setSelectionInPlace(layerId) {
+  setSelectionInPlace(layerId, multiIds = null) {
+    if (multiIds) {
+      this.selectedLayerIds = new Set(multiIds);
+    } else if (layerId && !this.selectedLayerIds.has(layerId)) {
+      this.selectedLayerIds = new Set([layerId]);
+    } else if (!layerId && !multiIds) {
+      this.selectedLayerIds.clear();
+    }
     this.lanesList?.querySelectorAll('.mf-clip[data-layer-id]').forEach((el) => {
-      el.classList.toggle('selected', el.dataset.layerId === layerId);
+      const id = el.dataset.layerId;
+      el.classList.toggle('selected', id === layerId);
+      el.classList.toggle('multi-selected', id !== layerId && this.selectedLayerIds.has(id));
     });
     this.headersList?.querySelectorAll('.mf-track-header-item[data-layer-id]').forEach((el) => {
-      el.classList.toggle('selected', el.dataset.layerId === layerId);
+      const id = el.dataset.layerId;
+      el.classList.toggle('selected', id === layerId || this.selectedLayerIds.has(id));
     });
     this.lanesList?.querySelectorAll('.mf-track-lane[data-lane-type="single"]').forEach((el) => {
       el.classList.toggle('selected', el.dataset.layerId === layerId);
@@ -406,7 +402,7 @@ export class TimelineView {
     const mainLane = this.lanesList?.querySelector('.mf-track-lane.main-track');
     const mainHdr = this.headersList?.querySelector('.mf-track-header-item.main-track');
     if (mainLane) {
-      const mainHasSelected = Boolean(mainLane.querySelector('.mf-clip.selected'));
+      const mainHasSelected = Boolean(mainLane.querySelector('.mf-clip.selected, .mf-clip.multi-selected'));
       mainLane.classList.toggle('selected', mainHasSelected);
       mainHdr?.classList.toggle('selected', mainHasSelected);
     }
@@ -514,6 +510,20 @@ export class TimelineView {
     this._scheduleCrispRedraw(40);
   }
 
+  zoomToFit(project = null) {
+    const proj = project || this._lastRenderContext?.project;
+    if (!proj) return;
+    const fps = Math.max(1, proj.fps || 30);
+    const contentEnd = Math.max(fps * 2, TimelineEngine.getProjectContentEndFrame(proj));
+    const vw = Math.max(240, (this.scrollEl?.clientWidth || 360) - 44);
+    const fitPx = Math.max(MIN_PX_PER_FRAME, Math.min(MAX_PX_PER_FRAME, vw / contentEnd));
+    this.pxPerFrame = Number(fitPx.toFixed(3));
+    this.pinchTargetPx = this.pxPerFrame;
+    this._pendingScrollLeft = 0;
+    this._applyFastZoomLayout();
+    this._scheduleCrispRedraw(40);
+  }
+
   _scheduleFastZoomUpdate() {
     if (this._zoomRafId !== null) return;
     const step = () => {
@@ -580,6 +590,10 @@ export class TimelineView {
 
     for (const s of this._zoomRefs.seams) {
       s.el.style.left = `${s.frame * px}px`;
+    }
+    for (const ts of (this._zoomRefs.transSpans || [])) {
+      ts.el.style.left = `${ts.frame * px}px`;
+      ts.el.style.width = `${Math.max(8, ts.durationFrames * px)}px`;
     }
     for (const g of this._zoomRefs.gaps) {
       g.el.style.left = `${g.frame * px}px`;
@@ -820,10 +834,36 @@ export class TimelineView {
       this.cb.onScrubEnd?.();
     };
 
-    this.rulerCanvas.addEventListener('pointerdown', (e) => startScrub(this.rulerCanvas, e, false));
+    let rulerDownX = 0;
+    let rulerDownMarker = null;
+    this.rulerCanvas.addEventListener('pointerdown', (e) => {
+      rulerDownX = e.clientX;
+      const rect = this.scrollEl.getBoundingClientRect();
+      const x = (e.clientX - rect.left) + this.scrollEl.scrollLeft;
+      rulerDownMarker = null;
+      for (const m of (this._lastTimelineMarkers || [])) {
+        const mf = typeof m === 'number' ? m : Number(m?.frame);
+        if (!Number.isFinite(mf)) continue;
+        if (Math.abs(mf * this.pxPerFrame - x) <= 10) {
+          rulerDownMarker = m;
+          break;
+        }
+      }
+      startScrub(this.rulerCanvas, e, false);
+    });
     this.rulerCanvas.addEventListener('pointermove', (e) => moveScrub(e, false));
-    this.rulerCanvas.addEventListener('pointerup', endScrub);
-    this.rulerCanvas.addEventListener('pointercancel', endScrub);
+    this.rulerCanvas.addEventListener('pointerup', (e) => {
+      const clickedMarker = rulerDownMarker && Math.abs(e.clientX - rulerDownX) <= 5 ? rulerDownMarker : null;
+      rulerDownMarker = null;
+      endScrub();
+      if (clickedMarker && typeof clickedMarker === 'object') {
+        this.cb.onClickMarker?.(clickedMarker, e.clientX, e.clientY);
+      }
+    });
+    this.rulerCanvas.addEventListener('pointercancel', () => {
+      rulerDownMarker = null;
+      endScrub();
+    });
 
     if (this.playheadEl) {
       this.playheadEl.addEventListener('pointerdown', (e) => startScrub(this.playheadEl, e, true));
@@ -832,10 +872,33 @@ export class TimelineView {
       this.playheadEl.addEventListener('pointercancel', endScrub);
     }
 
-    // CapCut behavior: tapping empty timeline space deselects active clip -> returns to Root Toolbar
+    // Ctrl/Cmd + Wheel zoom anchored under cursor
+    this.scrollEl.addEventListener('wheel', (e) => {
+      if (!e.ctrlKey && !e.metaKey) return;
+      e.preventDefault();
+      const rect = this.scrollEl.getBoundingClientRect();
+      const cursorX = Math.max(0, e.clientX - rect.left);
+      const cursorFrame = (this.scrollEl.scrollLeft + cursorX) / Math.max(MIN_PX_PER_FRAME, this.pxPerFrame);
+      const factor = Math.exp(-e.deltaY * 0.0026);
+      this._setZoomAnchored(this.pxPerFrame * factor, cursorFrame, cursorX);
+      this.pinchTargetPx = this.pxPerFrame;
+      this._applyFastZoomLayout();
+      this._scheduleCrispRedraw(70);
+    }, { passive: false });
+
+    // Empty timeline drag = Marquee multi-select; short tap = deselect all
     let bgDownX = 0;
     let bgDownY = 0;
     let bgTracking = false;
+    let marqueeEl = null;
+    let marqueeActive = false;
+    const clearMarqueeEl = () => {
+      if (marqueeEl) {
+        marqueeEl.remove();
+        marqueeEl = null;
+      }
+      marqueeActive = false;
+    };
     this.scrollEl.addEventListener('pointerdown', (e) => {
       if (
         this._isPinching ||
@@ -844,6 +907,7 @@ export class TimelineView {
         e.target.closest('.mf-kf-diamond') ||
         e.target.closest('.mf-kf-lane-diamond') ||
         e.target.closest('.mf-kf-lane') ||
+        e.target.closest('.mf-trans-seam-btn') ||
         e.target.closest('#timelineKfBar') ||
         e.target.closest('#playheadLine') ||
         e.target === this.rulerCanvas
@@ -852,19 +916,68 @@ export class TimelineView {
         return;
       }
       bgTracking = true;
+      marqueeActive = false;
       bgDownX = e.clientX;
       bgDownY = e.clientY;
     });
-    this.scrollEl.addEventListener('pointerup', (e) => {
+    this.scrollEl.addEventListener('pointermove', (e) => {
+      if (!bgTracking) return;
+      if (this._isPinching || this.activePointers.size >= 2) {
+        bgTracking = false;
+        clearMarqueeEl();
+        return;
+      }
+      const dist = Math.hypot(e.clientX - bgDownX, e.clientY - bgDownY);
+      if (!marqueeActive && dist >= 10) {
+        marqueeActive = true;
+        marqueeEl = document.createElement('div');
+        marqueeEl.className = 'mf-marquee-box';
+        this.lanesList.appendChild(marqueeEl);
+      }
+      if (!marqueeActive || !marqueeEl) return;
+      const lanesRect = this.lanesList.getBoundingClientRect();
+      const leftPx = Math.min(bgDownX, e.clientX) - lanesRect.left;
+      const topPx = Math.min(bgDownY, e.clientY) - lanesRect.top + this.lanesList.scrollTop;
+      const widthPx = Math.abs(e.clientX - bgDownX);
+      const heightPx = Math.abs(e.clientY - bgDownY);
+      marqueeEl.style.left = `${Math.max(0, leftPx)}px`;
+      marqueeEl.style.top = `${Math.max(0, topPx)}px`;
+      marqueeEl.style.width = `${widthPx}px`;
+      marqueeEl.style.height = `${heightPx}px`;
+
+      const selLeft = Math.min(bgDownX, e.clientX);
+      const selRight = Math.max(bgDownX, e.clientX);
+      const selTop = Math.min(bgDownY, e.clientY);
+      const selBottom = Math.max(bgDownY, e.clientY);
+      const hitIds = [];
+      this.lanesList.querySelectorAll('.mf-clip[data-layer-id]').forEach((clipEl) => {
+        const r = clipEl.getBoundingClientRect();
+        const intersects = !(r.right < selLeft || r.left > selRight || r.bottom < selTop || r.top > selBottom);
+        if (intersects) hitIds.push(clipEl.dataset.layerId);
+      });
+      this.setSelectionInPlace(hitIds[0] || null, hitIds);
+    });
+    const finishBg = (e) => {
       if (!bgTracking) return;
       bgTracking = false;
+      const wasMarquee = marqueeActive;
+      const selectedSnapshot = [...this.selectedLayerIds];
+      clearMarqueeEl();
       if (this._isPinching || this.activePointers.size > 1 || performance.now() < this._suppressBgTapUntil) return;
+      if (wasMarquee) {
+        this.cb.onMarqueeSelect?.(selectedSnapshot);
+        return;
+      }
       if (Math.hypot(e.clientX - bgDownX, e.clientY - bgDownY) <= 8) {
         this.selectedKf = null;
+        this.selectedLayerIds.clear();
         this._renderKfFloatingBar(this._lastRenderContext?.project);
+        this.cb.onMarqueeSelect?.([]);
         this.cb.onSelectLayer(null);
       }
-    });
+    };
+    this.scrollEl.addEventListener('pointerup', finishBg);
+    this.scrollEl.addEventListener('pointercancel', finishBg);
   }
 
   render(project, currentFrame, selectedLayerId, audioEngine, mediaMap = null) {
@@ -1039,9 +1152,10 @@ export class TimelineView {
   _buildClipElement(project, layer, isSelected, audioEngine, mediaMap) {
     const leftPx = layer.startFrame * this.pxPerFrame;
     const widthPx = Math.max(24, (layer.endFrame - layer.startFrame) * this.pxPerFrame);
+    const isMulti = !isSelected && this.selectedLayerIds.has(layer.id);
 
     const clip = document.createElement('div');
-    clip.className = `mf-clip mf-clip-${layer.type} ${isSelected ? 'selected' : ''} ${layer.locked ? 'locked' : ''}`.trim();
+    clip.className = `mf-clip mf-clip-${layer.type} ${isSelected ? 'selected' : ''} ${isMulti ? 'multi-selected' : ''} ${layer.locked ? 'locked' : ''}`.trim();
     clip.dataset.layerId = layer.id;
     clip.style.left = `${leftPx}px`;
     clip.style.width = `${widthPx}px`;
@@ -1112,7 +1226,7 @@ export class TimelineView {
       badgeStrip.className = 'mf-clip-badges';
       for (const b of badges) {
         const badgeEl = document.createElement('span');
-        badgeEl.className = `mf-clip-badge mf-badge-${b.kind}`;
+        badgeEl.className = `mf-clip-badge mf-badge-${b.kind} ${b.stacked ? 'badge-fx is-stacked' : ''}`.trim();
         badgeEl.title = b.title;
         if (b.icon) {
           const ic = document.createElement('i');
@@ -1160,6 +1274,123 @@ export class TimelineView {
     return { clip, leftTrim, rightTrim, waveEntry, filmEntry };
   }
 
+  closeTrackWheelMenu() {
+    if (this._activeWheel?.backdrop) {
+      this._activeWheel.backdrop.remove();
+    }
+    document.querySelectorAll('.mf-track-wheel-backdrop').forEach((el) => el.remove());
+    if (this._wheelKeyHandler) {
+      window.removeEventListener('keydown', this._wheelKeyHandler);
+      this._wheelKeyHandler = null;
+    }
+    this._activeWheel = null;
+  }
+
+  _renderActiveWheelNodes() {
+    const state = this._activeWheel;
+    if (!state || !state.wheelEl) return;
+    const actions = state.buildActions() || [];
+    state.wheelEl.querySelectorAll('.mf-track-wheel-node').forEach((el) => el.remove());
+
+    const cx = 108;
+    const cy = 108;
+    const radius = actions.length <= 4 ? 66 : 72;
+    actions.forEach((act, idx) => {
+      const angle = -Math.PI / 2 + (2 * Math.PI * idx) / Math.max(1, actions.length);
+      const nx = cx + Math.cos(angle) * radius;
+      const ny = cy + Math.sin(angle) * radius;
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = `mf-track-wheel-node ${act.stateClass || ''}`.trim();
+      btn.style.left = `${Math.round(nx)}px`;
+      btn.style.top = `${Math.round(ny)}px`;
+      btn.disabled = Boolean(act.disabled);
+      btn.title = act.title || act.label;
+      btn.setAttribute('aria-label', act.title || act.label);
+      btn.innerHTML = `<i class="bi ${act.icon}"></i><span>${this.escapeHtml(act.label)}</span>`;
+      btn.addEventListener('pointerdown', (ev) => ev.stopPropagation());
+      btn.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        act.onClick?.();
+        this._renderActiveWheelNodes();
+      });
+      state.wheelEl.appendChild(btn);
+    });
+  }
+
+  openTrackWheelMenu(anchorEl, wheelKey, title, buildActionsFn) {
+    const sameOpen = this._activeWheel && this._activeWheel.key === wheelKey;
+    this.closeTrackWheelMenu();
+    if (sameOpen) return;
+
+    const backdrop = document.createElement('div');
+    backdrop.className = 'mf-track-wheel-backdrop';
+
+    const wheel = document.createElement('div');
+    wheel.className = 'mf-track-wheel';
+    wheel.setAttribute('role', 'dialog');
+    wheel.setAttribute('aria-label', `${title} Track Controls`);
+
+    const titlePill = document.createElement('div');
+    titlePill.className = 'mf-track-wheel-title';
+    titlePill.textContent = title;
+    wheel.appendChild(titlePill);
+
+    const closeBtn = document.createElement('button');
+    closeBtn.type = 'button';
+    closeBtn.className = 'mf-track-wheel-close';
+    closeBtn.title = 'Tutup Menu Track';
+    closeBtn.setAttribute('aria-label', 'Tutup Roda Tombol Track');
+    closeBtn.innerHTML = `
+      <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+        <path d="M6.2 6.2L17.8 17.8M17.8 6.2L6.2 17.8" stroke="#ffffff" stroke-width="3" stroke-linecap="round"/>
+      </svg>
+    `;
+    closeBtn.addEventListener('pointerdown', (ev) => ev.stopPropagation());
+    closeBtn.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      this.closeTrackWheelMenu();
+    });
+    wheel.appendChild(closeBtn);
+
+    const rect = anchorEl?.getBoundingClientRect?.() || { left: 80, top: 240, width: 32, height: 32 };
+    const wheelSize = 216;
+    const half = wheelSize / 2;
+    const rawCx = rect.left + rect.width * 0.5 + 48;
+    const rawCy = rect.top + rect.height * 0.5;
+    const vw = window.innerWidth || 360;
+    const vh = window.innerHeight || 640;
+    const cx = Math.max(half + 10, Math.min(vw - half - 10, rawCx));
+    const cy = Math.max(half + 24, Math.min(vh - half - 14, rawCy));
+    wheel.style.left = `${Math.round(cx - half)}px`;
+    wheel.style.top = `${Math.round(cy - half)}px`;
+
+    backdrop.addEventListener('pointerdown', (ev) => {
+      if (ev.target === backdrop) {
+        ev.stopPropagation();
+        this.closeTrackWheelMenu();
+      }
+    });
+    wheel.addEventListener('pointerdown', (ev) => ev.stopPropagation());
+
+    backdrop.appendChild(wheel);
+    document.body.appendChild(backdrop);
+
+    this._wheelKeyHandler = (ev) => {
+      if (ev.key === 'Escape') this.closeTrackWheelMenu();
+    };
+    window.addEventListener('keydown', this._wheelKeyHandler);
+
+    this._activeWheel = {
+      key: wheelKey,
+      title,
+      backdrop,
+      wheelEl: wheel,
+      buildActions: buildActionsFn
+    };
+    this._renderActiveWheelNodes();
+  }
+
   _appendSingleLayerRow(project, layer, selectedLayerId, audioEngine, mediaMap, junctionByLeftId) {
     const layerIndex = project.layers.findIndex((l) => l.id === layer.id);
     const isSelected = layer.id === selectedLayerId;
@@ -1171,7 +1402,7 @@ export class TimelineView {
     const zone = layer.type === 'audio' ? 'audio' : 'overlay';
 
     const hdr = document.createElement('div');
-    hdr.className = `mf-track-header-item d-flex align-items-center justify-content-between ${isSelected ? 'selected' : ''} ${layer.parentId ? 'child-layer' : ''} ${isCompact ? 'compact' : ''}`.trim();
+    hdr.className = `mf-track-header-item zone-${zone} d-flex align-items-center justify-content-between ${isSelected ? 'selected' : ''} ${layer.parentId ? 'child-layer' : ''} ${isCompact ? 'compact' : ''}`.trim();
     hdr.dataset.index = String(layerIndex);
     hdr.dataset.layerId = layer.id;
     hdr.dataset.zone = zone;
@@ -1190,6 +1421,16 @@ export class TimelineView {
 
     const hasKfs = KeyframeEngine.getAllKeyframeFrames(layer).length > 0;
     const isKfExpanded = Boolean(layer.kfExpanded);
+    const hasTrackStatusAlert = isMuted || !layer.visible || layer.locked || isKfExpanded;
+    const wheelDotClass = layer.locked
+      ? 'is-locked'
+      : isMuted
+        ? 'is-muted'
+        : !layer.visible
+          ? 'is-hidden'
+          : isKfExpanded
+            ? 'is-kf'
+            : '';
 
     hdr.innerHTML = `
       <div class="d-flex align-items-center gap-1 min-w-0 flex-grow-1 overflow-hidden">
@@ -1199,22 +1440,9 @@ export class TimelineView {
         <span class="mf-track-title min-w-0">${roleHint}${this.escapeHtml(layer.name)}</span>
       </div>
       <div class="d-flex align-items-center flex-shrink-0">
-        <button class="mf-mini-btn ${isKfExpanded ? 'kf-open' : (hasKfs ? 'has-kf' : '')}" data-act="kf-lanes" title="${isKfExpanded ? 'Tutup Lane Keyframe' : 'Buka Lane Keyframe per Properti'}" aria-label="Toggle Keyframe Lanes">
-          <i class="bi ${isKfExpanded ? 'bi-diamond-fill' : 'bi-diamond-half'}"></i>
-        </button>
-        ${hasMuteControl ? `
-          <button class="mf-mini-btn ${isMuted ? 'muted' : ''}" data-act="mute" title="${isMuted ? 'Unmute Track' : 'Mute Track'}" aria-label="Mute Track">
-            <i class="bi ${isMuted ? 'bi-volume-mute-fill' : 'bi-volume-up-fill'}"></i>
-          </button>
-        ` : ''}
-        <button class="mf-mini-btn ${layer.visible ? 'on' : ''}" data-act="vis" title="${layer.visible ? 'Hide Track' : 'Show Track'}" aria-label="Toggle Visibility">
-          <i class="bi ${layer.visible ? 'bi-eye-fill' : 'bi-eye-slash'}"></i>
-        </button>
-        <button class="mf-mini-btn ${layer.locked ? 'locked' : ''}" data-act="lock" title="${layer.locked ? 'Unlock Track' : 'Lock Track'}" aria-label="Toggle Lock">
-          <i class="bi ${layer.locked ? 'bi-lock-fill' : 'bi-unlock'}"></i>
-        </button>
-        <button class="mf-mini-btn ${isCompact ? 'compact-on' : ''}" data-act="compact" title="${isCompact ? 'Expand Track Height' : 'Compact Track Height'}" aria-label="Toggle Compact Height">
-          <i class="bi ${isCompact ? 'bi-arrows-expand' : 'bi-arrows-collapse'}"></i>
+        <button type="button" class="mf-track-wheel-btn ${hasTrackStatusAlert ? 'has-alert' : ''}" data-act="open-wheel" title="Buka Kontrol Track" aria-label="Buka Roda Kontrol Track ${this.escapeHtml(layer.name)}">
+          <i class="bi bi-sliders"></i>
+          ${wheelDotClass ? `<span class="mf-wheel-status-dot ${wheelDotClass}"></span>` : ''}
         </button>
       </div>
     `;
@@ -1277,15 +1505,59 @@ export class TimelineView {
     dragHandle.addEventListener('pointercancel', finishReorder);
 
     hdr.addEventListener('click', (e) => {
-      const btn = e.target.closest('button');
+      const btn = e.target.closest('button[data-act="open-wheel"]');
       if (btn) {
         e.stopPropagation();
-        const act = btn.dataset.act;
-        if (act === 'kf-lanes') this.cb.onToggleKfExpanded?.(layer.id);
-        if (act === 'mute') this.cb.onToggleMute?.(layer.id);
-        if (act === 'vis') this.cb.onToggleVisibility(layer.id);
-        if (act === 'lock') this.cb.onToggleLock(layer.id);
-        if (act === 'compact') this.cb.onToggleTrackCompact?.(layer.id);
+        this.openTrackWheelMenu(btn, `layer:${layer.id}`, layer.name, () => {
+          const curProject = this._lastRenderContext?.project || project;
+          const liveLayer = curProject.layers.find((l) => l.id === layer.id) || layer;
+          const liveKfs = KeyframeEngine.getAllKeyframeFrames(liveLayer).length > 0;
+          const liveKfExpanded = Boolean(liveLayer.kfExpanded);
+          const liveMuted = Boolean(liveLayer.audioProps?.muted);
+          const liveCompact = Boolean(liveLayer.trackCompact);
+          const actions = [
+            {
+              icon: liveKfExpanded ? 'bi-diamond-fill' : 'bi-diamond-half',
+              label: 'Keyframe',
+              stateClass: liveKfExpanded ? 'is-kf-open' : (liveKfs ? 'is-active' : ''),
+              title: liveKfExpanded ? 'Tutup Lane Keyframe' : 'Buka Lane Keyframe',
+              onClick: () => this.cb.onToggleKfExpanded?.(liveLayer.id)
+            }
+          ];
+          if (liveLayer.type === 'audio' || liveLayer.type === 'video') {
+            actions.push({
+              icon: liveMuted ? 'bi-volume-mute-fill' : 'bi-volume-up-fill',
+              label: liveMuted ? 'Unmute' : 'Mute',
+              stateClass: liveMuted ? 'is-muted' : 'is-active',
+              title: liveMuted ? 'Aktifkan Suara' : 'Bisukan Track',
+              onClick: () => this.cb.onToggleMute?.(liveLayer.id)
+            });
+          }
+          actions.push(
+            {
+              icon: liveLayer.visible ? 'bi-eye-fill' : 'bi-eye-slash',
+              label: liveLayer.visible ? 'Tampil' : 'Sembunyi',
+              stateClass: liveLayer.visible ? 'is-active' : 'is-muted',
+              title: liveLayer.visible ? 'Sembunyikan Track' : 'Tampilkan Track',
+              onClick: () => this.cb.onToggleVisibility?.(liveLayer.id)
+            },
+            {
+              icon: liveLayer.locked ? 'bi-lock-fill' : 'bi-unlock',
+              label: liveLayer.locked ? 'Terkunci' : 'Kunci',
+              stateClass: liveLayer.locked ? 'is-locked' : '',
+              title: liveLayer.locked ? 'Buka Kunci Track' : 'Kunci Track',
+              onClick: () => this.cb.onToggleLock?.(liveLayer.id)
+            },
+            {
+              icon: liveCompact ? 'bi-arrows-expand' : 'bi-arrows-collapse',
+              label: liveCompact ? 'Lebar' : 'Ringkas',
+              stateClass: liveCompact ? 'is-compact' : '',
+              title: liveCompact ? 'Perbesar Tinggi Track' : 'Perkecil Tinggi Track',
+              onClick: () => this.cb.onToggleTrackCompact?.(liveLayer.id)
+            }
+          );
+          return actions;
+        });
         return;
       }
       this.cb.onSelectLayer(layer.id);
@@ -1293,8 +1565,9 @@ export class TimelineView {
     this.headersList.appendChild(hdr);
 
     const lane = document.createElement('div');
-    lane.className = `mf-track-lane ${isSelected ? 'selected' : ''} ${isCompact ? 'compact' : ''}`.trim();
+    lane.className = `mf-track-lane zone-${zone} ${isSelected ? 'selected' : ''} ${isCompact ? 'compact' : ''}`.trim();
     lane.dataset.laneType = 'single';
+    lane.dataset.zone = zone;
     lane.dataset.layerId = layer.id;
     lane.dataset.layerIndex = String(layerIndex);
     const { clip, leftTrim, rightTrim, waveEntry, filmEntry } = this._buildClipElement(
@@ -1316,19 +1589,72 @@ export class TimelineView {
   }
 
   _appendSeamButton(lane, junc) {
+    const hasTr = junc.type && junc.type !== 'none';
+    let spanEl = null;
+    if (hasTr) {
+      spanEl = document.createElement('div');
+      spanEl.className = 'mf-trans-span';
+      spanEl.style.left = `${junc.seamFrame * this.pxPerFrame}px`;
+      spanEl.style.width = `${Math.max(8, junc.durationFrames * this.pxPerFrame)}px`;
+      lane.appendChild(spanEl);
+      this._zoomRefs.transSpans.push({ el: spanEl, frame: junc.seamFrame, durationFrames: junc.durationFrames });
+    }
+
     const seamBtn = document.createElement('button');
     seamBtn.type = 'button';
-    const hasTr = junc.type && junc.type !== 'none';
     seamBtn.className = `mf-trans-seam-btn ${hasTr ? 'has-trans' : ''}`;
+    seamBtn.dataset.leftId = junc.leftId;
+    seamBtn.dataset.rightId = junc.rightId;
     seamBtn.style.left = `${junc.seamFrame * this.pxPerFrame}px`;
     seamBtn.title = hasTr
-      ? `Transition (${junc.type}) between ${junc.left.name} & ${junc.right.name}`
+      ? `Transition (${junc.type} · ${junc.durationFrames}f) — Drag horizontal to resize from center`
       : `Add transition between ${junc.left.name} & ${junc.right.name}`;
     seamBtn.setAttribute('aria-label', seamBtn.title);
     seamBtn.innerHTML = hasTr ? `<i class="bi bi-intersect"></i>` : `<i class="bi bi-plus-slash-minus"></i>`;
-    seamBtn.addEventListener('pointerdown', (e) => e.stopPropagation());
+
+    let seamDragging = false;
+    let seamMoved = false;
+    let seamStartX = 0;
+    let seamOrigDur = junc.durationFrames || 24;
+    let seamNextDur = seamOrigDur;
+    seamBtn.addEventListener('pointerdown', (e) => {
+      e.stopPropagation();
+      seamDragging = true;
+      seamMoved = false;
+      seamStartX = e.clientX;
+      seamOrigDur = junc.durationFrames || 24;
+      seamNextDur = seamOrigDur;
+      try { seamBtn.setPointerCapture(e.pointerId); } catch {}
+    });
+    seamBtn.addEventListener('pointermove', (e) => {
+      if (!seamDragging) return;
+      const dx = e.clientX - seamStartX;
+      if (!seamMoved && Math.abs(dx) < 5) return;
+      if (!seamMoved && !hasTr) return; // only resize if transition already applied; otherwise tap opens picker
+      seamMoved = true;
+      const deltaFrames = Math.round((dx / Math.max(0.2, this.pxPerFrame)) * 2);
+      seamNextDur = Math.max(4, Math.min(120, seamOrigDur + deltaFrames));
+      if (spanEl) {
+        spanEl.style.width = `${Math.max(8, seamNextDur * this.pxPerFrame)}px`;
+      }
+      const hL = Math.floor(seamNextDur / 2);
+      const hR = seamNextDur - hL;
+      this._showTooltip(`Trans ${seamNextDur}f (L:${hL}f | R:${hR}f)`, seamBtn, 'drag');
+    });
+    const endSeamDrag = (e) => {
+      if (!seamDragging) return;
+      seamDragging = false;
+      this._hideTooltip('drag');
+      if (seamMoved) {
+        e.stopPropagation();
+        this.cb.onResizeTransitionJunction?.(junc.leftId, junc.rightId, seamNextDur);
+      }
+    };
+    seamBtn.addEventListener('pointerup', endSeamDrag);
+    seamBtn.addEventListener('pointercancel', endSeamDrag);
     seamBtn.addEventListener('click', (e) => {
       e.stopPropagation();
+      if (seamMoved) return;
       this.cb.onOpenTransitionJunction?.(junc.leftId, junc.rightId);
     });
     lane.appendChild(seamBtn);
@@ -1339,8 +1665,8 @@ export class TimelineView {
     const anySelected = mainClips.some((c) => c.id === selectedLayerId);
     const rippleOn = project.settings?.rippleMode !== false;
     const isMainCompact = Boolean(project.settings?.mainTrackCompact);
-    const allHidden = mainClips.every((c) => !c.visible);
-    const allLocked = mainClips.every((c) => c.locked);
+    const allHidden = mainClips.length > 0 && mainClips.every((c) => !c.visible);
+    const allLocked = mainClips.length > 0 && mainClips.every((c) => c.locked);
     const audioClips = mainClips.filter((c) => c.audioProps);
     const allMuted = audioClips.length > 0 && audioClips.every((c) => c.audioProps.muted);
 
@@ -1350,11 +1676,22 @@ export class TimelineView {
         return pf >= c.startFrame && pf <= c.endFrame;
       })
       || mainClips[0];
-    const anyMainKfs = mainClips.some((c) => KeyframeEngine.getAllKeyframeFrames(c).length > 0);
     const isMainKfExpanded = Boolean(activeMainClip?.kfExpanded);
+    const mainDotClass = allLocked
+      ? 'is-locked'
+      : allMuted
+        ? 'is-muted'
+        : allHidden
+          ? 'is-hidden'
+          : isMainKfExpanded
+            ? 'is-kf'
+            : rippleOn
+              ? 'is-magnet'
+              : '';
 
     const hdr = document.createElement('div');
     hdr.className = `mf-track-header-item main-track d-flex align-items-center justify-content-between ${anySelected ? 'selected' : ''} ${isMainCompact ? 'compact' : ''}`.trim();
+    hdr.dataset.zone = 'main';
     hdr.innerHTML = `
       <div class="d-flex align-items-center gap-1 min-w-0 flex-grow-1 overflow-hidden">
         <i class="bi bi-film text-info small flex-shrink-0"></i>
@@ -1362,38 +1699,82 @@ export class TimelineView {
         <span class="badge bg-info bg-opacity-25 text-info px-1 flex-shrink-0" style="font-size:0.54rem;">${mainClips.length}</span>
       </div>
       <div class="d-flex align-items-center flex-shrink-0">
-        <button class="mf-mini-btn ${isMainKfExpanded ? 'kf-open' : (anyMainKfs ? 'has-kf' : '')}" data-act="main-kf-lanes" title="${isMainKfExpanded ? 'Tutup Lane Keyframe Clip' : 'Buka Lane Keyframe Clip Terpilih'}" aria-label="Toggle Main Clip Keyframe Lanes">
-          <i class="bi ${isMainKfExpanded ? 'bi-diamond-fill' : 'bi-diamond-half'}"></i>
-        </button>
-        <button class="mf-mini-btn ${rippleOn ? 'on' : ''}" data-act="ripple" title="Magnetic Main Track (${rippleOn ? 'ON' : 'OFF'})" aria-label="Toggle Magnetic Main Track">
-          <i class="bi bi-link-45deg"></i>
-        </button>
-        <button class="mf-mini-btn ${allMuted ? 'muted' : ''}" data-act="main-mute" title="${allMuted ? 'Unmute Main Track Audio' : 'Mute Main Track Audio'}" aria-label="Toggle Main Track Mute">
-          <i class="bi ${allMuted ? 'bi-volume-mute-fill' : 'bi-volume-up-fill'}"></i>
-        </button>
-        <button class="mf-mini-btn ${!allHidden ? 'on' : ''}" data-act="main-vis" title="Toggle Main Track Visibility" aria-label="Toggle Main Track Visibility">
-          <i class="bi ${!allHidden ? 'bi-eye-fill' : 'bi-eye-slash'}"></i>
-        </button>
-        <button class="mf-mini-btn ${allLocked ? 'locked' : ''}" data-act="main-lock" title="Lock Main Track" aria-label="Toggle Main Track Lock">
-          <i class="bi ${allLocked ? 'bi-lock-fill' : 'bi-unlock'}"></i>
-        </button>
-        <button class="mf-mini-btn ${isMainCompact ? 'compact-on' : ''}" data-act="main-compact" title="${isMainCompact ? 'Expand Main Track' : 'Compact Main Track'}" aria-label="Toggle Main Track Compact">
-          <i class="bi ${isMainCompact ? 'bi-arrows-expand' : 'bi-arrows-collapse'}"></i>
+        <button type="button" class="mf-track-wheel-btn ${mainDotClass ? 'has-alert' : ''}" data-act="open-wheel" title="Buka Kontrol Main Track" aria-label="Buka Roda Kontrol Main Track">
+          <i class="bi bi-sliders"></i>
+          ${mainDotClass ? `<span class="mf-wheel-status-dot ${mainDotClass}"></span>` : ''}
         </button>
       </div>
     `;
 
     hdr.addEventListener('click', (e) => {
-      const btn = e.target.closest('button');
+      const btn = e.target.closest('button[data-act="open-wheel"]');
       if (btn) {
         e.stopPropagation();
-        const act = btn.dataset.act;
-        if (act === 'main-kf-lanes' && activeMainClip) this.cb.onToggleKfExpanded?.(activeMainClip.id);
-        if (act === 'ripple') this.cb.onToggleRippleMode?.();
-        if (act === 'main-mute') this.cb.onToggleMainTrackProp?.('muted');
-        if (act === 'main-vis') this.cb.onToggleMainTrackProp?.('visible');
-        if (act === 'main-lock') this.cb.onToggleMainTrackProp?.('locked');
-        if (act === 'main-compact') this.cb.onToggleMainTrackProp?.('compact');
+        this.openTrackWheelMenu(btn, 'main', 'Main Track', () => {
+          const curProject = this._lastRenderContext?.project || project;
+          const liveMain = TimelineEngine.getMainTrackClips(curProject);
+          const liveSelected = this.cb.getPlayheadFrame?.() ?? 0;
+          const liveActive = liveMain.find((c) => this.selectedLayerIds?.has(c.id))
+            || liveMain.find((c) => liveSelected >= c.startFrame && liveSelected <= c.endFrame)
+            || liveMain[0];
+          const liveRipple = curProject.settings?.rippleMode !== false;
+          const liveCompact = Boolean(curProject.settings?.mainTrackCompact);
+          const liveHidden = liveMain.length > 0 && liveMain.every((c) => !c.visible);
+          const liveLocked = liveMain.length > 0 && liveMain.every((c) => c.locked);
+          const liveAud = liveMain.filter((c) => c.audioProps);
+          const liveMuted = liveAud.length > 0 && liveAud.every((c) => c.audioProps.muted);
+          const liveKfs = liveMain.some((c) => KeyframeEngine.getAllKeyframeFrames(c).length > 0);
+          const liveKfExp = Boolean(liveActive?.kfExpanded);
+
+          return [
+            {
+              icon: liveKfExp ? 'bi-diamond-fill' : 'bi-diamond-half',
+              label: 'Keyframe',
+              disabled: !liveActive,
+              stateClass: liveKfExp ? 'is-kf-open' : (liveKfs ? 'is-active' : ''),
+              title: liveKfExp ? 'Tutup Lane Keyframe' : 'Buka Lane Keyframe',
+              onClick: () => { if (liveActive) this.cb.onToggleKfExpanded?.(liveActive.id); }
+            },
+            {
+              icon: 'bi-magnet-fill',
+              label: liveRipple ? 'Magnet ON' : 'Magnet OFF',
+              stateClass: liveRipple ? 'is-active' : '',
+              title: liveRipple ? 'Matikan Magnet (boleh jarak kosong)' : 'Aktifkan Magnet (rapatkan clip)',
+              onClick: () => this.cb.onToggleRippleMode?.()
+            },
+            {
+              icon: liveMuted ? 'bi-volume-mute-fill' : 'bi-volume-up-fill',
+              label: liveMuted ? 'Unmute' : 'Mute',
+              disabled: liveMain.length === 0,
+              stateClass: liveMuted ? 'is-muted' : 'is-active',
+              title: liveMuted ? 'Aktifkan Audio Main Track' : 'Bisukan Audio Main Track',
+              onClick: () => this.cb.onToggleMainTrackProp?.('muted')
+            },
+            {
+              icon: !liveHidden ? 'bi-eye-fill' : 'bi-eye-slash',
+              label: !liveHidden ? 'Tampil' : 'Sembunyi',
+              disabled: liveMain.length === 0,
+              stateClass: !liveHidden ? 'is-active' : 'is-muted',
+              title: 'Toggle Visibilitas Main Track',
+              onClick: () => this.cb.onToggleMainTrackProp?.('visible')
+            },
+            {
+              icon: liveLocked ? 'bi-lock-fill' : 'bi-unlock',
+              label: liveLocked ? 'Terkunci' : 'Kunci',
+              disabled: liveMain.length === 0,
+              stateClass: liveLocked ? 'is-locked' : '',
+              title: 'Kunci / Buka Kunci Main Track',
+              onClick: () => this.cb.onToggleMainTrackProp?.('locked')
+            },
+            {
+              icon: liveCompact ? 'bi-arrows-expand' : 'bi-arrows-collapse',
+              label: liveCompact ? 'Lebar' : 'Ringkas',
+              stateClass: liveCompact ? 'is-compact' : '',
+              title: liveCompact ? 'Perbesar Main Track' : 'Perkecil Main Track',
+              onClick: () => this.cb.onToggleMainTrackProp?.('compact')
+            }
+          ];
+        });
         return;
       }
       if (mainClips.length > 0) {
@@ -1407,6 +1788,7 @@ export class TimelineView {
     const lane = document.createElement('div');
     lane.className = `mf-track-lane main-track ${anySelected ? 'selected' : ''} ${isMainCompact ? 'compact' : ''}`.trim();
     lane.dataset.laneType = 'main';
+    lane.dataset.zone = 'main';
 
     const dropMarker = document.createElement('div');
     dropMarker.className = 'mf-reorder-indicator d-none';
@@ -1457,8 +1839,8 @@ export class TimelineView {
     addBtn.type = 'button';
     addBtn.className = 'mf-main-add-btn';
     addBtn.style.left = `${mainEndFrame * this.pxPerFrame + 8}px`;
-    addBtn.title = 'Add Clip to Main Track';
-    addBtn.setAttribute('aria-label', 'Add Clip to Main Track');
+    addBtn.title = 'Tambah Video / Gambar ke Main Track';
+    addBtn.setAttribute('aria-label', 'Tambah Video atau Gambar ke Main Track');
     addBtn.innerHTML = `<i class="bi bi-plus-lg"></i>`;
     addBtn.addEventListener('pointerdown', (e) => e.stopPropagation());
     addBtn.addEventListener('click', (e) => {
@@ -1467,6 +1849,13 @@ export class TimelineView {
     });
     lane.appendChild(addBtn);
     this._zoomRefs.addBtns.push({ el: addBtn, frame: mainEndFrame });
+
+    if (mainClips.length === 0) {
+      const hint = document.createElement('span');
+      hint.className = 'mf-main-empty-hint';
+      hint.textContent = 'Track Utama · Khusus Video & Gambar';
+      lane.appendChild(hint);
+    }
 
     this.lanesList.appendChild(lane);
     if (isMainKfExpanded && activeMainClip) {
@@ -1493,19 +1882,13 @@ export class TimelineView {
   renderHeadersAndLanes(project, selectedLayerId, audioEngine, mediaMap = null) {
     this.headersList.innerHTML = '';
     this.lanesList.innerHTML = '';
-    this._zoomRefs = { clips: [], seams: [], gaps: [], addBtns: [], kfSpans: [], kfConnectors: [], kfDiamonds: [] };
-
-    if (project.layers.length === 0) {
-      const empty = document.createElement('div');
-      empty.className = 'text-secondary small p-3';
-      empty.textContent = 'Tap Edit / Media below to add clips to your Main Track.';
-      this.lanesList.appendChild(empty);
-      return;
-    }
+    this._zoomRefs = { clips: [], seams: [], transSpans: [], gaps: [], addBtns: [], kfSpans: [], kfConnectors: [], kfDiamonds: [] };
 
     this._waveEntries = [];
     this._filmstripEntries = [];
     this._lastRenderContext = { project, audioEngine, mediaMap };
+
+    TimelineEngine.normalizeTrackZOrder(project);
 
     const junctions = TimelineEngine.findTransitionJunctions(project);
     const junctionByLeftId = new Map(junctions.map((j) => [j.leftId, j]));
@@ -1514,16 +1897,21 @@ export class TimelineView {
     const nonMainOverlays = project.layers.filter((l) => l.trackRole !== 'main' && l.type !== 'audio');
     const audioLayers = project.layers.filter((l) => l.trackRole !== 'main' && l.type === 'audio');
 
+    // Zone 1 (Top): Non-audio overlays (Text, Shape, Adjustment, Overlay Video/Image, Group)
     for (const layer of nonMainOverlays) {
       this._appendSingleLayerRow(project, layer, selectedLayerId, audioEngine, mediaMap, junctionByLeftId);
     }
 
-    if (mainClips.length > 0) {
-      this._appendMainTrackRow(project, mainClips, selectedLayerId, audioEngine, mediaMap, junctionByLeftId);
-    }
+    // Zone 2 (Center): Single Main Track (ONLY Video & Image) - always visible in the middle
+    this._appendMainTrackRow(project, mainClips, selectedLayerId, audioEngine, mediaMap, junctionByLeftId);
 
+    // Zone 3 (Bottom): Audio tracks ONLY
     for (const layer of audioLayers) {
       this._appendSingleLayerRow(project, layer, selectedLayerId, audioEngine, mediaMap, junctionByLeftId);
+    }
+
+    if (this._activeWheel) {
+      this._renderActiveWheelNodes();
     }
   }
 
@@ -1860,11 +2248,19 @@ export class TimelineView {
     let origMediaOffset = 0;
     let origKeyframes = null;
     let origMainSnapshot = null;
+    let multiGroupSnapshot = null;
     let pushedUndo = false;
     let pendingCenterFrame = null;
     let pendingDrop = null;
     let lastHoverX = -9999;
     let lastHoverY = -9999;
+    let longPressTimer = null;
+    let longPressTriggered = false;
+    let prevStepX = 0;
+    let prevStepMs = 0;
+    let slowAccumMs = 0;
+    let fineSlideActive = false;
+    let effectiveScaledDx = 0;
 
     const isMainMagnetic = Boolean(
       mainCtx &&
@@ -1872,13 +2268,21 @@ export class TimelineView {
       project.settings?.rippleMode !== false
     );
 
+    const cancelLongPress = () => {
+      if (longPressTimer) {
+        clearTimeout(longPressTimer);
+        longPressTimer = null;
+      }
+    };
+
     const detectEdgeHover = (e) => {
       if (layer.locked) return null;
       if (e.target === leftTrim || e.target.closest?.('.mf-trim-handle.left')) return 'left';
       if (e.target === rightTrim || e.target.closest?.('.mf-trim-handle.right')) return 'right';
       const rect = clip.getBoundingClientRect();
       if (rect.width <= 0) return null;
-      const edgeZone = Math.min(13, Math.max(7, rect.width * 0.24));
+      const maxEdge = e.pointerType === 'touch' ? 20 : 14;
+      const edgeZone = Math.min(maxEdge, Math.max(8, rect.width * 0.26));
       const relX = e.clientX - rect.left;
       if (relX <= edgeZone) return 'left';
       if (rect.width - relX <= edgeZone) return 'right';
@@ -1932,16 +2336,27 @@ export class TimelineView {
     };
 
     const stopActiveGestureLoops = () => {
+      cancelLongPress();
       this._stopEdgeAutoScroll();
       if (this._activeDragReapply === reapplyCurrentDrag) {
         this._activeDragReapply = null;
       }
+      clip.classList.remove('is-fine-slide');
       this._hideSnapGuide();
     };
 
     const restoreOrigState = () => {
       stopActiveGestureLoops();
-      if (origMainSnapshot) {
+      if (multiGroupSnapshot && multiGroupSnapshot.length > 1) {
+        for (const g of multiGroupSnapshot) {
+          g.layer.startFrame = g.startFrame;
+          g.layer.endFrame = g.endFrame;
+          g.layer.keyframes = JSON.parse(JSON.stringify(g.keyframes));
+          if (g.clipEl) {
+            g.clipEl.style.left = `${g.startFrame * this.pxPerFrame}px`;
+          }
+        }
+      } else if (origMainSnapshot) {
         for (const snap of origMainSnapshot) {
           snap.layer.startFrame = snap.startFrame;
           snap.layer.endFrame = snap.endFrame;
@@ -1959,29 +2374,99 @@ export class TimelineView {
         clip.style.width = `${Math.max(24, (origEnd - origStart) * this.pxPerFrame)}px`;
       }
       syncDiamondsForClip();
-      clip.classList.remove('mf-clip-dragging-reorder');
+      clip.classList.remove('mf-clip-dragging-reorder', 'is-fine-slide');
       this._hideTooltip('drag');
       clearDropHighlights();
       mode = null;
     };
 
-    const applyDragStep = (clientX, clientY) => {
+    const applyDragStep = (clientX, clientY, fromAutoScroll = false) => {
       if (!mode) return;
       const scrollDx = this.scrollEl.scrollLeft - startScrollLeft;
-      const dx = (clientX - startX) + scrollDx;
+      const rawDx = (clientX - startX) + scrollDx;
       const dy = clientY - startY;
-      if (Math.hypot(dx, dy) < 3 && !pushedUndo) return;
+      if (Math.hypot(rawDx, dy) >= 7) {
+        cancelLongPress();
+      }
+      if (Math.hypot(rawDx, dy) < 4 && !pushedUndo) return;
       if (!pushedUndo) {
         this.cb.onPushUndo();
         pushedUndo = true;
+        prevStepX = rawDx;
+        prevStepMs = performance.now();
+        effectiveScaledDx = rawDx;
         this._startEdgeAutoScroll(edgeAutoScrollTick);
       }
-      const deltaFrames = Math.round(dx / this.pxPerFrame);
+
+      if (!fromAutoScroll) {
+        const nowMs = performance.now();
+        const dt = Math.max(8, nowMs - prevStepMs);
+        const stepDx = rawDx - prevStepX;
+        const speedPxMs = Math.abs(stepDx) / dt;
+        prevStepX = rawDx;
+        prevStepMs = nowMs;
+
+        if (speedPxMs > 0.002 && speedPxMs <= 0.095 && dt < 220) {
+          slowAccumMs += dt;
+          if (!fineSlideActive && slowAccumMs >= 260) {
+            fineSlideActive = true;
+            clip.classList.add('is-fine-slide');
+          }
+        } else if (speedPxMs > 0.36) {
+          slowAccumMs = 0;
+          if (fineSlideActive) {
+            fineSlideActive = false;
+            clip.classList.remove('is-fine-slide');
+          }
+        } else if (speedPxMs > 0.12) {
+          slowAccumMs = Math.max(0, slowAccumMs - dt * 0.5);
+        }
+        effectiveScaledDx += fineSlideActive ? stepDx * 0.25 : stepDx;
+      }
+
+      const activeDx = fineSlideActive ? effectiveScaledDx : rawDx;
+      const deltaFrames = Math.round(activeDx / this.pxPerFrame);
+      const finePrefix = fineSlideActive ? 'Geser Halus · ' : '';
       const fps = Math.max(1, project.fps || 30);
       const globalSnap = Boolean(project.settings?.snapToTimeline);
       const snapActive = isSnapActive(project, this._modifierHeld);
       const snapThreshold = this._getSnapThresholdFrames();
       const bypassSuffix = globalSnap && this._modifierHeld ? ' · Snap Off' : '';
+
+      // Case 0: Multi-Select Group Move maintaining exact relative frame offsets
+      if (mode === 'move' && multiGroupSnapshot && multiGroupSnapshot.length > 1) {
+        clearDropHighlights();
+        const minGroupStart = Math.min(...multiGroupSnapshot.map((g) => g.origStart));
+        const maxLead = Math.max(-minGroupStart, deltaFrames);
+        const leadTarget = Math.max(0, origStart + maxLead);
+        const snapMeta = TimelineEngine.snapFrameWithMeta(
+          project,
+          layer.id,
+          leadTarget,
+          Math.max(1, origEnd - origStart),
+          this.cb.getPlayheadFrame(),
+          snapThreshold,
+          snapActive
+        );
+        const effectiveDelta = Math.max(-minGroupStart, snapMeta.startFrame - origStart);
+        this._showSnapGuide(snapActive ? snapMeta : null);
+
+        for (const g of multiGroupSnapshot) {
+          g.layer.startFrame = Math.max(0, g.origStart + effectiveDelta);
+          g.layer.endFrame = g.layer.startFrame + Math.max(5, g.origEnd - g.origStart);
+          g.layer.keyframes = JSON.parse(JSON.stringify(g.keyframes));
+          TimelineEngine.shiftLayerKeyframes(g.layer, effectiveDelta);
+          TimelineEngine.ensureProjectDuration(project, g.layer.endFrame);
+          if (g.clipEl) {
+            g.clipEl.style.left = `${g.layer.startFrame * this.pxPerFrame}px`;
+          }
+        }
+        syncDiamondsForClip();
+        const snapTag = snapMeta.snapped && snapActive ? ` · Snap: ${snapMeta.label}` : bypassSuffix;
+        this._showTooltip(`${finePrefix}${multiGroupSnapshot.length} Clip (${formatSignedDurationDelta(effectiveDelta, fps)})${snapTag}`, clip, 'drag');
+        this.cb.onPreviewRefresh();
+        return;
+      }
 
       // 2D Drag & Drop target detection across lanes when moving vertically >= 24px
       let hoveredLane = null;
@@ -2021,16 +2506,16 @@ export class TimelineView {
         clip.style.left = `${dragStart * this.pxPerFrame}px`;
         clip.style.transform = `translateY(${dy}px) scale(1.03)`;
         pendingDrop = { targetRole: 'main', targetStartFrame: dragStart, dragCenterFrame: centerFrame };
-        this._showTooltip(`Main Track #${targetSlot + 1} · ${formatDurationShort(len, fps)}`, clip, 'drag');
+        this._showTooltip(`${finePrefix}Main Track #${targetSlot + 1} · ${formatDurationShort(len, fps)}`, clip, 'drag');
         return;
       }
 
-      // Case 2: Main Track clip dragged vertically off Main Track into Overlay zone
-      if (mode === 'move' && layer.trackRole === 'main' && Math.abs(dy) >= 26 && (!hoveredLane || hoveredLane.dataset.laneType !== 'main')) {
+      // Case 2: Main Track clip dragged vertically off Main Track into Top Overlay zone ONLY (never Audio zone)
+      if (mode === 'move' && layer.trackRole === 'main' && Math.abs(dy) >= 26 && (!hoveredLane || (hoveredLane.dataset.laneType !== 'main' && hoveredLane.dataset.zone !== 'audio'))) {
         const mainRect = laneEl?.getBoundingClientRect();
-        if (mainRect && (clientY < mainRect.top - 10 || clientY > mainRect.bottom + 10)) {
+        if (mainRect && clientY < mainRect.top - 10) {
           clearDropHighlights();
-          if (hoveredLane) hoveredLane.classList.add('drop-target');
+          if (hoveredLane && hoveredLane.dataset.zone === 'overlay') hoveredLane.classList.add('drop-target');
           const len = Math.max(5, origEnd - origStart);
           const rawDragStart = Math.max(0, origStart + deltaFrames);
           const snapMeta = TimelineEngine.snapFrameWithMeta(
@@ -2050,7 +2535,7 @@ export class TimelineView {
           const tgtIdx = hoveredLane?.dataset?.layerIndex ? Number(hoveredLane.dataset.layerIndex) : null;
           pendingDrop = { targetRole: 'overlay', targetLayerIndex: Number.isInteger(tgtIdx) ? tgtIdx : null, targetStartFrame: dragStart };
           const snapTag = snapMeta.snapped && snapActive ? ` · Snap: ${snapMeta.label}` : bypassSuffix;
-          this._showTooltip(`Overlay @ ${formatDurationShort(dragStart, fps)}${snapTag}`, clip, 'drag');
+          this._showTooltip(`${finePrefix}Overlay @ ${formatDurationShort(dragStart, fps)}${snapTag}`, clip, 'drag');
           return;
         }
       }
@@ -2094,11 +2579,11 @@ export class TimelineView {
           mainCtx.dropMarker.style.left = `${seamFrame * this.pxPerFrame}px`;
           mainCtx.dropMarker.classList.remove('d-none');
         }
-        this._showTooltip(`Slot #${targetSlot + 1} · ${formatDurationShort(len, fps)}`, clip, 'drag');
+        this._showTooltip(`${finePrefix}Slot #${targetSlot + 1} · ${formatDurationShort(len, fps)}`, clip, 'drag');
         return;
       }
 
-      // Case 4: Standard Move (plus optional vertical row drop across single lanes) or Left/Right Trim/Extend
+      // Case 4: Standard Move (plus optional vertical row drop within same zone) or Left/Right Trim/Extend
       clearDropHighlights();
       pendingDrop = null;
       let activeSnapInfo = null;
@@ -2118,7 +2603,8 @@ export class TimelineView {
         activeSnapInfo = moveRes?.snapInfo || null;
         this._showSnapGuide(snapActive ? activeSnapInfo : null);
 
-        if (hoveredLane && hoveredLane !== laneEl && hoveredLane.dataset.laneType === 'single' && layer.type !== 'audio') {
+        const ownZone = layer.type === 'audio' ? 'audio' : 'overlay';
+        if (layer.trackRole !== 'main' && hoveredLane && hoveredLane !== laneEl && hoveredLane.dataset.laneType === 'single' && hoveredLane.dataset.zone === ownZone) {
           const targetIdx = Number(hoveredLane.dataset.layerIndex);
           if (Number.isInteger(targetIdx)) {
             hoveredLane.classList.add('drop-target');
@@ -2191,7 +2677,7 @@ export class TimelineView {
         const deltaDurF = durF - origDurF;
         const anchorEl = mode === 'left' ? leftTrim : rightTrim;
         this._showTooltip(
-          `${formatDurationShort(durF, fps)} (${formatSignedDurationDelta(deltaDurF, fps)})${snapTag}`,
+          `${finePrefix}${formatDurationShort(durF, fps)} (${formatSignedDurationDelta(deltaDurF, fps)})${snapTag}`,
           anchorEl,
           'drag'
         );
@@ -2199,7 +2685,7 @@ export class TimelineView {
         const deltaMoveF = layer.startFrame - origStart;
         const dropLabel = pendingDrop ? ' · Drop' : '';
         this._showTooltip(
-          `${formatSignedDurationDelta(deltaMoveF, fps)} · ${formatDurationShort(layer.startFrame, fps)}–${formatDurationShort(layer.endFrame, fps)}${dropLabel}${snapTag}`,
+          `${finePrefix}${formatSignedDurationDelta(deltaMoveF, fps)} · ${formatDurationShort(layer.startFrame, fps)}–${formatDurationShort(layer.endFrame, fps)}${dropLabel}${snapTag}`,
           clip,
           'drag'
         );
@@ -2209,7 +2695,7 @@ export class TimelineView {
 
     const reapplyCurrentDrag = () => {
       if (!mode || !pushedUndo) return;
-      applyDragStep(lastClientX, lastClientY);
+      applyDragStep(lastClientX, lastClientY, true);
     };
 
     const edgeAutoScrollTick = () => {
@@ -2229,7 +2715,7 @@ export class TimelineView {
       this.scrollEl.scrollLeft = nextScroll;
       this.redrawRulerOnly();
       this.redrawVisibleClipCanvases();
-      applyDragStep(lastClientX, lastClientY);
+      applyDragStep(lastClientX, lastClientY, true);
     };
 
     const onDown = (e, hitMode) => {
@@ -2237,11 +2723,37 @@ export class TimelineView {
       if (this._isPinching || this.activePointers.size >= 2) return;
       e.stopPropagation();
       this._cancelHoverTooltip();
-      this._updateModifierHeld(Boolean(e.altKey || e.shiftKey || e.ctrlKey || e.metaKey), true);
+      longPressTriggered = false;
+      cancelLongPress();
 
-      // Update selection visual state in-place without rebuilding timeline DOM mid-gesture
-      this.setSelectionInPlace(layer.id);
-      this.cb.onSelectLayer(layer.id, { skipTimelineRender: true });
+      const isToggleMulti = Boolean(e.ctrlKey || e.metaKey);
+      this._updateModifierHeld(Boolean(e.altKey || e.shiftKey), true);
+
+      if (isToggleMulti) {
+        this.cb.onToggleMultiSelectLayer?.(layer.id);
+        return;
+      }
+
+      if (this.selectedLayerIds.has(layer.id) && this.selectedLayerIds.size > 1) {
+        this.setSelectionInPlace(layer.id, this.selectedLayerIds);
+        this.cb.onSelectLayer(layer.id, { skipTimelineRender: true, keepMulti: true });
+      } else {
+        this.setSelectionInPlace(layer.id, [layer.id]);
+        this.cb.onSelectLayer(layer.id, { skipTimelineRender: true });
+      }
+
+      if (hitMode === 'move') {
+        const lpX = e.clientX;
+        const lpY = e.clientY;
+        longPressTimer = setTimeout(() => {
+          if (mode !== 'move' || pushedUndo || this._isPinching || this.activePointers.size >= 2) return;
+          longPressTriggered = true;
+          mode = null;
+          stopActiveGestureLoops();
+          try { navigator.vibrate?.(18); } catch {}
+          this.cb.onOpenClipContextMenu?.(layer.id, lpX, lpY);
+        }, 420);
+      }
 
       if (layer.locked) return;
       const effectiveMode = hitMode === 'move' ? (detectEdgeHover(e) || 'move') : hitMode;
@@ -2257,6 +2769,29 @@ export class TimelineView {
       origKeyframes = JSON.parse(JSON.stringify(layer.keyframes || {}));
       pendingCenterFrame = null;
       pendingDrop = null;
+      slowAccumMs = 0;
+      fineSlideActive = false;
+      effectiveScaledDx = 0;
+      prevStepX = 0;
+      prevStepMs = performance.now();
+
+      if (effectiveMode === 'move' && this.selectedLayerIds.size > 1 && this.selectedLayerIds.has(layer.id)) {
+        multiGroupSnapshot = [...this.selectedLayerIds]
+          .map((id) => project.layers.find((l) => l.id === id))
+          .filter((l) => l && !l.locked)
+          .map((l) => ({
+            layer: l,
+            clipEl: this.lanesList.querySelector(`.mf-clip[data-layer-id="${l.id}"]`),
+            origStart: l.startFrame,
+            origEnd: l.endFrame,
+            startFrame: l.startFrame,
+            endFrame: l.endFrame,
+            keyframes: JSON.parse(JSON.stringify(l.keyframes || {}))
+          }));
+      } else {
+        multiGroupSnapshot = null;
+      }
+
       if (mainCtx?.clipRecords) {
         origMainSnapshot = mainCtx.clipRecords.map((r) => ({
           layer: r.layer,
@@ -2327,20 +2862,26 @@ export class TimelineView {
       this._cancelHoverTooltip();
       lastClientX = e.clientX;
       lastClientY = e.clientY;
-      this._updateModifierHeld(Boolean(e.altKey || e.shiftKey || e.ctrlKey || e.metaKey), true);
-      applyDragStep(lastClientX, lastClientY);
+      this._updateModifierHeld(Boolean(e.altKey || e.shiftKey), true);
+      applyDragStep(lastClientX, lastClientY, false);
     });
 
     const onEnd = (e) => {
+      cancelLongPress();
       this._activeClipAbort = null;
       stopActiveGestureLoops();
       this._hideTooltip('drag');
-      clip.classList.remove('mf-clip-dragging-reorder');
+      clip.classList.remove('mf-clip-dragging-reorder', 'is-fine-slide');
       clearDropHighlights();
       if (e?.pointerId !== undefined) {
         try {
           if (clip.hasPointerCapture?.(e.pointerId)) clip.releasePointerCapture(e.pointerId);
         } catch {}
+      }
+      if (longPressTriggered) {
+        longPressTriggered = false;
+        mode = null;
+        return;
       }
 
       if (mode === 'move' && pendingDrop && pushedUndo) {
@@ -2359,7 +2900,7 @@ export class TimelineView {
         return;
       }
 
-      if (mode === 'move' && isMainMagnetic && pushedUndo) {
+      if (mode === 'move' && isMainMagnetic && pushedUndo && (!multiGroupSnapshot || multiGroupSnapshot.length <= 1)) {
         if (pendingCenterFrame !== null) {
           const moved = TimelineEngine.reorderMainTrackClipByFrame(project, layer.id, pendingCenterFrame);
           if (moved) {

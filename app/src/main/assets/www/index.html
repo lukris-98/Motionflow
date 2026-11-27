@@ -134,10 +134,13 @@
       <button id="btnToggleRipple" class="btn btn-sm btn-dark mf-icon-btn active" title="Magnetic Main Track (Auto Close Gaps)" aria-label="Toggle Magnetic Main Track">
         <i class="bi bi-link-45deg"></i>
       </button>
-      <button id="btnZoomOut" class="btn btn-sm btn-dark mf-icon-btn" title="Zoom Out Timeline" aria-label="Zoom Out">
+      <button id="btnZoomOut" class="btn btn-sm btn-dark mf-icon-btn" title="Zoom Out Timeline (-)" aria-label="Zoom Out">
         <i class="bi bi-zoom-out"></i>
       </button>
-      <button id="btnZoomIn" class="btn btn-sm btn-dark mf-icon-btn" title="Zoom In Timeline" aria-label="Zoom In">
+      <button id="btnZoomFit" class="btn btn-sm btn-dark mf-icon-btn" title="Zoom to Fit (Shift+Z)" aria-label="Zoom to Fit">
+        <i class="bi bi-arrows-fullscreen"></i>
+      </button>
+      <button id="btnZoomIn" class="btn btn-sm btn-dark mf-icon-btn" title="Zoom In Timeline (+)" aria-label="Zoom In">
         <i class="bi bi-zoom-in"></i>
       </button>
     </div>
@@ -358,12 +361,17 @@
           <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
         </div>
         <div class="modal-body">
-          <div class="d-flex justify-content-between align-items-center mb-2">
-            <span class="small text-secondary">Paste .SRT timestamps or lyrics (1 line per cue)</span>
-            <label class="btn btn-xs btn-outline-info py-1 px-2 mb-0" style="cursor:pointer;">
-              <i class="bi bi-file-earmark-text me-1"></i>Load .SRT
-              <input id="inpSrtFile" type="file" accept=".srt,.txt,.vtt" class="d-none" />
-            </label>
+          <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-2">
+            <span class="small text-secondary">Paste .SRT timestamps, lyrics, or auto-generate synced captions</span>
+            <div class="d-flex gap-1">
+              <button id="btnAutoBeatCaptions" type="button" class="btn btn-xs btn-outline-warning py-1 px-2">
+                <i class="bi bi-stars me-1"></i>Auto Caption
+              </button>
+              <label class="btn btn-xs btn-outline-info py-1 px-2 mb-0" style="cursor:pointer;">
+                <i class="bi bi-file-earmark-text me-1"></i>Load .SRT
+                <input id="inpSrtFile" type="file" accept=".srt,.txt,.vtt" class="d-none" />
+              </label>
+            </div>
           </div>
           <textarea id="txtBatchCaptions" rows="6" class="form-control form-control-sm font-monospace mb-2" placeholder="1&#10;00:00:00,500 --> 00:00:02,500&#10;Welcome to MotionFlow&#10;&#10;Or plain lyric lines (1 line = 1 subtitle)"></textarea>
           <div class="row g-2 align-items-center">
