@@ -56,9 +56,12 @@
         <button id="btnToggleGrid" class="btn btn-xs mf-hud-btn" title="Toggle Safe Grid" aria-label="Toggle Safe Grid">
           <i class="bi bi-grid-3x3"></i>
         </button>
-        <button id="btnResetCameraQuick" class="btn btn-xs mf-hud-btn" title="Toggle 3D Viewport (Blender Mode)" aria-label="3D Viewport">
-          <i class="bi bi-badge-3d me-1 text-info"></i>3D
-        </button>
+        <div class="btn-group btn-group-xs mf-mode-switch" role="group" aria-label="Preview Mode 2D / 3D">
+          <button id="btnPreviewMode2D" type="button" class="btn btn-xs mf-hud-btn active" title="Mode Preview Canvas 2D Biasa" aria-label="2D Canvas Mode">2D</button>
+          <button id="btnResetCameraQuick" type="button" class="btn btn-xs mf-hud-btn" title="Mode Preview 3D Viewport" aria-label="3D Viewport Mode">
+            <i class="bi bi-badge-3d me-1 text-info"></i>3D
+          </button>
+        </div>
       </div>
     </div>
 
@@ -80,10 +83,10 @@
       </div>
       <span id="lbl3DHudReadout" class="badge mf-hud-pill text-info text-truncate min-w-0 mx-1">3D · 1F Orbit · 2F Zoom/Pan</span>
       <div class="mf-3d-pill-bar d-flex align-items-center gap-1 flex-shrink-0 pointer-auto">
-        <button id="btn3DCamAutoRec" class="btn btn-xs mf-hud-btn active text-danger" title="Auto-Record Smooth 3D Camera Keyframes" aria-label="Auto-Record 3D Camera">
+        <button id="btn3DCamAutoRec" class="btn btn-xs mf-hud-btn text-danger" title="Auto-Record 3D Keyframes (OFF = wajib klik ◆ Keyframe setelah pindah 3D)" aria-label="Auto-Record 3D Camera">
           <i class="bi bi-record-circle-fill"></i>
         </button>
-        <button id="btn3DCamKf" class="btn btn-xs mf-hud-btn text-warning" title="Keyframe 3D Camera" aria-label="Keyframe 3D Camera">
+        <button id="btn3DCamKf" class="btn btn-xs mf-hud-btn text-warning" title="Tambah / Hapus Keyframe Kamera 3D" aria-label="Keyframe 3D Camera">
           <i class="bi bi-diamond-fill"></i>
         </button>
         <button id="btn3DCamSmoothPath" class="btn btn-xs mf-hud-btn text-info" title="Smooth Recorded 3D Camera Path" aria-label="Smooth 3D Camera Path">
@@ -96,6 +99,18 @@
           <i class="bi bi-sliders2"></i>
         </button>
       </div>
+    </div>
+
+    <!-- Fullview 1-Screen Floating Controls -->
+    <div id="fullviewOverlayBar" class="mf-fullview-bar d-none align-items-center gap-2 pointer-auto">
+      <button id="btnFullviewPlayPause" type="button" class="btn btn-xs mf-hud-btn" title="Play / Pause" aria-label="Play or Pause Fullview">
+        <i id="iconFullviewPlayPause" class="bi bi-play-fill"></i>
+      </button>
+      <span id="lblFullviewTime" class="mf-fullview-time">00:00</span>
+      <span id="lblFullviewModeTag" class="badge bg-info bg-opacity-25 text-info" style="font-size:0.62rem;">Portrait</span>
+      <button id="btnExitFullview" type="button" class="btn btn-xs mf-hud-btn text-warning fw-semibold" title="Keluar Fullview" aria-label="Keluar Fullview">
+        <i class="bi bi-fullscreen-exit me-1"></i>Keluar
+      </button>
     </div>
   </section>
 
@@ -122,9 +137,17 @@
     </div>
 
     <div class="d-flex align-items-center gap-1 flex-shrink-0 mf-transport-group">
-      <button id="btnQuickKeyframe" class="btn btn-sm btn-dark mf-icon-btn" title="Toggle Keyframe" aria-label="Toggle Keyframe">
-        <i class="bi bi-diamond"></i>
-      </button>
+      <div class="btn-group btn-group-sm mf-kf-nav-group" role="group" aria-label="Keyframe Navigation">
+        <button id="btnPrevKeyframe" class="btn btn-sm btn-dark mf-icon-btn mf-kf-step-btn" title="Keyframe Sebelumnya" aria-label="Previous Keyframe">
+          <i class="bi bi-caret-left-fill"></i>
+        </button>
+        <button id="btnQuickKeyframe" class="btn btn-sm btn-dark mf-icon-btn" title="Tambah / Hapus Keyframe" aria-label="Toggle Keyframe">
+          <i class="bi bi-diamond"></i>
+        </button>
+        <button id="btnNextKeyframe" class="btn btn-sm btn-dark mf-icon-btn mf-kf-step-btn" title="Keyframe Berikutnya" aria-label="Next Keyframe">
+          <i class="bi bi-caret-right-fill"></i>
+        </button>
+      </div>
       <button id="btnSplitClip" class="btn btn-sm btn-dark mf-icon-btn" title="Split Clip at Playhead" aria-label="Split Clip">
         <i class="bi bi-scissors"></i>
       </button>
@@ -137,8 +160,8 @@
       <button id="btnZoomOut" class="btn btn-sm btn-dark mf-icon-btn" title="Zoom Out Timeline (-)" aria-label="Zoom Out">
         <i class="bi bi-zoom-out"></i>
       </button>
-      <button id="btnZoomFit" class="btn btn-sm btn-dark mf-icon-btn" title="Zoom to Fit (Shift+Z)" aria-label="Zoom to Fit">
-        <i class="bi bi-arrows-fullscreen"></i>
+      <button id="btnZoomFit" class="btn btn-sm btn-dark mf-icon-btn" title="Fullview 1 Layar (Auto Portrait / Landscape)" aria-label="Fullview 1 Layar">
+        <i id="iconFullviewBtn" class="bi bi-fullscreen"></i>
       </button>
       <button id="btnZoomIn" class="btn btn-sm btn-dark mf-icon-btn" title="Zoom In Timeline (+)" aria-label="Zoom In">
         <i class="bi bi-zoom-in"></i>
@@ -613,6 +636,19 @@
                   <input class="form-check-input" type="checkbox" id="chkExportTrimTail" checked />
                 </div>
               </div>
+              <div class="d-flex align-items-center justify-content-between gap-2 pt-2 mt-1 border-top border-secondary-subtle">
+                <div class="min-w-0 flex-grow-1">
+                  <div class="small fw-semibold text-light d-flex align-items-center gap-1">
+                    <i class="bi bi-folder2-open text-info"></i>
+                    <span>Lokasi File Export</span>
+                  </div>
+                  <div id="lblExportLocation" class="text-secondary text-truncate" style="font-size:0.7rem;">Movies/MotionFlow Studio (Default)</div>
+                </div>
+                <div class="d-flex align-items-center gap-1 flex-shrink-0">
+                  <button id="btnPickExportLocation" type="button" class="btn btn-xs btn-outline-info py-1 px-2">Pilih Lokasi...</button>
+                  <button id="btnClearExportLocation" type="button" class="btn btn-xs btn-outline-secondary py-1 px-2 d-none" title="Reset ke folder default">Reset</button>
+                </div>
+              </div>
             </div>
             <div id="exportCapsHint" class="mf-export-caps-hint text-secondary"></div>
           </div>
@@ -634,8 +670,9 @@
             <i class="bi bi-check-circle-fill text-success fs-1 d-block mb-2"></i>
             <div class="fw-bold fs-6 mb-1">Ready to Share</div>
             <div id="lblExportResultInfo" class="small text-secondary mb-3"></div>
-            <div class="d-flex justify-content-center gap-2">
+            <div class="d-flex flex-wrap justify-content-center gap-2">
               <button id="btnOpenExported" class="btn btn-sm mf-btn-accent px-3 fw-semibold"><i class="bi bi-play-circle me-1"></i>Play Video</button>
+              <button id="btnSaveExportAs" class="btn btn-sm btn-outline-info px-3"><i class="bi bi-folder-symlink me-1"></i>Save As...</button>
               <button id="btnShareExported" class="btn btn-sm btn-outline-light px-3"><i class="bi bi-share me-1"></i>Share</button>
             </div>
           </div>

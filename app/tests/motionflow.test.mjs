@@ -1,8 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { KEYFRAME_LANE_GROUPS, KeyframeEngine, EASING_TYPES } from '../src/main/assets/www/js/engine/keyframeEngine.js';
-import { lerpColorHex, normalizeHexColor } from '../src/main/assets/www/js/utils/math.js';
+import { KEYFRAME_LANE_GROUPS, CAMERA_LANE_GROUPS, CUBIC_BEZIER_PRESETS, KeyframeEngine, EASING_TYPES } from '../src/main/assets/www/js/engine/keyframeEngine.js';
+import { applyEasing, lerpColorHex, normalizeHexColor } from '../src/main/assets/www/js/utils/math.js';
 import {
   STABILIZE_PRESETS,
   StabilizerEngine,
@@ -1291,4 +1291,275 @@ test('3-zone track enforcement, magnetic Main Track (zero gaps when ON, free gap
   assert.equal(c1.audioDetached, true);
   assert.ok(proj.layers.indexOf(detached) > proj.layers.indexOf(c1));
 });
+
+import { Mat4 } from '../src/main/assets/www/js/utils/mat4.js';
+
+test('Mat4.ortho builds valid flat 2D orthographic projection matrix', () => {
+  const m = Mat4.ortho(-640, 640, -360, 360, -1000, 1000);
+  assert.equal(m.length, 16);
+  // Center maps to (0, 0) and (+640, +360) maps to (+1, +1)
+  assert.ok(Math.abs(m[0] * 640 - 1) < 1e-6);
+  assert.ok(Math.abs(m[5] * 360 - 1) < 1e-6);
+  assert.equal(m[15], 1);
+});
+
+test('TimelineEngine Filter and Effect adjustment items manage timeline visibility spans and badges', () => {
+  const proj = createEmptyProject('FilterEffectTimeline', { width: 1280, height: 720, fps: 30, durationSec: 10 });
+  const mainVid = TimelineEngine.createMediaLayer(proj, { id: 'v1', name: 'Clip', type: 'video', width: 1280, height: 720, durationMs: 5000 }, 0);
+  TimelineEngine.addToMainTrack(proj, mainVid);
+
+  const filterItem = TimelineEngine.createAdjustmentLayer(proj, 15, {
+    adjustmentKind: 'filter',
+    name: 'Filter: Cinema',
+    durationFrames: 45,
+    filterId: 'cinema',
+    filterIntensity: 0.9
+  });
+  TimelineEngine.addLayer(proj, filterItem);
+
+  const effectItem = TimelineEngine.createAdjustmentLayer(proj, 30, {
+    adjustmentKind: 'effect',
+    name: 'FX: Shake',
+    durationFrames: 60,
+    vfx: { type: 'shake', intensity: 0.8, speed: 1.2 }
+  });
+  TimelineEngine.setPrimaryLayerVfx(effectItem, 'shake', 0.8, 1.2);
+  TimelineEngine.addLayer(proj, effectItem);
+  TimelineEngine.normalizeTrackZOrder(proj);
+
+  assert.equal(filterItem.adjustmentKind, 'filter');
+  assert.equal(filterItem.startFrame, 15);
+  assert.equal(filterItem.endFrame, 60);
+  assert.equal(effectItem.adjustmentKind, 'effect');
+  assert.equal(effectItem.startFrame, 30);
+  assert.equal(effectItem.endFrame, 90);
+  assert.equal(effectItem.vfxStack[0].type, 'shake');
+
+  // Filter & Effect timeline items sit above main track in overlay zone
+  assert.ok(proj.layers.indexOf(filterItem) < proj.layers.indexOf(mainVid));
+  assert.ok(proj.layers.indexOf(effectItem) < proj.layers.indexOf(mainVid));
+
+  // Trim/extend filter item start and end safely
+  TimelineEngine.trimMainOrClip(proj, filterItem.id, 'left', 5, false, 0, 0);
+  TimelineEngine.trimMainOrClip(proj, filterItem.id, 'right', 90, false, 0, 0);
+  assert.equal(filterItem.startFrame, 5);
+  assert.equal(filterItem.endFrame, 90);
+
+  const fBadges = getClipStatusBadges(filterItem);
+  assert.ok(fBadges.some((b) => b.kind === 'filter'));
+  const eBadges = getClipStatusBadges(effectItem);
+  assert.ok(eBadges.some((b) => b.kind === 'fx'));
+});
+
+test('KeyframeEngine supports Hold step easing for numbers & colors plus Prev/Next navigation', () => {
+  assert.ok(EASING_TYPES.some((e) => e.key === 'hold'));
+  const proj = createEmptyProject('HoldNav', { width: 1280, height: 720, fps: 30, durationSec: 5 });
+  const textLayer = TimelineEngine.createTextLayer(proj, 0);
+  TimelineEngine.addLayer(proj, textLayer);
+
+  KeyframeEngine.setKeyframe(textLayer, 'x', 0, 0, 'hold');
+  KeyframeEngine.setKeyframe(textLayer, 'x', 30, 200, 'linear');
+  KeyframeEngine.setKeyframe(textLayer, 'x', 60, 400, 'easeOut');
+
+  assert.equal(KeyframeEngine.getValueAtFrame(textLayer, 'x', 0, 0), 0);
+  assert.equal(KeyframeEngine.getValueAtFrame(textLayer, 'x', 29, 0), 0);
+  assert.equal(KeyframeEngine.getValueAtFrame(textLayer, 'x', 30, 0), 200);
+  assert.equal(KeyframeEngine.getValueAtFrame(textLayer, 'x', 45, 0), 300);
+
+  KeyframeEngine.setKeyframe(textLayer, 'color', 10, '#ff0000', 'hold');
+  KeyframeEngine.setKeyframe(textLayer, 'color', 40, '#00ff00', 'linear');
+  assert.equal(KeyframeEngine.getColorAtFrame(textLayer, 25, '#ffffff'), '#ff0000');
+  assert.equal(KeyframeEngine.getColorAtFrame(textLayer, 40, '#ffffff'), '#00ff00');
+
+  const frames = KeyframeEngine.getAllKeyframeFrames(textLayer);
+  assert.deepEqual(frames, [0, 10, 30, 40, 60]);
+  assert.equal(KeyframeEngine.getPrevKeyframeFrame(frames, 30), 10);
+  assert.equal(KeyframeEngine.getPrevKeyframeFrame(frames, 0), null);
+  assert.equal(KeyframeEngine.getNextKeyframeFrame(frames, 30), 40);
+  assert.equal(KeyframeEngine.getNextKeyframeFrame(frames, 60), null);
+});
+
+test('KeyframeEngine strict 3D commitStaged3DLayerPose and commitStaged3DCameraPose (Rule of Two)', () => {
+  const proj = createEmptyProject('Strict3D', { width: 1280, height: 720, fps: 30, durationSec: 5 });
+  const clip = TimelineEngine.createShapeLayer(proj, 'rectangle', 10);
+  clip.endFrame = 100;
+  clip.transform.x = 25;
+  clip.transform.z = 0;
+  clip.transform.rotY = 0;
+  TimelineEngine.addLayer(proj, clip);
+
+  // Without explicit commit, clip location at any frame remains at initial 3D transform
+  const beforeF50 = KeyframeEngine.getTransformAtFrame(clip, 50);
+  assert.equal(beforeF50.x, 25);
+  assert.equal(beforeF50.z, 0);
+  assert.equal(beforeF50.rotY, 0);
+
+  // Explicit Add Keyframe commits staged 3D pose at F50 AND anchors startFrame F10
+  KeyframeEngine.commitStaged3DLayerPose(clip, 50, { z: -180, rotY: 42 }, 'easeInOut');
+  assert.equal(KeyframeEngine.getTransformAtFrame(clip, 10).z, 0);
+  assert.equal(KeyframeEngine.getTransformAtFrame(clip, 10).rotY, 0);
+  assert.equal(KeyframeEngine.getTransformAtFrame(clip, 50).z, -180);
+  assert.equal(KeyframeEngine.getTransformAtFrame(clip, 50).rotY, 42);
+  assert.ok(KeyframeEngine.getTransformAtFrame(clip, 30).z < 0 && KeyframeEngine.getTransformAtFrame(clip, 30).z > -180);
+
+  // Camera commit anchors F0 and keys target frame F40
+  const cam = proj.camera;
+  cam.rotY = 5;
+  cam.z = 0;
+  KeyframeEngine.commitStaged3DCameraPose(cam, 40, { rotY: -35, z: 220 }, 'smooth');
+  assert.equal(KeyframeEngine.getCameraAtFrame(cam, 0).rotY, 5);
+  assert.equal(KeyframeEngine.getCameraAtFrame(cam, 40).rotY, -35);
+  assert.equal(KeyframeEngine.getCameraAtFrame(cam, 40).z, 220);
+  assert.equal(KeyframeEngine.hasAnyCameraKeyframeAtFrame(cam, 0), true);
+  assert.equal(KeyframeEngine.hasAnyCameraKeyframeAtFrame(cam, 40), true);
+});
+
+test('KeyframeEngine split & trim preserve scaleX/opacity defaults and segment easing, plus 3D lane toggle & intensity lane', () => {
+  const proj = createEmptyProject('SplitTrimKf', { width: 1280, height: 720, fps: 30, durationSec: 6 });
+  const clip = TimelineEngine.createShapeLayer(proj, 'rectangle', 0);
+  clip.endFrame = 120;
+  clip.transform.scaleX = 1.5;
+  TimelineEngine.addLayer(proj, clip);
+
+  KeyframeEngine.setKeyframe(clip, 'scaleX', 0, 1.0, 'easeIn');
+  KeyframeEngine.setKeyframe(clip, 'scaleX', 100, 2.0, 'easeOut');
+
+  // Toggle 3D position lane includes z, while 2D excludes z unless already set
+  KeyframeEngine.togglePropLaneKeyframeAtFrame(clip, 'position', 20, 'linear', { is3D: true });
+  assert.equal(clip.keyframes.z.length, 1);
+  assert.equal(clip.keyframes.x.length, 1);
+
+  // Split clip at F50 preserves easing on seam boundary keyframe
+  const right = TimelineEngine.splitClipAtFrame(proj, clip.id, 50);
+  assert.ok(right);
+  assert.equal(clip.keyframes.scaleX.at(-1).frame, 50);
+  assert.equal(clip.keyframes.scaleX.at(-1).easing, 'easeIn');
+  assert.equal(right.keyframes.scaleX[0].frame, 50);
+  assert.equal(right.keyframes.scaleX[0].easing, 'easeIn');
+  assert.ok(Math.abs(right.keyframes.scaleX[0].value - KeyframeEngine.getValueAtFrame(clip, 'scaleX', 50, 1)) < 0.01);
+
+  // Trim right side at F80 preserves midpoint scale value & easing
+  TimelineEngine.trimDeleteSideAtPlayhead(proj, right.id, 'right', 80);
+  const trimmedEndKf = right.keyframes.scaleX.find((k) => k.frame === 80);
+  assert.ok(trimmedEndKf);
+  assert.ok(trimmedEndKf.value > 1.0 && trimmedEndKf.value < 2.0);
+
+  // Filter adjustment item exposes intensity lane & interpolates properly
+  const filterItem = TimelineEngine.createAdjustmentLayer(proj, 10, {
+    adjustmentKind: 'filter',
+    name: 'Filter: Cinema',
+    durationFrames: 60,
+    filterId: 'cinema',
+    filterIntensity: 0.8
+  });
+  const visLanes = KeyframeEngine.getVisibleKeyframeLanes(filterItem).map((g) => g.key);
+  assert.ok(visLanes.includes('intensity'));
+  KeyframeEngine.setKeyframe(filterItem, 'intensity', 10, 0.2, 'linear');
+  KeyframeEngine.setKeyframe(filterItem, 'intensity', 50, 1.0, 'linear');
+  assert.ok(Math.abs(KeyframeEngine.getValueAtFrame(filterItem, 'intensity', 30, 0.8) - 0.6) < 0.01);
+
+  // Short-clip shake preset keeps unique monotonic keyframe frames
+  const shortClip = TimelineEngine.createShapeLayer(proj, 'rectangle', 0);
+  shortClip.endFrame = 10;
+  KeyframeEngine.applyPreset(shortClip, 'shake', 1280, 720, 24);
+  const shakeFrames = shortClip.keyframes.x.map((k) => k.frame);
+  assert.equal(new Set(shakeFrames).size, shakeFrames.length);
+});
+
+test('Keyframe interpolation curves (easeOutBack, spring, anticipate, bezier presets) & multiselect batch operations', () => {
+  // 1. Extended easing curves behave meaningfully
+  assert.ok(EASING_TYPES.some((e) => e.key === 'easeOutBack'));
+  assert.ok(EASING_TYPES.some((e) => e.key === 'spring'));
+  assert.ok(EASING_TYPES.some((e) => e.key === 'anticipate'));
+  assert.ok(CUBIC_BEZIER_PRESETS.length >= 4);
+
+  // Overshoot exceeds 1.0 briefly before settling at 1.0
+  assert.equal(applyEasing(0, 'easeOutBack'), 0);
+  assert.equal(applyEasing(1, 'easeOutBack'), 1);
+  assert.ok(applyEasing(0.6, 'easeOutBack') > 1.0);
+
+  // Anticipate pulls backward (< 0) near start
+  assert.equal(applyEasing(0, 'anticipate'), 0);
+  assert.equal(applyEasing(1, 'anticipate'), 1);
+  assert.ok(applyEasing(0.18, 'anticipate') < 0);
+
+  // Spring oscillates cleanly to 1.0
+  assert.equal(applyEasing(0, 'spring'), 0);
+  assert.equal(applyEasing(1, 'spring'), 1);
+  assert.ok(applyEasing(0.32, 'spring') > 0.9);
+
+  // 2. Multiselect move, easing, copy/paste, batch delete across multiple props/layers
+  const proj = createEmptyProject('MultiSelectKF', { width: 1080, height: 1920, fps: 30, durationSec: 8 });
+  const clipA = TimelineEngine.createShapeLayer(proj, 'rectangle', 0);
+  clipA.endFrame = 180;
+  TimelineEngine.addLayer(proj, clipA);
+
+  KeyframeEngine.setKeyframe(clipA, 'x', 10, 0, 'linear');
+  KeyframeEngine.setKeyframe(clipA, 'y', 10, 0, 'linear');
+  KeyframeEngine.setKeyframe(clipA, 'scaleX', 30, 1.0, 'linear');
+  KeyframeEngine.setKeyframe(clipA, 'scaleY', 30, 1.0, 'linear');
+
+  const selection = [
+    { layerId: clipA.id, laneKey: 'position', props: ['x', 'y', 'z'], frame: 10 },
+    { layerId: clipA.id, laneKey: 'scale', props: ['scaleX', 'scaleY'], frame: 30 }
+  ];
+
+  // Batch curve update
+  const updated = KeyframeEngine.setSelectedKeyframesEasing(proj, selection, 'spring');
+  assert.equal(updated, 2);
+  assert.equal(clipA.keyframes.x[0].easing, 'spring');
+  assert.equal(clipA.keyframes.scaleX[0].easing, 'spring');
+
+  // Batch copy & paste at F80 preserves relative +20f offset
+  const clipboard = KeyframeEngine.cloneKeyframesForClipboard(proj, selection);
+  assert.ok(clipboard && clipboard.items.length === 4);
+  const pasted = KeyframeEngine.pasteKeyframesAtFrame(proj, clipboard, 80, clipA.id);
+  assert.equal(pasted.length, 2);
+  assert.ok(clipA.keyframes.x.some((k) => k.frame === 80 && k.easing === 'spring'));
+  assert.ok(clipA.keyframes.scaleX.some((k) => k.frame === 100 && k.easing === 'spring'));
+
+  // Batch move pasted keyframes +15f -> F95 and F115
+  KeyframeEngine.moveSelectedKeyframes(proj, pasted, 15);
+  assert.ok(clipA.keyframes.x.some((k) => k.frame === 95));
+  assert.ok(clipA.keyframes.scaleX.some((k) => k.frame === 115));
+
+  // Batch delete removes shifted keyframes while leaving original F10/F30 intact
+  const movedRefs = pasted.map((p) => ({ ...p, frame: p.frame + 15 }));
+  KeyframeEngine.removeSelectedKeyframes(proj, movedRefs);
+  assert.equal(clipA.keyframes.x.length, 1);
+  assert.equal(clipA.keyframes.x[0].frame, 10);
+});
+
+test('Auto-Rec 3D Camera timeline item bidirectional sync, visibility lanes & delete cleanup', () => {
+  const proj = createEmptyProject('AutoRecCam', { width: 1280, height: 720, fps: 30, durationSec: 6 });
+  proj.camera.enabled = true;
+  KeyframeEngine.setKeyframe(proj.camera, 'x', 0, 0, 'smooth');
+  KeyframeEngine.setKeyframe(proj.camera, 'x', 45, 160, 'smooth');
+  KeyframeEngine.setKeyframe(proj.camera, 'z', 45, -220, 'smooth');
+  KeyframeEngine.setKeyframe(proj.camera, 'rotY', 45, 28, 'smooth');
+  KeyframeEngine.setKeyframe(proj.camera, 'zoom', 45, 1.35, 'smooth');
+
+  const camLayer = TimelineEngine.getOrCreateCameraLayer(proj, { kfExpanded: true });
+  assert.equal(camLayer.type, 'camera');
+  assert.equal(camLayer.kfExpanded, true);
+  assert.equal(TimelineEngine.getOrCreateCameraLayer(proj).id, camLayer.id);
+
+  // Synced keyframes appear inside camera timeline item with CAMERA_LANE_GROUPS
+  const lanes = KeyframeEngine.getVisibleKeyframeLanes(camLayer).map((g) => g.key);
+  assert.deepEqual(lanes, CAMERA_LANE_GROUPS.map((g) => g.key));
+  assert.equal(camLayer.keyframes.x.length, 2);
+  assert.equal(camLayer.keyframes.z[0].value, -220);
+
+  // Editing keyframe on timeline item syncs back to project.camera
+  KeyframeEngine.movePropGroupKeyframe(camLayer, ['x', 'y', 'z'], 45, 60);
+  TimelineEngine.syncLayerToCamera(proj, camLayer);
+  assert.equal(proj.camera.keyframes.x.find((k) => k.frame === 60)?.value, 160);
+  assert.equal(proj.camera.keyframes.z.find((k) => k.frame === 60)?.value, -220);
+
+  // Deleting camera timeline item clears camera keyframes cleanly
+  TimelineEngine.deleteLayer(proj, camLayer.id);
+  assert.equal(TimelineEngine.getCameraLayer(proj), null);
+  assert.equal(KeyframeEngine.getAllCameraKeyframeFrames(proj.camera).length, 0);
+});
+
 

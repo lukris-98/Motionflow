@@ -87,13 +87,33 @@ export function evalCubicBezier(t, x1 = 0.42, y1 = 0, x2 = 0.58, y2 = 1) {
 
 export function applyEasing(t, easing = 'linear', bezier = [0.42, 0, 0.58, 1]) {
   const x = clamp(t, 0, 1);
+  if (x <= 0) return 0;
+  if (x >= 1) return 1;
   switch (easing) {
+    case 'hold':
+      return x >= 1 ? 1 : 0;
     case 'easeIn':
       return x * x * x;
     case 'easeOut':
       return 1 - Math.pow(1 - x, 3);
     case 'easeInOut':
       return x < 0.5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2;
+    case 'easeOutBack': {
+      const c1 = 1.70158;
+      const c3 = c1 + 1;
+      return 1 + c3 * Math.pow(x - 1, 3) + c1 * Math.pow(x - 1, 2);
+    }
+    case 'anticipate': {
+      const c1 = 1.70158;
+      const c3 = c1 + 1;
+      return c3 * x * x * x - c1 * x * x;
+    }
+    case 'spring': {
+      if (x <= 0) return 0;
+      if (x >= 1) return 1;
+      const freq = Math.PI * 3.5;
+      return 1 - Math.exp(-6.0 * x) * Math.cos(freq * x);
+    }
     case 'cubicBezier':
       return evalCubicBezier(x, bezier[0], bezier[1], bezier[2], bezier[3]);
     case 'linear':

@@ -9,10 +9,13 @@ export const ANIMATABLE_PROPS = [
   { key: 'rotation', label: 'Rotation Z (°)', step: 1 },
   { key: 'rotX', label: '3D Tilt X (°)', step: 1 },
   { key: 'rotY', label: '3D Tilt Y (°)', step: 1 },
+  { key: 'rotZ', label: 'Camera Roll Z (°)', step: 1 },
+  { key: 'zoom', label: 'Camera Zoom', step: 0.05 },
   { key: 'opacity', label: 'Opacity', step: 0.05 },
   { key: 'anchorX', label: 'Anchor X', step: 1 },
   { key: 'anchorY', label: 'Anchor Y', step: 1 },
   { key: 'volume', label: 'Audio Volume', step: 0.05 },
+  { key: 'intensity', label: 'Effect / Filter Intensity', step: 0.05 },
   { key: 'color', label: 'Color / Tint', isColor: true }
 ];
 
@@ -74,13 +77,65 @@ export const KEYFRAME_LANE_GROUPS = [
   }
 ];
 
+export const INTENSITY_LANE_GROUP = {
+  key: 'intensity',
+  label: 'Intensitas',
+  icon: 'bi-sliders',
+  color: '#fbbf24',
+  props: ['intensity'],
+  defaultProps: ['intensity'],
+  primaryProp: 'intensity'
+};
+
+export const CAMERA_LANE_GROUPS = [
+  {
+    key: 'position',
+    label: 'Posisi 3D (X/Y/Z)',
+    icon: 'bi-arrows-move',
+    color: '#38bdf8',
+    props: ['x', 'y', 'z'],
+    defaultProps: ['x', 'y', 'z'],
+    primaryProp: 'x'
+  },
+  {
+    key: 'rotation',
+    label: 'Rotasi 3D',
+    icon: 'bi-arrow-repeat',
+    color: '#f472b6',
+    props: ['rotX', 'rotY', 'rotZ'],
+    defaultProps: ['rotX', 'rotY', 'rotZ'],
+    primaryProp: 'rotY'
+  },
+  {
+    key: 'zoom',
+    label: 'Zoom Kamera',
+    icon: 'bi-zoom-in',
+    color: '#a78bfa',
+    props: ['zoom'],
+    defaultProps: ['zoom'],
+    primaryProp: 'zoom'
+  }
+];
+
 export const EASING_TYPES = [
   { key: 'linear', label: 'Linear' },
   { key: 'easeIn', label: 'Ease In' },
   { key: 'easeOut', label: 'Ease Out' },
   { key: 'easeInOut', label: 'Ease In-Out' },
-  { key: 'smooth', label: 'Smooth Spline (Camera)' },
+  { key: 'smooth', label: 'Smooth Spline' },
+  { key: 'easeOutBack', label: 'Overshoot' },
+  { key: 'spring', label: 'Spring Bounce' },
+  { key: 'anticipate', label: 'Anticipate' },
+  { key: 'hold', label: 'Hold (Tetap)' },
   { key: 'cubicBezier', label: 'Cubic Bezier' }
+];
+
+export const CUBIC_BEZIER_PRESETS = [
+  { id: 'smooth', label: 'CapCut Smooth', bezier: [0.25, 0.1, 0.25, 1.0] },
+  { id: 'snappy', label: 'Snappy Out', bezier: [0.16, 1.0, 0.3, 1.0] },
+  { id: 'fastCut', label: 'Fast Cut', bezier: [0.7, 0.0, 0.2, 1.0] },
+  { id: 'overshoot', label: 'Pop Overshoot', bezier: [0.34, 1.45, 0.64, 1.0] },
+  { id: 'anticipate', label: 'Anticipate', bezier: [0.36, -0.35, 0.65, 1.0] }
 ];
 
 export const ANIMATION_PRESETS = [
@@ -126,29 +181,61 @@ export const KeyframeEngine = {
       return normalizeHexColor(layer.fx?.tintColor || '#ffffff', '#ffffff');
     }
     if (prop === 'volume') return layer.audioProps?.volume ?? 1;
+    if (prop === 'intensity') {
+      if (layer.adjustmentKind === 'effect') {
+        const firstActive = Array.isArray(layer.vfxStack) ? layer.vfxStack.find((v) => v && v.enabled !== false && v.type !== 'none') : null;
+        return firstActive?.intensity ?? layer.vfx?.intensity ?? 0.75;
+      }
+      return layer.filterIntensity ?? 1;
+    }
+    if (prop === 'zoom') return layer.type === 'camera' ? 1 : (layer.transform?.zoom ?? 1);
     const base = layer.transform || {};
     if (prop === 'scaleX' || prop === 'scaleY' || prop === 'opacity') return base[prop] ?? 1;
     return base[prop] ?? 0;
   },
 
+  getLaneGroupByKey(laneKey, layer = null) {
+    if (layer?.type === 'camera') {
+      const camGroup = CAMERA_LANE_GROUPS.find((g) => g.key === laneKey);
+      if (camGroup) return camGroup;
+    }
+    if (laneKey === 'zoom') return CAMERA_LANE_GROUPS[2];
+    if (laneKey === 'intensity') return INTENSITY_LANE_GROUP;
+    return KEYFRAME_LANE_GROUPS.find((g) => g.key === laneKey) || null;
+  },
+
   getVisibleKeyframeLanes(layer) {
     if (!layer) return [];
+    if (layer.type === 'camera') {
+      return CAMERA_LANE_GROUPS.map((g) => ({ ...g, props: [...g.props], defaultProps: [...g.defaultProps] }));
+    }
     const hasProps = (props) => props.some((p) => (layer.keyframes?.[p]?.length || 0) > 0);
-    return KEYFRAME_LANE_GROUPS.filter((g) => {
+    const base = KEYFRAME_LANE_GROUPS.filter((g) => {
       if (hasProps(g.props)) return true;
       if (layer.type === 'audio') return g.key === 'volume';
       if (layer.type === 'adjustment') return g.key === 'opacity' || g.key === 'color';
       if (g.key === 'volume') return layer.type === 'video' || Boolean(layer.audioProps);
       return true;
     });
+    if (
+      layer.type === 'adjustment' &&
+      (layer.adjustmentKind === 'filter' || layer.adjustmentKind === 'effect' || hasProps(['intensity']))
+    ) {
+      base.push(INTENSITY_LANE_GROUP);
+    } else if (layer.type !== 'adjustment' && hasProps(['intensity'])) {
+      base.push(INTENSITY_LANE_GROUP);
+    }
+    return base;
   },
 
   setKeyframe(target, prop, frame, value, easing = 'easeInOut', bezier = [0.42, 0, 0.58, 1], opts = null) {
     const f = Math.round(frame);
-    const list = this.ensurePropTrack(target, prop);
+    if (!Number.isFinite(f)) return null;
     const storedVal = prop === 'color'
       ? normalizeHexColor(String(value || '#ffffff'), '#ffffff')
       : Number(value);
+    if (prop !== 'color' && !Number.isFinite(storedVal)) return null;
+    const list = this.ensurePropTrack(target, prop);
     const existing = list.find((k) => k.frame === f);
     if (existing) {
       existing.value = storedVal;
@@ -217,6 +304,44 @@ export const KeyframeEngine = {
       for (const k of arr) set.add(k.frame);
     }
     return Array.from(set).sort((a, b) => a - b);
+  },
+
+  getAllCameraKeyframeFrames(camera) {
+    const set = new Set();
+    if (!camera?.keyframes) return [];
+    for (const arr of Object.values(camera.keyframes)) {
+      if (!Array.isArray(arr)) continue;
+      for (const k of arr) set.add(k.frame);
+    }
+    return Array.from(set).sort((a, b) => a - b);
+  },
+
+  hasAnyCameraKeyframeAtFrame(camera, frame) {
+    const f = Math.round(frame);
+    if (!camera?.keyframes) return false;
+    return Object.values(camera.keyframes).some((arr) => Array.isArray(arr) && arr.some((k) => k.frame === f));
+  },
+
+  getPrevKeyframeFrame(targetOrFrames, currentFrame) {
+    const f = Math.round(currentFrame);
+    const frames = Array.isArray(targetOrFrames)
+      ? [...targetOrFrames].sort((a, b) => a - b)
+      : this.getAllKeyframeFrames(targetOrFrames);
+    for (let i = frames.length - 1; i >= 0; i--) {
+      if (frames[i] < f) return frames[i];
+    }
+    return null;
+  },
+
+  getNextKeyframeFrame(targetOrFrames, currentFrame) {
+    const f = Math.round(currentFrame);
+    const frames = Array.isArray(targetOrFrames)
+      ? [...targetOrFrames].sort((a, b) => a - b)
+      : this.getAllKeyframeFrames(targetOrFrames);
+    for (let i = 0; i < frames.length; i++) {
+      if (frames[i] > f) return frames[i];
+    }
+    return null;
   },
 
   getLaneKeyframes(layer, propKeys) {
@@ -301,8 +426,8 @@ export const KeyframeEngine = {
     return updated;
   },
 
-  togglePropLaneKeyframeAtFrame(layer, laneKey, frame, easing = 'easeInOut') {
-    const group = KEYFRAME_LANE_GROUPS.find((g) => g.key === laneKey);
+  togglePropLaneKeyframeAtFrame(layer, laneKey, frame, easing = 'easeInOut', opts = {}) {
+    const group = this.getLaneGroupByKey(laneKey, layer);
     if (!layer || !group) return { added: false, laneKey };
     const f = Math.max(layer.startFrame || 0, Math.min(layer.endFrame ?? frame, Math.round(frame)));
     const exists = group.props.some((p) => Boolean(this.getKeyframeAtFrame(layer, p, f)));
@@ -311,18 +436,108 @@ export const KeyframeEngine = {
       return { added: false, laneKey, frame: f };
     }
     const tf = this.getTransformAtFrame(layer, f);
-    for (const p of group.defaultProps) {
+    let targetProps = [...group.defaultProps];
+    if (layer.type !== 'camera') {
+      if (laneKey === 'position') {
+        const has3DPos = Boolean(opts?.is3D) || Math.abs(tf.z || 0) > 1e-4 || (layer.keyframes?.z?.length || 0) > 0;
+        if (has3DPos && !targetProps.includes('z')) targetProps.push('z');
+      } else if (laneKey === 'rotation') {
+        const has3DRot = Boolean(opts?.is3D) || Math.abs(tf.rotX || 0) > 1e-4 || Math.abs(tf.rotY || 0) > 1e-4 ||
+          (layer.keyframes?.rotX?.length || 0) > 0 || (layer.keyframes?.rotY?.length || 0) > 0;
+        if (has3DRot) {
+          if (!targetProps.includes('rotX')) targetProps.push('rotX');
+          if (!targetProps.includes('rotY')) targetProps.push('rotY');
+        }
+      }
+    }
+    for (const p of targetProps) {
       let val;
       if (p === 'color') {
         val = this.getColorAtFrame(layer, f, this.getDefaultPropValue(layer, 'color'));
-      } else if (p === 'volume') {
-        val = this.getValueAtFrame(layer, 'volume', f, this.getDefaultPropValue(layer, 'volume'));
+      } else if (p === 'volume' || p === 'intensity' || p === 'zoom' || p === 'rotZ' || layer.type === 'camera') {
+        val = this.getValueAtFrame(layer, p, f, this.getDefaultPropValue(layer, p));
       } else {
         val = tf[p] ?? this.getDefaultPropValue(layer, p);
       }
       this.setKeyframe(layer, p, f, val, easing);
     }
     return { added: true, laneKey, frame: f };
+  },
+
+  getSegmentEasingAtFrame(target, prop, frame) {
+    const f = Math.round(frame);
+    const list = target?.keyframes?.[prop];
+    if (!Array.isArray(list) || list.length === 0) {
+      return { easing: 'easeInOut', bezier: [0.42, 0, 0.58, 1] };
+    }
+    const sorted = [...list].sort((a, b) => a.frame - b.frame);
+    if (f <= sorted[0].frame) {
+      return {
+        easing: sorted[0].easing || 'easeInOut',
+        bezier: [...(sorted[0].bezier || [0.42, 0, 0.58, 1])]
+      };
+    }
+    for (let i = 0; i < sorted.length - 1; i++) {
+      const a = sorted[i];
+      const b = sorted[i + 1];
+      if (f >= a.frame && f <= b.frame) {
+        return {
+          easing: a.easing || 'linear',
+          bezier: [...(a.bezier || [0.42, 0, 0.58, 1])]
+        };
+      }
+    }
+    const last = sorted[sorted.length - 1];
+    return {
+      easing: last.easing || 'easeInOut',
+      bezier: [...(last.bezier || [0.42, 0, 0.58, 1])]
+    };
+  },
+
+  partitionKeyframesAtSplit(orig, right, splitFrame) {
+    const f = Math.round(splitFrame);
+    if (!orig?.keyframes) return;
+    if (!right.keyframes) right.keyframes = {};
+    for (const prop of Object.keys(orig.keyframes)) {
+      const list = orig.keyframes[prop];
+      if (!Array.isArray(list) || list.length === 0) continue;
+      const fallback = this.getDefaultPropValue(orig, prop);
+      const valAtSplit = this.getValueAtFrame(orig, prop, f, fallback);
+      const seg = this.getSegmentEasingAtFrame(orig, prop, f);
+      const hasBoundary = list.some((k) => k.frame === f);
+      const firstF = list[0]?.frame ?? f;
+      const lastF = list[list.length - 1]?.frame ?? f;
+      orig.keyframes[prop] = list.filter((k) => k.frame <= f).map((k) => ({ ...k, bezier: [...(k.bezier || [0.42, 0, 0.58, 1])] }));
+      right.keyframes[prop] = (right.keyframes[prop] || []).filter((k) => k.frame >= f).map((k) => ({ ...k, bezier: [...(k.bezier || [0.42, 0, 0.58, 1])] }));
+      if (!hasBoundary && f > firstF && f < lastF) {
+        this.setKeyframe(orig, prop, f, valAtSplit, seg.easing, seg.bezier);
+        this.setKeyframe(right, prop, f, valAtSplit, seg.easing, seg.bezier);
+      } else if (!hasBoundary && orig.keyframes[prop].length > 0 && right.keyframes[prop].length > 0) {
+        this.setKeyframe(orig, prop, f, valAtSplit, seg.easing, seg.bezier);
+        this.setKeyframe(right, prop, f, valAtSplit, seg.easing, seg.bezier);
+      }
+    }
+  },
+
+  trimKeyframesAtBoundary(layer, keepSide, splitFrame) {
+    const f = Math.round(splitFrame);
+    if (!layer?.keyframes) return;
+    for (const prop of Object.keys(layer.keyframes)) {
+      const list = layer.keyframes[prop];
+      if (!Array.isArray(list) || list.length === 0) continue;
+      const fallback = this.getDefaultPropValue(layer, prop);
+      const valAtSplit = this.getValueAtFrame(layer, prop, f, fallback);
+      const seg = this.getSegmentEasingAtFrame(layer, prop, f);
+      const hasBoundary = list.some((k) => k.frame === f);
+      const hadBefore = list.some((k) => k.frame < f);
+      const hadAfter = list.some((k) => k.frame > f);
+      layer.keyframes[prop] = keepSide === 'right'
+        ? list.filter((k) => k.frame >= f)
+        : list.filter((k) => k.frame <= f);
+      if (!hasBoundary && hadBefore && hadAfter) {
+        this.setKeyframe(layer, prop, f, valAtSplit, seg.easing, seg.bezier);
+      }
+    }
   },
 
   getValueAtFrame(target, prop, frame, fallbackValue = 0) {
@@ -345,9 +560,12 @@ export const KeyframeEngine = {
       const b = list[i + 1];
       if (frame >= a.frame && frame <= b.frame) {
         const span = b.frame - a.frame;
-        if (span <= 0) return b.value;
-        const rawT = (frame - a.frame) / span;
+        if (span <= 0 || frame === b.frame) return b.value;
         const easingMode = a.easing || 'linear';
+        if (easingMode === 'hold') {
+          return a.value;
+        }
+        const rawT = (frame - a.frame) / span;
         if (easingMode === 'smooth') {
           if (list.length === 2) {
             return lerp(a.value, b.value, applyEasing(rawT, 'easeInOut'));
@@ -394,7 +612,8 @@ export const KeyframeEngine = {
       const b = list[i + 1];
       if (frame >= a.frame && frame <= b.frame) {
         const span = b.frame - a.frame;
-        if (span <= 0) return normalizeHexColor(String(b.value), safeFallback);
+        if (span <= 0 || frame === b.frame) return normalizeHexColor(String(b.value), safeFallback);
+        if (a.easing === 'hold') return normalizeHexColor(String(a.value), safeFallback);
         const rawT = (frame - a.frame) / span;
         const mode = a.easing === 'smooth' ? 'easeInOut' : (a.easing || 'linear');
         const easedT = applyEasing(rawT, mode, a.bezier || [0.42, 0, 0.58, 1]);
@@ -594,11 +813,16 @@ export const KeyframeEngine = {
         break;
       }
       case 'shake': {
-        const step = Math.max(2, Math.round((end - start) / 6));
         const offsets = [0, -18, 18, -12, 12, -5, 0];
+        const span = Math.max(6, end - start);
+        let prevF = -1;
         offsets.forEach((dx, i) => {
-          const f = Math.min(layer.endFrame, start + i * step);
-          sk('x', f, base.x + dx, 'linear');
+          let f = Math.min(layer.endFrame, start + Math.round((i / (offsets.length - 1)) * span));
+          if (f <= prevF) f = Math.min(layer.endFrame, prevF + 1);
+          if (f > prevF) {
+            sk('x', f, base.x + dx, 'linear');
+            prevF = f;
+          }
         });
         break;
       }
@@ -715,5 +939,187 @@ export const KeyframeEngine = {
       });
     }
     return touched;
+  },
+
+  /**
+   * Commits a staged 3D Layer pose explicitly after the user moves in 3D and clicks Add Keyframe.
+   * Implements CapCut's Rule of Two: if a 3D/position/rotation prop has no keyframes yet and
+   * frame > layer.startFrame, anchors the previous saved value at layer.startFrame first.
+   */
+  commitStaged3DLayerPose(layer, frame, stagedProps, easing = 'easeInOut') {
+    if (!layer || !stagedProps) return 0;
+    const f = Math.max(layer.startFrame || 0, Math.min(layer.endFrame ?? frame, Math.round(frame)));
+    const anchorF = Math.max(0, Math.round(layer.startFrame || 0));
+    const props = ['x', 'y', 'z', 'scaleX', 'scaleY', 'rotation', 'rotX', 'rotY'];
+    const priorTf = this.getTransformAtFrame(layer, f);
+    let committed = 0;
+
+    for (const prop of props) {
+      if (!Object.prototype.hasOwnProperty.call(stagedProps, prop)) continue;
+      const nextVal = Number(stagedProps[prop]);
+      if (!Number.isFinite(nextVal)) continue;
+      const prevVal = Number(priorTf[prop] ?? this.getDefaultPropValue(layer, prop));
+      const trackLen = layer.keyframes?.[prop]?.length || 0;
+      const is3DAxis = prop === 'z' || prop === 'rotX' || prop === 'rotY';
+      const changed = Math.abs(nextVal - prevVal) > 1e-4;
+      if (!changed && trackLen === 0 && !is3DAxis) continue;
+      if (trackLen === 0 && f > anchorF && changed) {
+        const baseStartVal = Number(layer.transform?.[prop] ?? this.getDefaultPropValue(layer, prop));
+        this.setKeyframe(layer, prop, anchorF, baseStartVal, easing);
+      } else if (trackLen === 0 && f === anchorF && layer.transform) {
+        layer.transform[prop] = nextVal;
+      }
+      this.setKeyframe(layer, prop, f, nextVal, easing);
+      committed++;
+    }
+    return committed;
+  },
+
+  /**
+   * Commits a staged 3D Camera pose explicitly after the user moves the 3D camera and clicks Add Keyframe.
+   * Anchors F0 with the previous camera value if no keyframes exist yet and frame > 0.
+   */
+  commitStaged3DCameraPose(camera, frame, stagedCam, easing = 'smooth') {
+    if (!camera || !stagedCam) return 0;
+    const f = Math.max(0, Math.round(frame));
+    camera.enabled = true;
+    const priorCam = this.getCameraAtFrame(camera, f);
+    const props = ['x', 'y', 'z', 'rotX', 'rotY', 'rotZ', 'zoom'];
+    let committed = 0;
+
+    for (const prop of props) {
+      if (!Object.prototype.hasOwnProperty.call(stagedCam, prop)) continue;
+      const nextVal = Number(stagedCam[prop]);
+      if (!Number.isFinite(nextVal)) continue;
+      const prevVal = Number(priorCam[prop] ?? (prop === 'zoom' ? 1 : 0));
+      const trackLen = camera.keyframes?.[prop]?.length || 0;
+      const changed = Math.abs(nextVal - prevVal) > 1e-4;
+      if (trackLen === 0 && f > 0 && changed) {
+        const baseVal = Number(camera[prop] ?? (prop === 'zoom' ? 1 : 0));
+        this.setKeyframe(camera, prop, 0, baseVal, easing);
+      } else if (trackLen === 0 && f === 0) {
+        camera[prop] = nextVal;
+      }
+      this.setKeyframe(camera, prop, f, nextVal, easing);
+      committed++;
+    }
+    return committed;
+  },
+
+  /**
+   * Batch-shifts multiple selected keyframes by deltaFrames cleanly (avoiding frame collisions inside the batch).
+   * items: Array<{ layerId, laneKey?, props?, frame }>
+   */
+  moveSelectedKeyframes(project, items, deltaFrames) {
+    const df = Math.round(Number(deltaFrames) || 0);
+    if (!project?.layers || !Array.isArray(items) || items.length === 0 || df === 0) return 0;
+    const minFrame = Math.min(...items.map((it) => Math.round(Number(it.frame) || 0)));
+    const safeDelta = Math.max(-minFrame, df);
+    if (safeDelta === 0) return 0;
+
+    const extracted = [];
+    for (const it of items) {
+      const layer = project.layers.find((l) => l.id === it.layerId);
+      if (!layer?.keyframes) continue;
+      const group = it.props?.length ? { props: it.props } : this.getLaneGroupByKey(it.laneKey, layer);
+      const props = group?.props || [];
+      const f = Math.round(it.frame);
+      for (const prop of props) {
+        const list = layer.keyframes[prop];
+        if (!Array.isArray(list)) continue;
+        const idx = list.findIndex((k) => k.frame === f);
+        if (idx >= 0) {
+          const [kf] = list.splice(idx, 1);
+          extracted.push({ layer, prop, kf, newFrame: Math.max(0, f + safeDelta) });
+        }
+      }
+    }
+
+    for (const ex of extracted) {
+      const list = this.ensurePropTrack(ex.layer, ex.prop);
+      const colIdx = list.findIndex((k) => k.frame === ex.newFrame);
+      if (colIdx >= 0) list.splice(colIdx, 1);
+      ex.kf.frame = ex.newFrame;
+      list.push(ex.kf);
+      list.sort((a, b) => a.frame - b.frame);
+    }
+    return extracted.length;
+  },
+
+  setSelectedKeyframesEasing(project, items, easing, bezier = null) {
+    if (!project?.layers || !Array.isArray(items) || items.length === 0) return 0;
+    let updated = 0;
+    for (const it of items) {
+      const layer = project.layers.find((l) => l.id === it.layerId);
+      if (!layer) continue;
+      const group = it.props?.length ? { props: it.props } : this.getLaneGroupByKey(it.laneKey, layer);
+      if (!group) continue;
+      if (this.setPropGroupEasing(layer, group.props, it.frame, easing, bezier)) {
+        updated++;
+      }
+    }
+    return updated;
+  },
+
+  removeSelectedKeyframes(project, items) {
+    if (!project?.layers || !Array.isArray(items) || items.length === 0) return 0;
+    let removed = 0;
+    for (const it of items) {
+      const layer = project.layers.find((l) => l.id === it.layerId);
+      if (!layer) continue;
+      const group = it.props?.length ? { props: it.props } : this.getLaneGroupByKey(it.laneKey, layer);
+      if (!group) continue;
+      if (this.removePropGroupKeyframe(layer, group.props, it.frame)) {
+        removed++;
+      }
+    }
+    return removed;
+  },
+
+  cloneKeyframesForClipboard(project, items) {
+    if (!project?.layers || !Array.isArray(items) || items.length === 0) return null;
+    const minFrame = Math.min(...items.map((it) => Math.round(Number(it.frame) || 0)));
+    const copied = [];
+    for (const it of items) {
+      const layer = project.layers.find((l) => l.id === it.layerId);
+      if (!layer?.keyframes) continue;
+      const group = it.props?.length ? { props: it.props, key: it.laneKey } : this.getLaneGroupByKey(it.laneKey, layer);
+      if (!group) continue;
+      const f = Math.round(it.frame);
+      for (const prop of group.props) {
+        const kf = this.getKeyframeAtFrame(layer, prop, f);
+        if (!kf) continue;
+        copied.push({
+          layerId: layer.id,
+          laneKey: it.laneKey || group.key,
+          prop,
+          offset: f - minFrame,
+          value: kf.value,
+          easing: kf.easing || 'easeInOut',
+          bezier: [...(kf.bezier || [0.42, 0, 0.58, 1])]
+        });
+      }
+    }
+    return copied.length > 0 ? { minFrame, items: copied } : null;
+  },
+
+  pasteKeyframesAtFrame(project, clipboard, targetFrame, fallbackLayerId = null) {
+    if (!project?.layers || !clipboard?.items?.length) return [];
+    const baseFrame = Math.max(0, Math.round(targetFrame));
+    const pastedRefs = [];
+    const seenKeys = new Set();
+    for (const item of clipboard.items) {
+      const layer = project.layers.find((l) => l.id === item.layerId)
+        || (fallbackLayerId ? project.layers.find((l) => l.id === fallbackLayerId) : null);
+      if (!layer) continue;
+      const f = Math.max(0, baseFrame + Math.round(item.offset || 0));
+      this.setKeyframe(layer, item.prop, f, item.value, item.easing, item.bezier);
+      const refKey = `${layer.id}|${item.laneKey}|${f}`;
+      if (!seenKeys.has(refKey)) {
+        seenKeys.add(refKey);
+        pastedRefs.push({ layerId: layer.id, laneKey: item.laneKey, frame: f });
+      }
+    }
+    return pastedRefs;
   }
 };

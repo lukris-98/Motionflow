@@ -51,6 +51,11 @@ class MotionFlowApp {
     this._cutoutTargetLayerId = null;
     this._cutoutSourceCanvas = null;
     this._templatePreview = null;
+    this._mediaRafId = null;
+    this.isPreviewFullview = false;
+    this._fullviewResizeTimers = [];
+    this._liveAutoRecRefreshTimer = null;
+    this.exportLocation = { uri: '', displayName: '', webHandle: null };
 
     this.history = new HistoryManager(40);
     this.audioEngine = new AudioEngine();
@@ -59,7 +64,11 @@ class MotionFlowApp {
       document.getElementById('overlayCanvas')
     );
     this.renderer.onMediaFrameReady = () => {
-      if (!this.isPlaying) this.renderPreview();
+      if (this.isPlaying || this._mediaRafId) return;
+      this._mediaRafId = requestAnimationFrame(() => {
+        this._mediaRafId = null;
+        if (!this.isPlaying) this.renderPreview();
+      });
     };
     this.exportEngine = new ExportEngine(this.renderer, this.audioEngine);
     this.trackerEngine = new TrackerEngine(this.renderer);
@@ -75,9 +84,12 @@ class MotionFlowApp {
     this.viewport3D = {
       enabled: false,
       tool: 'move', // 'move' | 'rotate' | 'scale' | 'camera'
-      autoRecord: true
+      autoRecord: false
     };
+    this._pending3DLayerPose = null;
+    this._pending3DCamPose = null;
     this.renderer.setViewport3DState(this.viewport3D);
+    this.renderer.setPending3DPose(null, null);
     this.trackerState = {
       active: false,
       isTracking: false,
@@ -128,6 +140,7 @@ class MotionFlowApp {
         const layer = this.project.layers.find((l) => l.id === layerId);
         if (!layer) return;
         KeyframeEngine.moveAllKeyframesAtFrame(layer, oldF, newF);
+        if (layer.type === 'camera') TimelineEngine.syncLayerToCamera(this.project, layer);
         this.onTimelineMutated();
         this.showToast(`Moved keyframe F${oldF} → F${newF}`);
       },
@@ -137,20 +150,34 @@ class MotionFlowApp {
         const layer = this.project.layers.find((l) => l.id === layerId);
         if (!layer) return;
         KeyframeEngine.movePropGroupKeyframe(layer, propKeys, oldF, newF);
+        if (layer.type === 'camera') TimelineEngine.syncLayerToCamera(this.project, layer);
         this.onTimelineMutated();
         this.showToast(`Keyframe digeser F${oldF} → F${newF}`);
       },
       onDeletePropKeyframe: (layerId, propKeys, frame) => {
         const layer = this.project.layers.find((l) => l.id === layerId);
         if (!layer) return;
-        this.mutateProject(() => KeyframeEngine.removePropGroupKeyframe(layer, propKeys, frame));
+        this.mutateProject(() => {
+          KeyframeEngine.removePropGroupKeyframe(layer, propKeys, frame);
+          if (layer.type === 'camera') TimelineEngine.syncLayerToCamera(this.project, layer);
+        });
         this.showToast(`Keyframe F${frame} dihapus`);
       },
       onSetPropKeyframeEasing: (layerId, propKeys, frame, easing) => {
         const layer = this.project.layers.find((l) => l.id === layerId);
         if (!layer) return;
-        this.mutateProject(() => KeyframeEngine.setPropGroupEasing(layer, propKeys, frame, easing));
+        this.mutateProject(() => {
+          KeyframeEngine.setPropGroupEasing(layer, propKeys, frame, easing);
+          if (layer.type === 'camera') TimelineEngine.syncLayerToCamera(this.project, layer);
+        });
       },
+      onMoveSelectedKeyframes: (items, deltaFrames) => this.moveSelectedKeyframesAction(items, deltaFrames, { skipUndo: true }),
+      onSetSelectedKeyframesEasing: (items, easing, bezier) => this.setSelectedKeyframesEasingAction(items, easing, bezier),
+      onDeleteSelectedKeyframes: (items) => this.deleteSelectedKeyframesAction(items),
+      onCopyKeyframes: (clip) => {
+        if (clip?.items?.length) this.showToast(`${clip.items.length} keyframe disalin`);
+      },
+      onPasteKeyframes: (clip, targetFrame, fallbackLayerId) => this.pasteCopiedKeyframesAction(clip, targetFrame, fallbackLayerId),
       onSetPropKeyframeColor: (layerId, frame, hexColor, easing) => {
         const layer = this.project.layers.find((l) => l.id === layerId);
         if (!layer) return;
@@ -294,6 +321,7 @@ class MotionFlowApp {
 
   mutateProject(mutator) {
     this.stopTemplateLivePreview({ skipRender: true });
+    this.clearPending3DPose(false);
     this.pushUndo();
     mutator();
     this.onTimelineMutated();
@@ -399,15 +427,292 @@ class MotionFlowApp {
     document.getElementById('btnGroupChecked')?.classList.toggle('d-none', totalGroupCount < 2);
   }
 
-  updateTransportLabels() {
-    document.getElementById('lblTimecode').textContent = formatTimecode(this.currentFrame, this.project.fps);
-    document.getElementById('lblFrameCounter').textContent = `F ${this.currentFrame} / ${this.project.durationFrames}`;
+  getEffectiveLayerTransform(layer, frame = this.currentFrame) {
+    if (!layer) return null;
+    const base = KeyframeEngine.getTransformAtFrame(layer, frame);
+    const f = Math.round(frame);
+    if (this._pending3DLayerPose && this._pending3DLayerPose.layerId === layer.id && this._pending3DLayerPose.frame === f) {
+      return { ...base, ...this._pending3DLayerPose.props };
+    }
+    return base;
+  }
 
+  getEffectiveCamera(frame = this.currentFrame) {
+    const base = KeyframeEngine.getCameraAtFrame(this.project?.camera, frame);
+    const f = Math.round(frame);
+    if (this._pending3DCamPose && this._pending3DCamPose.frame === f) {
+      return { ...base, ...this._pending3DCamPose.props };
+    }
+    return base;
+  }
+
+  clearPending3DPose(shouldRender = false) {
+    const hadAny = Boolean(this._pending3DLayerPose || this._pending3DCamPose);
+    this._pending3DLayerPose = null;
+    this._pending3DCamPose = null;
+    this.renderer?.setPending3DPose?.(null, null);
+    if (shouldRender && hadAny) {
+      this.updateTransportLabels();
+      this.syncViewport3DUI();
+      this.renderPreview();
+      this.panels?.renderInspector();
+      if (this.panels?.activeStyleTab === 'camera') this.panels.renderStylePanel();
+    }
+    return hadAny;
+  }
+
+  getActiveKeyframeJumpFrames() {
     const layer = this.getSelectedLayer();
-    const hasKf = layer && KeyframeEngine.hasAnyKeyframeAtFrame(layer, this.currentFrame);
+    const layerFrames = layer ? KeyframeEngine.getAllKeyframeFrames(layer) : [];
+    if (layerFrames.length > 0) return layerFrames;
+    if (this.viewport3D?.enabled || this.project?.camera?.enabled) {
+      return KeyframeEngine.getAllCameraKeyframeFrames(this.project?.camera);
+    }
+    return [];
+  }
+
+  jumpToKeyframe(dir = 1) {
+    const frames = this.getActiveKeyframeJumpFrames();
+    if (!frames.length) {
+      return this.showToast('Belum ada keyframe pada item terpilih');
+    }
+    const cur = Math.round(this.currentFrame);
+    const target = dir < 0
+      ? KeyframeEngine.getPrevKeyframeFrame(frames, cur)
+      : KeyframeEngine.getNextKeyframeFrame(frames, cur);
+    if (target === null) {
+      return this.showToast(dir < 0 ? 'Sudah di keyframe pertama' : 'Sudah di keyframe terakhir');
+    }
+    this.pause();
+    this.seekToFrame(target);
+  }
+
+  commitPending3DLayerKeyframe(layer) {
+    if (!layer || !this._pending3DLayerPose || this._pending3DLayerPose.layerId !== layer.id) return false;
+    const staged = {
+      frame: this._pending3DLayerPose.frame,
+      props: { ...this._pending3DLayerPose.props }
+    };
+    this.mutateProject(() => {
+      KeyframeEngine.commitStaged3DLayerPose(layer, staged.frame, staged.props, 'easeInOut');
+    });
+    this.showToast(`Keyframe 3D disimpan @ F${staged.frame}`);
+    return true;
+  }
+
+  commitPending3DCameraKeyframe() {
+    if (!this._pending3DCamPose) return false;
+    const staged = {
+      frame: this._pending3DCamPose.frame,
+      props: { ...this._pending3DCamPose.props }
+    };
+    const cam = this.project.camera;
+    this.mutateProject(() => {
+      cam.enabled = true;
+      KeyframeEngine.commitStaged3DCameraPose(cam, staged.frame, staged.props, 'smooth');
+      this._syncCameraTimelineItemIfNeeded(false);
+    });
+    this.showToast(`Keyframe Kamera 3D disimpan @ F${staged.frame}`);
+    return true;
+  }
+
+  resolveFullviewOrientation(project = this.project) {
+    const w = Number(project?.width) || 0;
+    const h = Number(project?.height) || 0;
+    return w > h ? 'landscape' : 'portrait';
+  }
+
+  _syncFullviewUI() {
+    const on = Boolean(this.isPreviewFullview);
+    const sec = document.querySelector('.mf-preview-section');
+    if (sec) sec.classList.toggle('is-fullview', on);
+    const bar = document.getElementById('fullviewOverlayBar');
+    if (bar) {
+      bar.classList.toggle('d-none', !on);
+      bar.classList.toggle('d-flex', on);
+    }
+    const btnFit = document.getElementById('btnZoomFit');
+    if (btnFit) btnFit.classList.toggle('active', on);
+    const icFit = document.getElementById('iconFullviewBtn');
+    if (icFit) icFit.className = on ? 'bi bi-fullscreen-exit' : 'bi bi-fullscreen';
+    const tag = document.getElementById('lblFullviewModeTag');
+    if (tag) {
+      tag.textContent = this.resolveFullviewOrientation() === 'landscape' ? 'Landscape' : 'Portrait';
+    }
+  }
+
+  _scheduleFullviewCanvasRefresh() {
+    if (Array.isArray(this._fullviewResizeTimers)) {
+      this._fullviewResizeTimers.forEach((t) => clearTimeout(t));
+    }
+    this._fullviewResizeTimers = [0, 180, 360].map((ms) => setTimeout(() => {
+      this.renderer?.syncCanvasDimensions(this.project);
+      this.renderPreview();
+    }, ms));
+  }
+
+  enterPreviewFullview() {
+    if (this.isPreviewFullview) return;
+    const orient = this.resolveFullviewOrientation();
+    this.isPreviewFullview = true;
+    this._syncFullviewUI();
+    this.updateTransportLabels();
+    try {
+      window.AndroidBridge?.setFullviewMode?.(true, orient);
+    } catch {}
+    try {
+      screen.orientation?.lock?.(orient === 'landscape' ? 'landscape' : 'portrait')?.catch?.(() => {});
+    } catch {}
+    this._scheduleFullviewCanvasRefresh();
+  }
+
+  exitPreviewFullview() {
+    if (!this.isPreviewFullview) return;
+    this.isPreviewFullview = false;
+    this._syncFullviewUI();
+    try {
+      window.AndroidBridge?.setFullviewMode?.(false, 'auto');
+    } catch {}
+    try {
+      screen.orientation?.unlock?.();
+    } catch {}
+    this._scheduleFullviewCanvasRefresh();
+  }
+
+  togglePreviewFullview() {
+    if (this.isPreviewFullview) {
+      this.exitPreviewFullview();
+    } else {
+      this.enterPreviewFullview();
+    }
+  }
+
+  _syncCameraTimelineItemIfNeeded(autoCreate = false) {
+    if (!this.project) return null;
+    const camLayer = autoCreate
+      ? TimelineEngine.getOrCreateCameraLayer(this.project, { kfExpanded: true })
+      : TimelineEngine.getCameraLayer(this.project);
+    if (!camLayer) return null;
+    TimelineEngine.syncCameraToLayer(this.project, camLayer);
+    return camLayer;
+  }
+
+  _scheduleLiveAutoRecTimelineRefresh() {
+    if (this._liveAutoRecRefreshTimer) return;
+    this._liveAutoRecRefreshTimer = setTimeout(() => {
+      this._liveAutoRecRefreshTimer = null;
+      this.refreshTimelineOnly();
+      this.updateTransportLabels();
+      this.panels?.renderKeyframesPanel();
+    }, 110);
+  }
+
+  _syncAffectedCameraLayers(items) {
+    if (!Array.isArray(items) || !this.project) return;
+    const seen = new Set();
+    for (const it of items) {
+      if (!it?.layerId || seen.has(it.layerId)) continue;
+      seen.add(it.layerId);
+      const l = this.project.layers.find((x) => x.id === it.layerId);
+      if (l?.type === 'camera') TimelineEngine.syncLayerToCamera(this.project, l);
+    }
+  }
+
+  moveSelectedKeyframesAction(items, deltaFrames, opts = {}) {
+    if (!Array.isArray(items) || items.length === 0 || !deltaFrames) return;
+    const runMove = () => {
+      const moved = KeyframeEngine.moveSelectedKeyframes(this.project, items, deltaFrames);
+      this._syncAffectedCameraLayers(items);
+      if (this.timelineView && !opts.skipUndo) {
+        this.timelineView.selectedKfs = items.map((it) => ({
+          layerId: it.layerId,
+          laneKey: it.laneKey,
+          frame: Math.max(0, Math.round(it.frame + deltaFrames))
+        }));
+      }
+      return moved;
+    };
+    if (opts.skipUndo) {
+      runMove();
+      this.onTimelineMutated();
+    } else {
+      this.mutateProject(runMove);
+    }
+    this.showToast(`${items.length} keyframe digeser ${deltaFrames >= 0 ? `+${deltaFrames}` : deltaFrames}f`);
+  }
+
+  setSelectedKeyframesEasingAction(items, easing, bezier = null) {
+    if (!Array.isArray(items) || items.length === 0) return;
+    this.mutateProject(() => {
+      KeyframeEngine.setSelectedKeyframesEasing(this.project, items, easing, bezier);
+      this._syncAffectedCameraLayers(items);
+    });
+    this.showToast(`Kurva ${items.length} keyframe → ${easing}`);
+  }
+
+  deleteSelectedKeyframesAction(items) {
+    if (!Array.isArray(items) || items.length === 0) return;
+    this.mutateProject(() => {
+      KeyframeEngine.removeSelectedKeyframes(this.project, items);
+      this._syncAffectedCameraLayers(items);
+      if (this.timelineView) this.timelineView.selectedKfs = [];
+    });
+    this.showToast(`${items.length} keyframe dihapus`);
+  }
+
+  pasteCopiedKeyframesAction(clip, targetFrame = this.currentFrame, fallbackLayerId = this.selectedLayerId) {
+    if (!clip?.items?.length) return;
+    let pasted = [];
+    this.mutateProject(() => {
+      pasted = KeyframeEngine.pasteKeyframesAtFrame(this.project, clip, targetFrame, fallbackLayerId);
+      this._syncAffectedCameraLayers(pasted);
+      if (this.timelineView && pasted.length > 0) {
+        this.timelineView.selectedKfs = pasted;
+      }
+    });
+    if (pasted.length > 0) {
+      this.showToast(`${pasted.length} keyframe ditempel @ F${Math.round(targetFrame)}`);
+    }
+  }
+
+  updateTransportLabels() {
+    const tc = formatTimecode(this.currentFrame, this.project.fps);
+    document.getElementById('lblTimecode').textContent = tc;
+    document.getElementById('lblFrameCounter').textContent = `F ${this.currentFrame} / ${this.project.durationFrames}`;
+    const fvTime = document.getElementById('lblFullviewTime');
+    if (fvTime) fvTime.textContent = tc;
+    const fvIcon = document.getElementById('iconFullviewPlayPause');
+    if (fvIcon) fvIcon.className = this.isPlaying ? 'bi bi-pause-fill' : 'bi bi-play-fill';
+
+    const curFrame = Math.round(this.currentFrame);
+    const layer = this.getSelectedLayer();
+    const is3D = Boolean(this.viewport3D?.enabled);
+    const showCamOnQuick = !layer && is3D;
+    const hasPendingLayer = Boolean(layer && this._pending3DLayerPose?.layerId === layer.id && this._pending3DLayerPose.frame === curFrame);
+    const hasPendingCam = Boolean(this._pending3DCamPose && this._pending3DCamPose.frame === curFrame);
+    const hasKf = layer
+      ? KeyframeEngine.hasAnyKeyframeAtFrame(layer, curFrame)
+      : (showCamOnQuick && KeyframeEngine.hasAnyCameraKeyframeAtFrame(this.project?.camera, curFrame));
+    const isPending = hasPendingLayer || (showCamOnQuick && hasPendingCam);
+
     const kfBtn = document.getElementById('btnQuickKeyframe');
-    kfBtn.classList.toggle('active', Boolean(hasKf));
-    kfBtn.querySelector('i').className = hasKf ? 'bi bi-diamond-fill' : 'bi bi-diamond';
+    if (kfBtn) {
+      kfBtn.classList.toggle('active', Boolean(hasKf) && !isPending);
+      kfBtn.classList.toggle('is-pending-3d', isPending);
+      kfBtn.title = isPending
+        ? 'Klik untuk simpan posisi 3D sebagai Keyframe'
+        : hasKf
+          ? 'Hapus Keyframe di frame ini'
+          : 'Tambah Keyframe di frame ini';
+      const ic = kfBtn.querySelector('i');
+      if (ic) ic.className = (hasKf || isPending) ? 'bi bi-diamond-fill' : 'bi bi-diamond';
+    }
+
+    const jumpFrames = this.getActiveKeyframeJumpFrames();
+    const prevBtn = document.getElementById('btnPrevKeyframe');
+    const nextBtn = document.getElementById('btnNextKeyframe');
+    if (prevBtn) prevBtn.disabled = KeyframeEngine.getPrevKeyframeFrame(jumpFrames, curFrame) === null;
+    if (nextBtn) nextBtn.disabled = KeyframeEngine.getNextKeyframeFrame(jumpFrames, curFrame) === null;
   }
 
   renderPreview() {
@@ -568,9 +873,14 @@ class MotionFlowApp {
     this.stopTemplateLivePreview({ skipRender: true });
     const token = (this._seekVersion = (this._seekVersion || 0) + 1);
     const clamped = Math.max(0, Math.min(this.project.durationFrames, Math.round(frame)));
+    if ((this._pending3DLayerPose && this._pending3DLayerPose.frame !== clamped) ||
+        (this._pending3DCamPose && this._pending3DCamPose.frame !== clamped)) {
+      this.clearPending3DPose(false);
+    }
     this.currentFrame = clamped;
     this.timelineView.updatePlayhead(this.currentFrame);
     this.updateTransportLabels();
+    this.syncViewport3DUI();
     if (this.isPlaying && this.shuttleRate > 0) {
       this.renderer.syncVideoPlayback(this.project, this.currentFrame, this.mediaMap, true, this.shuttleRate);
     } else {
@@ -584,6 +894,7 @@ class MotionFlowApp {
     if (!this.timelineView.isScrubbing) {
       this.panels.renderInspector();
       this.panels.renderKeyframesPanel();
+      if (this.panels?.activeStyleTab === 'camera') this.panels.renderStylePanel();
     }
   }
 
@@ -605,6 +916,7 @@ class MotionFlowApp {
       return;
     }
     this.stopTemplateLivePreview({ skipRender: true });
+    this.clearPending3DPose(false);
     if (dir > 0 && this.currentFrame >= this.project.durationFrames) {
       this.currentFrame = 0;
     } else if (dir < 0 && this.currentFrame <= 0) {
@@ -613,6 +925,8 @@ class MotionFlowApp {
     this.isPlaying = true;
     const token = ++this.playToken;
     document.getElementById('iconPlayPause').className = 'bi bi-pause-fill';
+    const fvIconPlay = document.getElementById('iconFullviewPlayPause');
+    if (fvIconPlay) fvIconPlay.className = 'bi bi-pause-fill';
     this.lastTickMs = performance.now();
     if (this.shuttleRate === 1) {
       this.audioEngine.startPlayback(this.project, this.currentFrame, this.mediaMap);
@@ -681,6 +995,8 @@ class MotionFlowApp {
     this.audioEngine.stopAll();
     this.renderer.syncVideoPlayback(this.project, this.currentFrame, this.mediaMap, false, 0);
     document.getElementById('iconPlayPause').className = 'bi bi-play-fill';
+    const fvIconPause = document.getElementById('iconFullviewPlayPause');
+    if (fvIconPause) fvIconPause.className = 'bi bi-play-fill';
     this.renderPreview();
   }
 
@@ -724,6 +1040,10 @@ class MotionFlowApp {
 
   selectLayer(layerId, opts = {}) {
     if (this.selectedLayerId === layerId && !opts.force) return;
+    if (this._pending3DLayerPose && this._pending3DLayerPose.layerId !== layerId) {
+      this._pending3DLayerPose = null;
+      this.renderer.setPending3DPose(null, this._pending3DCamPose);
+    }
     this.selectedLayerId = layerId;
     if (!opts.preserveMulti) {
       this.selectedLayerIds = layerId ? new Set([layerId]) : new Set();
@@ -817,12 +1137,18 @@ class MotionFlowApp {
   togglePropLaneKeyframe(layerId, laneKey, frame = this.currentFrame) {
     const l = this.project.layers.find((x) => x.id === layerId);
     if (!l) return;
+    const is3D = Boolean(this.viewport3D?.enabled);
+    if (l.type !== 'camera' && this._pending3DLayerPose?.layerId === l.id && (laneKey === 'position' || laneKey === 'rotation' || laneKey === 'scale' || laneKey === 'opacity')) {
+      this.commitPending3DLayerKeyframe(l);
+      return;
+    }
     let res = null;
     this.mutateProject(() => {
-      res = KeyframeEngine.togglePropLaneKeyframeAtFrame(l, laneKey, frame);
+      res = KeyframeEngine.togglePropLaneKeyframeAtFrame(l, laneKey, frame, l.type === 'camera' ? 'smooth' : 'easeInOut', { is3D });
+      if (l.type === 'camera') TimelineEngine.syncLayerToCamera(this.project, l);
     });
     if (res) {
-      const group = KEYFRAME_LANE_GROUPS.find((g) => g.key === laneKey);
+      const group = KeyframeEngine.getLaneGroupByKey(laneKey, l);
       const label = group?.label || laneKey;
       this.showToast(res.added ? `Keyframe ${label} + F${res.frame}` : `Keyframe ${label} @ F${res.frame} dihapus`);
     }
@@ -846,72 +1172,287 @@ class MotionFlowApp {
   }
 
   setLayerTransformProp(layer, prop, value, pushHistory = true) {
+    const numVal = Number(value);
+    if (!layer || !Number.isFinite(numVal)) return;
+    const curFrame = Math.max(0, Math.round(this.currentFrame));
+    const is3DProp = prop === 'z' || prop === 'rotX' || prop === 'rotY';
+    const in3D = Boolean(this.viewport3D?.enabled);
+    const autoRec = Boolean(this.viewport3D?.autoRecord);
+
+    // Strict 3D mode: moving/tilting in 3D stages pose until user explicitly clicks Add Keyframe
+    if ((in3D || is3DProp) && !autoRec) {
+      if (!this._pending3DLayerPose || this._pending3DLayerPose.layerId !== layer.id || this._pending3DLayerPose.frame !== curFrame) {
+        this._pending3DLayerPose = { layerId: layer.id, frame: curFrame, props: {} };
+      }
+      this._pending3DLayerPose.props[prop] = numVal;
+      this.renderer.setPending3DPose(this._pending3DLayerPose, this._pending3DCamPose);
+      this.updateTransportLabels();
+      this.syncViewport3DUI();
+      if (pushHistory) {
+        this.panels.renderInspector();
+      }
+      this.renderPreview();
+      return;
+    }
+
     const applyFn = () => {
       const hasTrack = (layer.keyframes?.[prop]?.length || 0) > 0;
       if (hasTrack) {
-        KeyframeEngine.setKeyframe(layer, prop, this.currentFrame, value);
+        KeyframeEngine.setKeyframe(layer, prop, curFrame, numVal);
+        if (in3D && autoRec) layer.kfExpanded = true;
+      } else if (in3D && autoRec) {
+        const anchorFrame = Math.max(0, Math.round(layer.startFrame || 0));
+        const baseVal = Number(layer.transform?.[prop] ?? KeyframeEngine.getDefaultPropValue(layer, prop));
+        if (curFrame !== anchorFrame) {
+          KeyframeEngine.setKeyframe(layer, prop, anchorFrame, baseVal);
+        }
+        KeyframeEngine.setKeyframe(layer, prop, curFrame, numVal);
+        layer.kfExpanded = true;
       } else {
-        layer.transform[prop] = value;
+        if (!layer.transform) layer.transform = {};
+        layer.transform[prop] = numVal;
       }
+      if (layer.type === 'camera') TimelineEngine.syncLayerToCamera(this.project, layer);
     };
     if (pushHistory) {
       this.mutateProject(applyFn);
     } else {
       applyFn();
+      if (in3D && autoRec) this._scheduleLiveAutoRecTimelineRefresh();
       this.renderPreview();
     }
   }
 
   setCameraProp(prop, value, pushHistory = false, recordKeyframe = null) {
+    const numVal = Number(value);
+    if (!Number.isFinite(numVal)) return;
     const cam = this.project.camera;
+    const curFrame = Math.max(0, Math.round(this.currentFrame));
+    const autoRec = recordKeyframe !== null
+      ? Boolean(recordKeyframe)
+      : Boolean(this.viewport3D?.enabled && this.viewport3D?.autoRecord);
+
+    // Strict 3D Camera rule: without Auto-Rec, camera movement stages preview until Keyframe button is clicked
+    if (!autoRec) {
+      if (!this._pending3DCamPose || this._pending3DCamPose.frame !== curFrame) {
+        this._pending3DCamPose = { frame: curFrame, props: {} };
+      }
+      this._pending3DCamPose.props[prop] = numVal;
+      this.renderer.setPending3DPose(this._pending3DLayerPose, this._pending3DCamPose);
+      this.updateTransportLabels();
+      this.syncViewport3DUI();
+      if (pushHistory && this.panels?.activeStyleTab === 'camera') {
+        this.panels.renderStylePanel();
+      }
+      this.renderPreview();
+      return;
+    }
+
     const applyFn = () => {
       cam.enabled = true;
       const track = cam.keyframes?.[prop];
       const hasTrack = Array.isArray(track) && track.length > 0;
-      const autoRec = recordKeyframe !== null
-        ? Boolean(recordKeyframe)
-        : Boolean(this.viewport3D?.enabled && this.viewport3D?.autoRecord);
-      const curFrame = Math.max(0, Math.round(this.currentFrame));
-
-      if (hasTrack || autoRec) {
-        if (!hasTrack && curFrame > 0) {
-          const baseVal = Number(cam[prop] ?? (prop === 'zoom' ? 1 : 0));
-          KeyframeEngine.setKeyframe(cam, prop, 0, baseVal, 'smooth');
-        }
-        KeyframeEngine.setKeyframe(cam, prop, curFrame, value, 'smooth');
-        if (curFrame === 0 || !hasTrack) {
-          cam[prop] = value;
-        }
-      } else {
-        cam[prop] = value;
+      if (!hasTrack && curFrame > 0) {
+        const baseVal = Number(cam[prop] ?? (prop === 'zoom' ? 1 : 0));
+        KeyframeEngine.setKeyframe(cam, prop, 0, baseVal, 'smooth');
       }
+      KeyframeEngine.setKeyframe(cam, prop, curFrame, numVal, 'smooth');
+      if (curFrame === 0 || !hasTrack) {
+        cam[prop] = numVal;
+      }
+      this._syncCameraTimelineItemIfNeeded(Boolean(this.viewport3D?.autoRecord));
     };
     if (pushHistory) {
       this.mutateProject(applyFn);
     } else {
       applyFn();
+      this._scheduleLiveAutoRecTimelineRefresh();
       this.renderPreview();
     }
   }
 
-  toggleViewport3D() {
-    this.viewport3D.enabled = !this.viewport3D.enabled;
-    if (this.viewport3D.enabled) {
-      this.project.camera.enabled = true;
+  _computeTimedAdjustmentDuration(startFrame) {
+    const fps = Math.max(1, this.project.fps || 30);
+    const clip = (this.project.layers || []).find(
+      (l) => (l.type === 'video' || l.type === 'image') && startFrame >= l.startFrame && startFrame < l.endFrame
+    );
+    if (clip) {
+      return Math.max(30, Math.min(clip.endFrame - startFrame, fps * 5));
+    }
+    return fps * 3;
+  }
+
+  applyFilterAsTimelineItem(filterPreset, { forceNew = false } = {}) {
+    if (!filterPreset) return null;
+    const cur = this.getSelectedLayer();
+    const isFilterAdj = cur && cur.type === 'adjustment' &&
+      (cur.adjustmentKind === 'filter' || (!cur.adjustmentKind && TimelineEngine.getActiveVfxList(cur).length === 0));
+    if (!forceNew && isFilterAdj) {
+      this.mutateProject(() => {
+        cur.adjustmentKind = 'filter';
+        cur.name = filterPreset.id === 'normal' ? 'Filter: Normal' : `Filter: ${filterPreset.label}`;
+        TimelineEngine.applyFilterWithIntensity(cur, filterPreset.id, filterPreset.fx, cur.filterIntensity ?? 1);
+      });
+      this.showToast(`Filter timeline diperbarui: ${filterPreset.label}`);
+      return cur;
+    }
+
+    const startFrame = Math.max(0, Math.round(this.currentFrame || 0));
+    const durationFrames = this._computeTimedAdjustmentDuration(startFrame);
+    let created = null;
+    this.mutateProject(() => {
+      created = TimelineEngine.createAdjustmentLayer(this.project, startFrame, {
+        adjustmentKind: 'filter',
+        name: `Filter: ${filterPreset.label}`,
+        durationFrames,
+        filterId: filterPreset.id,
+        filterIntensity: 1,
+        fx: { ...filterPreset.fx }
+      });
+      TimelineEngine.addLayer(this.project, created);
+      TimelineEngine.normalizeTrackZOrder(this.project);
+      this.selectedLayerId = created.id;
+      this.selectedLayerIds = new Set([created.id]);
+    });
+    this.showToast(`Filter "${filterPreset.label}" ditambahkan ke timeline — tahan pojok kiri/kanan atas untuk atur durasi`);
+    return created;
+  }
+
+  applyEffectAsTimelineItem(vfxPreset, { forceNew = false, stackOnExisting = false } = {}) {
+    if (!vfxPreset) return null;
+    const cur = this.getSelectedLayer();
+    const isEffectAdj = cur && cur.type === 'adjustment' &&
+      (cur.adjustmentKind === 'effect' || (!cur.adjustmentKind && TimelineEngine.getActiveVfxList(cur).length > 0));
+
+    if (!forceNew && isEffectAdj) {
+      let nextVfxId = this.panels?.selectedVfxId || null;
+      this.mutateProject(() => {
+        cur.adjustmentKind = 'effect';
+        if (stackOnExisting) {
+          const added = TimelineEngine.addLayerVfx(cur, vfxPreset.id, 0.75, 1.0);
+          if (added) nextVfxId = added.id;
+        } else if (vfxPreset.id === 'none') {
+          TimelineEngine.setPrimaryLayerVfx(cur, 'none');
+          cur.name = 'Effect FX';
+          nextVfxId = null;
+        } else if (nextVfxId && Array.isArray(cur.vfxStack) && cur.vfxStack.some((x) => x.id === nextVfxId)) {
+          TimelineEngine.updateLayerVfx(cur, nextVfxId, { type: vfxPreset.id, enabled: true });
+          cur.name = `FX: ${vfxPreset.label}`;
+        } else {
+          const stack = TimelineEngine.setPrimaryLayerVfx(cur, vfxPreset.id, cur.vfx?.intensity || 0.75, cur.vfx?.speed || 1.0);
+          cur.name = `FX: ${vfxPreset.label}`;
+          nextVfxId = stack[0]?.id || null;
+        }
+      });
+      if (this.panels) {
+        this.panels.selectedVfxId = nextVfxId;
+        this.panels.renderStylePanel();
+      }
+      this.showToast(`${stackOnExisting ? 'Efek dilapis' : 'Efek timeline diperbarui'}: ${vfxPreset.label}`);
+      return cur;
+    }
+
+    if (vfxPreset.id === 'none') {
+      this.showToast('Pilih efek untuk ditambahkan ke timeline');
+      return null;
+    }
+
+    const startFrame = Math.max(0, Math.round(this.currentFrame || 0));
+    const durationFrames = this._computeTimedAdjustmentDuration(startFrame);
+    let created = null;
+    this.mutateProject(() => {
+      created = TimelineEngine.createAdjustmentLayer(this.project, startFrame, {
+        adjustmentKind: 'effect',
+        name: `FX: ${vfxPreset.label}`,
+        durationFrames,
+        vfx: { type: vfxPreset.id, intensity: 0.75, speed: 1.0 }
+      });
+      const stack = TimelineEngine.setPrimaryLayerVfx(created, vfxPreset.id, 0.75, 1.0);
+      TimelineEngine.addLayer(this.project, created);
+      TimelineEngine.normalizeTrackZOrder(this.project);
+      this.selectedLayerId = created.id;
+      this.selectedLayerIds = new Set([created.id]);
+      if (this.panels) this.panels.selectedVfxId = stack[0]?.id || null;
+    });
+    if (this.panels) this.panels.renderStylePanel();
+    this.showToast(`Efek "${vfxPreset.label}" ditambahkan ke timeline — tahan pojok kiri/kanan atas untuk atur durasi`);
+    return created;
+  }
+
+  setViewport3DEnabled(enabled) {
+    const next = Boolean(enabled);
+    if (!next) {
+      this.clearPending3DPose(false);
+    }
+    this.viewport3D.enabled = next;
+    if (this.project?.camera) {
+      if (next) {
+        this.project.camera.enabled = true;
+      } else {
+        const hasCamKeyframes = Object.values(this.project.camera.keyframes || {}).some(
+          (arr) => Array.isArray(arr) && arr.length > 0
+        );
+        if (!hasCamKeyframes) {
+          this.project.camera.enabled = false;
+        }
+      }
     }
     this.renderer.setViewport3DState(this.viewport3D);
     this.syncViewport3DUI();
+    this.updateTransportLabels();
+    this.panels?.renderStylePanel();
+    this.panels?.renderInspector();
     this.renderPreview();
   }
 
+  toggleViewport3D() {
+    this.setViewport3DEnabled(!this.viewport3D.enabled);
+  }
+
   toggleViewport3DAutoRecord() {
-    this.viewport3D.autoRecord = !this.viewport3D.autoRecord;
-    this.syncViewport3DUI();
-    this.panels.renderStylePanel();
+    this.setViewport3DAutoRecord(!this.viewport3D.autoRecord);
+  }
+
+  setViewport3DAutoRecord(enabled) {
+    const next = Boolean(enabled);
+    this.viewport3D.autoRecord = next;
+    if (next) {
+      if (!this.viewport3D.enabled) {
+        this.viewport3D.enabled = true;
+        this.renderer.setViewport3DState(this.viewport3D);
+      }
+      const curFrame = Math.max(0, Math.round(this.currentFrame));
+      this.mutateProject(() => {
+        const cam = this.project.camera;
+        cam.enabled = true;
+        const camLayer = TimelineEngine.getOrCreateCameraLayer(this.project, { kfExpanded: true });
+        camLayer.kfExpanded = true;
+        const camFrames = KeyframeEngine.getAllCameraKeyframeFrames(cam);
+        if (camFrames.length === 0) {
+          const base = KeyframeEngine.getCameraAtFrame(cam, 0);
+          const cur = KeyframeEngine.getCameraAtFrame(cam, curFrame);
+          for (const p of ['x', 'y', 'z', 'rotX', 'rotY', 'rotZ', 'zoom']) {
+            const def = p === 'zoom' ? 1 : 0;
+            KeyframeEngine.setKeyframe(cam, p, 0, Number(base[p] ?? def), 'smooth');
+            if (curFrame > 0) {
+              KeyframeEngine.setKeyframe(cam, p, curFrame, Number(cur[p] ?? def), 'smooth');
+            }
+          }
+        }
+        TimelineEngine.syncCameraToLayer(this.project, camLayer);
+        if (!this.selectedLayerId) {
+          this.selectedLayerId = camLayer.id;
+          this.selectedLayerIds = new Set([camLayer.id]);
+        }
+      });
+    } else {
+      this.syncViewport3DUI();
+      this.panels.renderStylePanel();
+    }
     this.showToast(
-      this.viewport3D.autoRecord
-        ? '3D Auto-Rec ON: gerak kamera otomatis direkam halus'
-        : '3D Auto-Rec OFF: gerak kamera statis kecuali di-keyframe'
+      next
+        ? 'Auto-Rec 3D ON: item "3D Camera Rec" tampil di timeline & otomatis rekam keyframe'
+        : 'Auto-Rec 3D OFF: gerak 3D tetap statis sampai klik ◆ Keyframe'
     );
   }
 
@@ -926,6 +1467,7 @@ class MotionFlowApp {
     }
     this.mutateProject(() => {
       KeyframeEngine.smoothCameraKeyframes(cam, 0.38);
+      this._syncCameraTimelineItemIfNeeded(false);
     });
     this.showToast('Jalur gerakan kamera 3D diperhalus (Smooth Spline)');
   }
@@ -939,6 +1481,7 @@ class MotionFlowApp {
 
   syncViewport3DUI() {
     const on = Boolean(this.viewport3D?.enabled);
+    document.getElementById('btnPreviewMode2D')?.classList.toggle('active', !on);
     document.getElementById('btnResetCameraQuick')?.classList.toggle('active', on);
     const hud = document.getElementById('hud3DViewport');
     if (hud) {
@@ -952,11 +1495,25 @@ class MotionFlowApp {
     document.getElementById('btn3DToolCam')?.classList.toggle('active', tool === 'camera');
     document.getElementById('btn3DCamAutoRec')?.classList.toggle('active', Boolean(this.viewport3D?.autoRecord));
 
-    const cam = KeyframeEngine.getCameraAtFrame(this.project.camera, this.currentFrame);
-    const recTag = this.viewport3D?.autoRecord ? 'REC · ' : '';
-    this.set3DHudReadout(
-      `${recTag}Y:${Math.round(cam.rotY)}° X:${Math.round(cam.rotX)}° Z:${Math.round(cam.z)} (${cam.zoom.toFixed(2)}x)`
-    );
+    const curFrame = Math.round(this.currentFrame);
+    const hasPendingLayer = Boolean(this._pending3DLayerPose && this._pending3DLayerPose.frame === curFrame);
+    const hasPendingCam = Boolean(this._pending3DCamPose && this._pending3DCamPose.frame === curFrame);
+    const hasCamKf = KeyframeEngine.hasAnyCameraKeyframeAtFrame(this.project?.camera, curFrame);
+    const camKfBtn = document.getElementById('btn3DCamKf');
+    if (camKfBtn) {
+      camKfBtn.classList.toggle('active', hasCamKf && !hasPendingCam);
+      camKfBtn.classList.toggle('is-pending-3d', hasPendingCam);
+    }
+
+    const cam = this.getEffectiveCamera(this.currentFrame);
+    if (hasPendingLayer || hasPendingCam) {
+      this.set3DHudReadout(`Pending 3D · Klik ◆ Keyframe (F${curFrame})`);
+    } else {
+      const recTag = this.viewport3D?.autoRecord ? 'REC · ' : '';
+      this.set3DHudReadout(
+        `${recTag}Y:${Math.round(cam.rotY)}° X:${Math.round(cam.rotX)}° Z:${Math.round(cam.z)} (${cam.zoom.toFixed(2)}x)`
+      );
+    }
   }
 
   set3DHudReadout(text) {
@@ -965,11 +1522,26 @@ class MotionFlowApp {
   }
 
   keyframeCameraAtPlayhead() {
+    if (this._pending3DCamPose) {
+      this.commitPending3DCameraKeyframe();
+      return;
+    }
     const cam = this.project.camera;
+    const f = Math.round(this.currentFrame);
+    const hasKf = KeyframeEngine.hasAnyCameraKeyframeAtFrame(cam, f);
+    if (hasKf) {
+      this.mutateProject(() => {
+        for (const p of ['x', 'y', 'z', 'rotX', 'rotY', 'rotZ', 'zoom']) {
+          KeyframeEngine.removeKeyframe(cam, p, f);
+        }
+        this._syncCameraTimelineItemIfNeeded(false);
+      });
+      this.showToast(`Keyframe Kamera 3D dihapus @ F${f}`);
+      return;
+    }
     this.mutateProject(() => {
       cam.enabled = true;
-      const cur = KeyframeEngine.getCameraAtFrame(cam, this.currentFrame);
-      const f = this.currentFrame;
+      const cur = KeyframeEngine.getCameraAtFrame(cam, f);
       KeyframeEngine.setKeyframe(cam, 'x', f, cur.x, 'smooth');
       KeyframeEngine.setKeyframe(cam, 'y', f, cur.y, 'smooth');
       KeyframeEngine.setKeyframe(cam, 'z', f, cur.z, 'smooth');
@@ -977,11 +1549,13 @@ class MotionFlowApp {
       KeyframeEngine.setKeyframe(cam, 'rotY', f, cur.rotY, 'smooth');
       KeyframeEngine.setKeyframe(cam, 'rotZ', f, cur.rotZ || 0, 'smooth');
       KeyframeEngine.setKeyframe(cam, 'zoom', f, cur.zoom, 'smooth');
+      this._syncCameraTimelineItemIfNeeded(Boolean(this.viewport3D?.autoRecord));
     });
-    this.showToast(`3D Camera keyframed (Smooth) @ F${this.currentFrame}`);
+    this.showToast(`3D Camera keyframed @ F${f}`);
   }
 
   resetCameraRig() {
+    this.clearPending3DPose(false);
     const cam = this.project.camera;
     this.mutateProject(() => {
       Object.assign(cam, {
@@ -995,6 +1569,7 @@ class MotionFlowApp {
         zoom: 1,
         keyframes: { x: [], y: [], z: [], rotX: [], rotY: [], rotZ: [], zoom: [] }
       });
+      this._syncCameraTimelineItemIfNeeded(false);
     });
     this.showToast('3D Camera reset');
   }
@@ -2146,15 +2721,6 @@ class MotionFlowApp {
 
     if (!layer) {
       // CapCut ROOT TOOLBAR (when no clip is selected)
-      const ensureVisualOrSelected = () => {
-        if (this.project.layers.length > 0) {
-          this.selectedLayerId = this.project.layers[0].id;
-          this.updateAllUI();
-          return true;
-        }
-        this.showToast('Import or add a clip first');
-        return false;
-      };
       const rootItems = [
         ['bi-plus-circle-fill text-info', 'Edit', () => this.triggerDeviceVisualPick('main_append')],
         ['bi-collection-play', 'Media', () => { this.mediaPickerContext = null; this.openSheet('sheetMedia'); }],
@@ -2172,8 +2738,8 @@ class MotionFlowApp {
         ['bi-intersect text-info', 'Transitions', () => this.openTransitionsSheet()],
         ['bi-magic text-info', 'Templates', () => this.openSheet('sheetTemplates')],
         ['bi-brush text-info', 'Draw', () => this.openDrawModal()],
-        ['bi-stars text-info', 'Effects', () => { if (ensureVisualOrSelected()) this.openSheet('sheetStyle', 'fx', 'effects'); }],
-        ['bi-palette-fill text-success', 'Filters', () => { if (ensureVisualOrSelected()) this.openSheet('sheetStyle', 'fx', 'filters'); }],
+        ['bi-stars text-info', 'Effects', () => this.openSheet('sheetStyle', 'fx', 'effects')],
+        ['bi-palette-fill text-success', 'Filters', () => this.openSheet('sheetStyle', 'fx', 'filters')],
         ['bi-layers-half text-success', 'Overlay', () => this.triggerDeviceVisualPick('overlay_at_playhead')],
         ['bi-sliders2-vertical text-warning', 'Adj Layer', () => {
           this.mutateProject(() => {
@@ -2835,13 +3401,15 @@ class MotionFlowApp {
         const startDist = Math.max(12, Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y));
         const startMidX = (pts[0].x + pts[1].x) / 2;
         const startMidY = (pts[0].y + pts[1].y) / 2;
+        const stage3D = !this.viewport3D?.autoRecord;
         const alreadyPushed = Boolean(gesture?.undoPushed);
-        if (!alreadyPushed) this.pushUndo();
-        const origCam = KeyframeEngine.getCameraAtFrame(this.project.camera, this.currentFrame);
-        this.project.camera.enabled = true;
+        if (!stage3D && !alreadyPushed) this.pushUndo();
+        const origCam = this.getEffectiveCamera(this.currentFrame);
         gesture = {
           mode: 'cam_pinch_pan',
-          undoPushed: true,
+          undoPushed: !stage3D,
+          staged3DOnly: stage3D,
+          dragStarted: true,
           startDist,
           startMidX,
           startMidY,
@@ -2863,6 +3431,7 @@ class MotionFlowApp {
         gesture = {
           mode: 'tracker',
           undoPushed: false,
+          dragStarted: false,
           startX: px,
           startY: py,
           origTX: this.trackerState.targetX,
@@ -2873,14 +3442,15 @@ class MotionFlowApp {
       }
 
       if (hit === 'cam_orbit') {
-        const origCam = KeyframeEngine.getCameraAtFrame(this.project.camera, this.currentFrame);
+        const origCam = this.getEffectiveCamera(this.currentFrame);
         const pendingLayerPick = this.viewport3D.tool !== 'camera'
           ? this.renderer.hitTestAnyLayer(px, py)
           : null;
-        this.project.camera.enabled = true;
         gesture = {
           mode: 'cam_orbit',
           undoPushed: false,
+          staged3DOnly: !this.viewport3D?.autoRecord,
+          dragStarted: false,
           startX: px,
           startY: py,
           origCam,
@@ -2891,22 +3461,26 @@ class MotionFlowApp {
       }
 
       let layer = this.getSelectedLayer();
+      const box = this.renderer.lastOverlayBox;
+      const isCamRig = Boolean(box?.isCameraGizmo || layer?.type === 'camera');
       if (!hit) {
         const picked = this.renderer.hitTestAnyLayer(px, py);
         if (picked) {
           this.selectLayer(picked);
           layer = this.getSelectedLayer();
           if (layer && !layer.locked && this.renderer.lastOverlayBox) {
-            const box = this.renderer.lastOverlayBox;
-            const origTf = KeyframeEngine.getTransformAtFrame(layer, this.currentFrame);
+            const pickedBox = this.renderer.lastOverlayBox;
+            const origTf = this.getEffectiveLayerTransform(layer, this.currentFrame);
             gesture = {
               mode: 'move',
               undoPushed: false,
+              staged3DOnly: Boolean(this.viewport3D?.enabled && !this.viewport3D?.autoRecord),
+              dragStarted: false,
               startX: px,
               startY: py,
               origTf,
               layer,
-              box,
+              box: pickedBox,
               gizmo: this.renderer.lastGizmoHandles,
               startAngle: 0,
               startDist: 10
@@ -2920,25 +3494,30 @@ class MotionFlowApp {
         return;
       }
 
-      if (!layer || layer.locked) return;
+      if (layer?.locked) return;
+      if (!layer && !isCamRig) return;
 
-      const box = this.renderer.lastOverlayBox;
       const gizmo = this.renderer.lastGizmoHandles;
-      const origTf = KeyframeEngine.getTransformAtFrame(layer, this.currentFrame);
+      const origTf = layer && !isCamRig ? this.getEffectiveLayerTransform(layer, this.currentFrame) : null;
+      const origCam = isCamRig ? this.getEffectiveCamera(this.currentFrame) : null;
       const bcx = box?.cx ?? px;
       const bcy = box?.cy ?? py;
 
       gesture = {
         mode: hit,
+        isCameraGizmo: isCamRig,
         undoPushed: false,
+        staged3DOnly: Boolean(this.viewport3D?.enabled && !this.viewport3D?.autoRecord),
+        dragStarted: false,
         startX: px,
         startY: py,
         origTf,
+        origCam,
         layer,
         box,
         gizmo,
         startAngle: Math.atan2(py - bcy, px - bcx),
-        startDist: Math.max(10, Math.hypot(px - bcx, py - bcy))
+        startDist: Math.max(10, Math.hypot(px - bcx, py - bcx))
       };
     });
 
@@ -2956,19 +3535,19 @@ class MotionFlowApp {
         const curDist = Math.max(12, Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y));
         const curMidX = (pts[0].x + pts[1].x) / 2;
         const curMidY = (pts[0].y + pts[1].y) / 2;
-        const { origCam, startDist, startMidX, startMidY, sx, sy } = gesture;
+        const { origCam, startDist, startMidX, startMidY, sx, sy, staged3DOnly } = gesture;
         const nextZoom = clamp(Number((origCam.zoom * (curDist / startDist)).toFixed(2)), 0.25, 4.0);
         const nextX = Math.round(origCam.x - (curMidX - startMidX) / sx);
         const nextY = Math.round(origCam.y - (curMidY - startMidY) / sy);
-        const canKeyNow = !this.isPlaying || Math.abs(this.currentFrame - (gesture.lastRecFrame ?? -999)) >= 2;
-        this.setCameraProp('zoom', nextZoom, false, canKeyNow ? null : false);
-        this.setCameraProp('x', nextX, false, canKeyNow ? null : false);
-        this.setCameraProp('y', nextY, false, canKeyNow ? null : false);
+        const canKeyNow = !staged3DOnly && (!this.isPlaying || Math.abs(this.currentFrame - (gesture.lastRecFrame ?? -999)) >= 2);
+        this.setCameraProp('zoom', nextZoom, false, staged3DOnly ? false : (canKeyNow ? null : false));
+        this.setCameraProp('x', nextX, false, staged3DOnly ? false : (canKeyNow ? null : false));
+        this.setCameraProp('y', nextY, false, staged3DOnly ? false : (canKeyNow ? null : false));
         if (canKeyNow) gesture.lastRecFrame = this.currentFrame;
         gesture.lastZoom = nextZoom;
         gesture.lastX = nextX;
         gesture.lastY = nextY;
-        const recPrefix = this.viewport3D.autoRecord ? 'REC · ' : '';
+        const recPrefix = staged3DOnly ? 'Pending 3D · ' : (this.viewport3D.autoRecord ? 'REC · ' : '');
         this.set3DHudReadout(`${recPrefix}Pan (${nextX}, ${nextY}) · Zoom ${nextZoom.toFixed(2)}x`);
         return;
       }
@@ -2976,20 +3555,23 @@ class MotionFlowApp {
       if (gesture.mode === 'cam_orbit') {
         const dx = px - gesture.startX;
         const dy = py - gesture.startY;
-        if (!gesture.undoPushed && Math.hypot(dx, dy) < 4) return;
-        if (!gesture.undoPushed) {
-          this.pushUndo();
-          gesture.undoPushed = true;
+        if (!gesture.dragStarted && Math.hypot(dx, dy) < 4) return;
+        if (!gesture.dragStarted) {
+          gesture.dragStarted = true;
+          if (!gesture.staged3DOnly && !gesture.undoPushed) {
+            this.pushUndo();
+            gesture.undoPushed = true;
+          }
         }
         const nextRY = clamp(Math.round(gesture.origCam.rotY + dx * 0.38), -175, 175);
         const nextRX = clamp(Math.round(gesture.origCam.rotX + dy * 0.38), -85, 85);
-        const canKeyNow = !this.isPlaying || Math.abs(this.currentFrame - (gesture.lastRecFrame ?? -999)) >= 2;
-        this.setCameraProp('rotY', nextRY, false, canKeyNow ? null : false);
-        this.setCameraProp('rotX', nextRX, false, canKeyNow ? null : false);
+        const canKeyNow = !gesture.staged3DOnly && (!this.isPlaying || Math.abs(this.currentFrame - (gesture.lastRecFrame ?? -999)) >= 2);
+        this.setCameraProp('rotY', nextRY, false, gesture.staged3DOnly ? false : (canKeyNow ? null : false));
+        this.setCameraProp('rotX', nextRX, false, gesture.staged3DOnly ? false : (canKeyNow ? null : false));
         if (canKeyNow) gesture.lastRecFrame = this.currentFrame;
         gesture.lastRY = nextRY;
         gesture.lastRX = nextRX;
-        const recPrefix = this.viewport3D.autoRecord ? 'REC · ' : '';
+        const recPrefix = gesture.staged3DOnly ? 'Pending 3D · ' : (this.viewport3D.autoRecord ? 'REC · ' : '');
         this.set3DHudReadout(`${recPrefix}Orbit Y:${nextRY}° X:${nextRX}°`);
         return;
       }
@@ -3007,28 +3589,75 @@ class MotionFlowApp {
         return;
       }
 
-      const { mode, startX, startY, origTf, layer, box, gizmo, startAngle, startDist } = gesture;
-      if (!gesture.undoPushed) {
+      const { mode, isCameraGizmo, startX, startY, origTf, origCam, layer, box, gizmo, startAngle, startDist, staged3DOnly } = gesture;
+      if (!gesture.dragStarted) {
         if (Math.hypot(px - startX, py - startY) < 3) return;
-        this.pushUndo();
-        gesture.undoPushed = true;
+        gesture.dragStarted = true;
+        if (!staged3DOnly && !gesture.undoPushed) {
+          this.pushUndo();
+          gesture.undoPushed = true;
+        }
+      }
+
+      if (isCameraGizmo && origCam) {
+        const camRecFlag = staged3DOnly ? false : null;
+        if (mode === 'gizmo_x' && gizmo?.x) {
+          const proj = (px - startX) * gizmo.x.dirX + (py - startY) * gizmo.x.dirY;
+          const nx = Math.round(origCam.x + proj / Math.max(0.15, box.sx));
+          this.setCameraProp('x', nx, false, camRecFlag);
+          this.set3DHudReadout(`${staged3DOnly ? 'Pending 3D · ' : 'REC · '}Cam X: ${nx}px`);
+        } else if (mode === 'gizmo_y' && gizmo?.y) {
+          const proj = (px - startX) * gizmo.y.dirX + (py - startY) * gizmo.y.dirY;
+          const ny = Math.round(origCam.y - proj / Math.max(0.15, box.sy));
+          this.setCameraProp('y', ny, false, camRecFlag);
+          this.set3DHudReadout(`${staged3DOnly ? 'Pending 3D · ' : 'REC · '}Cam Y: ${ny}px`);
+        } else if (mode === 'gizmo_z' && gizmo?.z) {
+          const proj = (px - startX) * gizmo.z.dirX + (py - startY) * gizmo.z.dirY;
+          const nz = clamp(Math.round((origCam.z || 0) + (proj * 1.6) / Math.max(0.15, box.sx)), -1500, 1200);
+          this.setCameraProp('z', nz, false, camRecFlag);
+          this.set3DHudReadout(`${staged3DOnly ? 'Pending 3D · ' : 'REC · '}Cam Z: ${nz}`);
+        } else if (mode === 'gizmo_rot_xy') {
+          const nextRY = clamp(Math.round((origCam.rotY || 0) + (px - startX) * 0.5), -175, 175);
+          const nextRX = clamp(Math.round((origCam.rotX || 0) + (py - startY) * 0.5), -85, 85);
+          this.setCameraProp('rotY', nextRY, false, camRecFlag);
+          this.setCameraProp('rotX', nextRX, false, camRecFlag);
+          this.set3DHudReadout(`${staged3DOnly ? 'Pending 3D · ' : 'REC · '}Cam Orbit Y:${nextRY}° X:${nextRX}°`);
+        } else if (mode === 'gizmo_rot_z' || mode === 'rotate') {
+          const curAngle = Math.atan2(py - box.cy, px - box.cx);
+          const degDelta = ((curAngle - startAngle) * 180) / Math.PI;
+          const nRZ = Math.round((origCam.rotZ || 0) + degDelta);
+          this.setCameraProp('rotZ', nRZ, false, camRecFlag);
+          this.set3DHudReadout(`${staged3DOnly ? 'Pending 3D · ' : 'REC · '}Cam Roll Z: ${nRZ}°`);
+        } else if (mode === 'move') {
+          const nx = Math.round(origCam.x + (px - startX) / Math.max(0.15, box.sx));
+          const ny = Math.round(origCam.y + (py - startY) / Math.max(0.15, box.sy));
+          this.setCameraProp('x', nx, false, camRecFlag);
+          this.setCameraProp('y', ny, false, camRecFlag);
+          this.set3DHudReadout(`${staged3DOnly ? 'Pending 3D · ' : 'REC · '}Cam (${nx}, ${ny})`);
+        } else if (mode === 'scale') {
+          const curDist = Math.max(10, Math.hypot(px - box.cx, py - box.cy));
+          const nZoom = clamp(Number((origCam.zoom * (curDist / startDist)).toFixed(2)), 0.25, 4.0);
+          this.setCameraProp('zoom', nZoom, false, camRecFlag);
+          this.set3DHudReadout(`${staged3DOnly ? 'Pending 3D · ' : 'REC · '}Cam Zoom ${nZoom.toFixed(2)}x`);
+        }
+        return;
       }
 
       if (mode === 'gizmo_x' && gizmo?.x) {
         const proj = (px - startX) * gizmo.x.dirX + (py - startY) * gizmo.x.dirY;
         const nx = Math.round(origTf.x + proj / Math.max(0.15, box.sx));
         this.setLayerTransformProp(layer, 'x', nx, false);
-        this.set3DHudReadout(`Move X: ${nx}px`);
+        this.set3DHudReadout(`${staged3DOnly ? 'Pending 3D · ' : ''}Move X: ${nx}px`);
       } else if (mode === 'gizmo_y' && gizmo?.y) {
         const proj = (px - startX) * gizmo.y.dirX + (py - startY) * gizmo.y.dirY;
         const ny = Math.round(origTf.y - proj / Math.max(0.15, box.sy));
         this.setLayerTransformProp(layer, 'y', ny, false);
-        this.set3DHudReadout(`Move Y: ${ny}px`);
+        this.set3DHudReadout(`${staged3DOnly ? 'Pending 3D · ' : ''}Move Y: ${ny}px`);
       } else if (mode === 'gizmo_z' && gizmo?.z) {
         const proj = (px - startX) * gizmo.z.dirX + (py - startY) * gizmo.z.dirY;
         const nz = Math.round((origTf.z || 0) + (proj * 1.35) / Math.max(0.15, box.sx));
         this.setLayerTransformProp(layer, 'z', nz, false);
-        this.set3DHudReadout(`Depth Z: ${nz}`);
+        this.set3DHudReadout(`${staged3DOnly ? 'Pending 3D · ' : ''}Depth Z: ${nz}`);
       } else if (mode === 'gizmo_rot_xy') {
         const dx = px - startX;
         const dy = py - startY;
@@ -3036,13 +3665,13 @@ class MotionFlowApp {
         const nRX = Math.round((origTf.rotX || 0) - dy * 0.65);
         this.setLayerTransformProp(layer, 'rotY', nRY, false);
         this.setLayerTransformProp(layer, 'rotX', nRX, false);
-        this.set3DHudReadout(`Tilt X:${nRX}° Yaw Y:${nRY}°`);
+        this.set3DHudReadout(`${staged3DOnly ? 'Pending 3D · ' : ''}Tilt X:${nRX}° Yaw Y:${nRY}°`);
       } else if (mode === 'gizmo_rot_z' || mode === 'rotate') {
         const curAngle = Math.atan2(py - box.cy, px - box.cx);
         const degDelta = ((curAngle - startAngle) * 180) / Math.PI;
         const nRot = Math.round(origTf.rotation + degDelta);
         this.setLayerTransformProp(layer, 'rotation', nRot, false);
-        if (this.viewport3D.enabled) this.set3DHudReadout(`Roll Z: ${nRot}°`);
+        if (this.viewport3D.enabled) this.set3DHudReadout(`${staged3DOnly ? 'Pending 3D · ' : ''}Roll Z: ${nRot}°`);
       } else if (mode === 'move') {
         const dx = (px - startX) / box.sx;
         const dy = (py - startY) / box.sy;
@@ -3050,7 +3679,7 @@ class MotionFlowApp {
         const ny = Math.round(origTf.y + dy);
         this.setLayerTransformProp(layer, 'x', nx, false);
         this.setLayerTransformProp(layer, 'y', ny, false);
-        if (this.viewport3D.enabled) this.set3DHudReadout(`Pos (${nx}, ${ny})`);
+        if (this.viewport3D.enabled) this.set3DHudReadout(`${staged3DOnly ? 'Pending 3D · ' : ''}Pos (${nx}, ${ny})`);
       } else if (mode === 'scale') {
         const curDist = Math.max(10, Math.hypot(px - box.cx, py - box.cy));
         const ratio = curDist / startDist;
@@ -3058,7 +3687,7 @@ class MotionFlowApp {
         const syVal = Number((origTf.scaleY * ratio).toFixed(2));
         this.setLayerTransformProp(layer, 'scaleX', sxVal, false);
         this.setLayerTransformProp(layer, 'scaleY', syVal, false);
-        if (this.viewport3D.enabled) this.set3DHudReadout(`Scale ${sxVal.toFixed(2)}x`);
+        if (this.viewport3D.enabled) this.set3DHudReadout(`${staged3DOnly ? 'Pending 3D · ' : ''}Scale ${sxVal.toFixed(2)}x`);
       }
     });
 
@@ -3066,25 +3695,34 @@ class MotionFlowApp {
     overlay.addEventListener('wheel', (e) => {
       if (!this.viewport3D?.enabled) return;
       e.preventDefault();
-      const cam = KeyframeEngine.getCameraAtFrame(this.project.camera, this.currentFrame);
+      const cam = this.getEffectiveCamera(this.currentFrame);
       const nextZ = clamp(Math.round(cam.z - e.deltaY * 0.65), -1500, 1200);
       this.setCameraProp('z', nextZ, false);
-      const recPrefix = this.viewport3D.autoRecord ? 'REC · ' : '';
-      this.set3DHudReadout(`${recPrefix}Dolly Z: ${nextZ}`);
-      this.scheduleAutosave();
+      if (this.viewport3D.autoRecord) {
+        this.set3DHudReadout(`REC · Dolly Z: ${nextZ}`);
+        this.scheduleAutosave();
+      } else {
+        this.set3DHudReadout(`Pending 3D · Dolly Z: ${nextZ} (Klik ◆ Keyframe)`);
+      }
     }, { passive: false });
 
     const endGesture = (e) => {
       pointers.delete(e.pointerId);
       if (pointers.size > 0 && gesture?.mode === 'cam_pinch_pan') {
-        // Keep remaining finger from jumping after lifting one finger of pinch
-        if (this.viewport3D.autoRecord && gesture.lastZoom !== undefined) {
+        if (!gesture.staged3DOnly && this.viewport3D.autoRecord && gesture.lastZoom !== undefined) {
           this.setCameraProp('zoom', gesture.lastZoom, false, true);
           this.setCameraProp('x', gesture.lastX, false, true);
           this.setCameraProp('y', gesture.lastY, false, true);
         }
+        const wasStaged = gesture.staged3DOnly;
         gesture = null;
-        this.onTimelineMutated();
+        if (wasStaged) {
+          this.updateTransportLabels();
+          this.syncViewport3DUI();
+          this.renderPreview();
+        } else {
+          this.onTimelineMutated();
+        }
         return;
       }
       if (pointers.size === 0 && gesture) {
@@ -3099,23 +3737,29 @@ class MotionFlowApp {
           }
           return;
         }
-        if (g.mode === 'cam_orbit' && !g.undoPushed) {
+        if (g.mode === 'cam_orbit' && !g.dragStarted) {
           if (g.pendingLayerPick) {
             this.selectLayer(g.pendingLayerPick);
           }
           return;
         }
-        if (g.mode === 'cam_orbit' && this.viewport3D.autoRecord && g.lastRY !== undefined) {
+        if (g.mode === 'cam_orbit' && !g.staged3DOnly && this.viewport3D.autoRecord && g.lastRY !== undefined) {
           this.setCameraProp('rotY', g.lastRY, false, true);
           this.setCameraProp('rotX', g.lastRX, false, true);
         }
-        if (g.mode === 'cam_pinch_pan' && this.viewport3D.autoRecord && g.lastZoom !== undefined) {
+        if (g.mode === 'cam_pinch_pan' && !g.staged3DOnly && this.viewport3D.autoRecord && g.lastZoom !== undefined) {
           this.setCameraProp('zoom', g.lastZoom, false, true);
           this.setCameraProp('x', g.lastX, false, true);
           this.setCameraProp('y', g.lastY, false, true);
         }
         if (g.mode === 'tracker') {
           this.trackerState.dragging = false;
+          this.renderPreview();
+        } else if (g.staged3DOnly && g.dragStarted) {
+          this.updateTransportLabels();
+          this.syncViewport3DUI();
+          this.panels?.renderInspector();
+          if (this.panels?.activeStyleTab === 'camera') this.panels.renderStylePanel();
           this.renderPreview();
         } else if (g.undoPushed) {
           this.onTimelineMutated();
@@ -3138,6 +3782,10 @@ class MotionFlowApp {
         const openSheet = document.querySelector('.offcanvas.show');
         if (openSheet) {
           bootstrap.Offcanvas.getInstance(openSheet)?.hide();
+          return true;
+        }
+        if (this.isPreviewFullview) {
+          this.exitPreviewFullview();
           return true;
         }
         return false;
@@ -3295,8 +3943,44 @@ class MotionFlowApp {
           this.panels.renderStylePanel();
         }
         this.showToast(`Loaded font "${fontObj.name}"`);
+      },
+      onExportLocationPicked: (info) => {
+        if (info?.uri) {
+          this.exportLocation = {
+            uri: info.uri,
+            displayName: info.displayName || 'Custom Location.mp4',
+            webHandle: null
+          };
+          this.updateExportLocationUI();
+          this.showToast(`Lokasi export dipilih: ${this.exportLocation.displayName}`);
+        }
+      },
+      onExportSavedToLocation: (res) => {
+        if (res?.ok) {
+          const lbl = document.getElementById('lblExportResultInfo');
+          if (lbl) lbl.textContent = `${res.displayName || 'Export.mp4'} disimpan ke lokasi pilihan Anda`;
+          this.showToast(`Disimpan: ${res.displayName || 'Lokasi Pilihan'}`);
+        } else {
+          this.showToast(res?.error || 'Gagal menyimpan file ke lokasi pilihan');
+        }
       }
     };
+  }
+
+  updateExportLocationUI() {
+    const lbl = document.getElementById('lblExportLocation');
+    const clearBtn = document.getElementById('btnClearExportLocation');
+    const hasCustom = Boolean(this.exportLocation?.uri || this.exportLocation?.webHandle);
+    if (lbl) {
+      lbl.textContent = hasCustom
+        ? (this.exportLocation.displayName || 'Lokasi Pilihan')
+        : 'Movies/MotionFlow Studio (Default)';
+      lbl.classList.toggle('text-info', hasCustom);
+      lbl.classList.toggle('text-secondary', !hasCustom);
+    }
+    if (clearBtn) {
+      clearBtn.classList.toggle('d-none', !hasCustom);
+    }
   }
 
   bindUIEvents() {
@@ -3320,6 +4004,7 @@ class MotionFlowApp {
     this.undoAction = () => {
       const prev = this.history.undo(this.project);
       if (prev) {
+        this.clearPending3DPose(false);
         this.project = prev;
         this.currentFrame = Math.min(this.currentFrame, this.project.durationFrames);
         if (this.selectedLayerId && !this.project.layers.some((l) => l.id === this.selectedLayerId)) {
@@ -3333,6 +4018,7 @@ class MotionFlowApp {
     this.redoAction = () => {
       const next = this.history.redo(this.project);
       if (next) {
+        this.clearPending3DPose(false);
         this.project = next;
         this.currentFrame = Math.min(this.currentFrame, this.project.durationFrames);
         if (this.selectedLayerId && !this.project.layers.some((l) => l.id === this.selectedLayerId)) {
@@ -3396,8 +4082,11 @@ class MotionFlowApp {
       this.project.settings.showGrid = !this.project.settings.showGrid;
       this.onTimelineMutated();
     };
+    document.getElementById('btnPreviewMode2D')?.addEventListener('click', () => {
+      this.setViewport3DEnabled(false);
+    });
     document.getElementById('btnResetCameraQuick').onclick = () => {
-      this.toggleViewport3D();
+      this.setViewport3DEnabled(true);
     };
     document.getElementById('btn3DToolMove').onclick = () => this.setViewport3DTool('move');
     document.getElementById('btn3DToolRotate').onclick = () => this.setViewport3DTool('rotate');
@@ -3497,6 +4186,9 @@ class MotionFlowApp {
         e.preventDefault();
         this.timelineView.zoomOut(this.currentFrame);
         this.refreshTimelineOnly();
+      } else if (key === 'escape' && this.isPreviewFullview) {
+        e.preventDefault();
+        this.exitPreviewFullview();
       } else if (key === 'delete' || key === 'backspace') {
         e.preventDefault();
         this.deleteSelectedLayer();
@@ -3508,41 +4200,74 @@ class MotionFlowApp {
     document.getElementById('btnZoomIn').onclick = () => { this.timelineView.zoomIn(this.currentFrame); this.refreshTimelineOnly(); };
     document.getElementById('btnZoomOut').onclick = () => { this.timelineView.zoomOut(this.currentFrame); this.refreshTimelineOnly(); };
     document.getElementById('btnZoomFit')?.addEventListener('click', () => {
-      this.timelineView.zoomToFit(this.project);
-      this.refreshTimelineOnly();
-      this.showToast('Zoomed timeline to fit clips');
+      this.togglePreviewFullview();
+    });
+    document.getElementById('btnExitFullview')?.addEventListener('click', () => {
+      this.exitPreviewFullview();
+    });
+    document.getElementById('btnFullviewPlayPause')?.addEventListener('click', () => {
+      this.togglePlay();
     });
     window.addEventListener('resize', () => {
       this.timelineView.redrawRulerOnly();
+      this.renderer?.syncCanvasDimensions(this.project);
       this.renderPreview();
     });
 
+    document.getElementById('btnPrevKeyframe')?.addEventListener('click', () => this.jumpToKeyframe(-1));
+    document.getElementById('btnNextKeyframe')?.addEventListener('click', () => this.jumpToKeyframe(1));
+
     document.getElementById('btnQuickKeyframe').onclick = () => {
       const layer = this.getSelectedLayer();
-      if (!layer) return this.showToast('Select a layer first');
+      if (!layer || layer.type === 'camera') {
+        if (this.viewport3D?.enabled || layer?.type === 'camera') {
+          this.keyframeCameraAtPlayhead();
+          return;
+        }
+        return this.showToast('Pilih clip di timeline atau aktifkan mode 3D terlebih dahulu');
+      }
+      if (this._pending3DLayerPose && this._pending3DLayerPose.layerId === layer.id) {
+        this.commitPending3DLayerKeyframe(layer);
+        return;
+      }
+      const f = Math.round(this.currentFrame);
+      const is3D = Boolean(this.viewport3D?.enabled);
       this.mutateProject(() => {
-        const exists = KeyframeEngine.hasAnyKeyframeAtFrame(layer, this.currentFrame);
+        const exists = KeyframeEngine.hasAnyKeyframeAtFrame(layer, f);
         if (exists) {
           if (layer.keyframes) {
-            Object.keys(layer.keyframes).forEach((p) => KeyframeEngine.removeKeyframe(layer, p, this.currentFrame));
+            Object.keys(layer.keyframes).forEach((p) => KeyframeEngine.removeKeyframe(layer, p, f));
           }
-          this.showToast(`Removed keyframes at F${this.currentFrame}`);
+          this.showToast(`Keyframe dihapus @ F${f}`);
         } else if (layer.type === 'audio') {
-          const vol = KeyframeEngine.getValueAtFrame(layer, 'volume', this.currentFrame, layer.audioProps?.volume ?? 1);
-          KeyframeEngine.setKeyframe(layer, 'volume', this.currentFrame, vol);
-          this.showToast(`Keyframed volume at F${this.currentFrame}`);
+          const vol = KeyframeEngine.getValueAtFrame(layer, 'volume', f, layer.audioProps?.volume ?? 1);
+          KeyframeEngine.setKeyframe(layer, 'volume', f, vol);
+          this.showToast(`Keyframe volume @ F${f}`);
+        } else if (layer.type === 'adjustment') {
+          const tf = KeyframeEngine.getTransformAtFrame(layer, f);
+          KeyframeEngine.setKeyframe(layer, 'opacity', f, tf.opacity);
+          if (layer.adjustmentKind === 'filter' || layer.adjustmentKind === 'effect') {
+            const intVal = KeyframeEngine.getValueAtFrame(layer, 'intensity', f, KeyframeEngine.getDefaultPropValue(layer, 'intensity'));
+            KeyframeEngine.setKeyframe(layer, 'intensity', f, intVal);
+          }
+          this.showToast(`Keyframe adjustment @ F${f}`);
         } else {
-          const tf = KeyframeEngine.getTransformAtFrame(layer, this.currentFrame);
-          KeyframeEngine.setKeyframe(layer, 'x', this.currentFrame, tf.x);
-          KeyframeEngine.setKeyframe(layer, 'y', this.currentFrame, tf.y);
-          KeyframeEngine.setKeyframe(layer, 'z', this.currentFrame, tf.z || 0);
-          KeyframeEngine.setKeyframe(layer, 'scaleX', this.currentFrame, tf.scaleX);
-          KeyframeEngine.setKeyframe(layer, 'scaleY', this.currentFrame, tf.scaleY);
-          KeyframeEngine.setKeyframe(layer, 'rotation', this.currentFrame, tf.rotation);
-          KeyframeEngine.setKeyframe(layer, 'rotX', this.currentFrame, tf.rotX || 0);
-          KeyframeEngine.setKeyframe(layer, 'rotY', this.currentFrame, tf.rotY || 0);
-          KeyframeEngine.setKeyframe(layer, 'opacity', this.currentFrame, tf.opacity);
-          this.showToast(`Keyframed transforms at F${this.currentFrame}`);
+          const tf = KeyframeEngine.getTransformAtFrame(layer, f);
+          const include3D = is3D ||
+            Math.abs(tf.z || 0) > 0.01 || Math.abs(tf.rotX || 0) > 0.01 || Math.abs(tf.rotY || 0) > 0.01 ||
+            ['z', 'rotX', 'rotY'].some((p) => (layer.keyframes?.[p]?.length || 0) > 0);
+          KeyframeEngine.setKeyframe(layer, 'x', f, tf.x);
+          KeyframeEngine.setKeyframe(layer, 'y', f, tf.y);
+          KeyframeEngine.setKeyframe(layer, 'scaleX', f, tf.scaleX);
+          KeyframeEngine.setKeyframe(layer, 'scaleY', f, tf.scaleY);
+          KeyframeEngine.setKeyframe(layer, 'rotation', f, tf.rotation);
+          KeyframeEngine.setKeyframe(layer, 'opacity', f, tf.opacity);
+          if (include3D) {
+            KeyframeEngine.setKeyframe(layer, 'z', f, tf.z || 0);
+            KeyframeEngine.setKeyframe(layer, 'rotX', f, tf.rotX || 0);
+            KeyframeEngine.setKeyframe(layer, 'rotY', f, tf.rotY || 0);
+          }
+          this.showToast(`Keyframe ${include3D ? '3D ' : '2D '}ditambahkan @ F${f}`);
         }
       });
     };
@@ -3914,6 +4639,7 @@ class MotionFlowApp {
       const trimEl = document.getElementById('chkExportTrimTail');
       if (trimEl) trimEl.checked = ep.trimTrailingEmpty !== false;
       document.getElementById('inpExportFileName').value = `${this.project.name.replace(/\s+/g, '_')}.mp4`;
+      this.updateExportLocationUI();
 
       syncResStep(resIdx, cachedSupports4K);
       syncFpsStep(fpsIdx);
@@ -3929,6 +4655,37 @@ class MotionFlowApp {
     };
     document.getElementById('btnOpenExport').onclick = openExportDialog;
     document.getElementById('btnQuickExportSpec')?.addEventListener('click', openExportDialog);
+
+    document.getElementById('btnPickExportLocation')?.addEventListener('click', async () => {
+      const rawName = document.getElementById('inpExportFileName')?.value?.trim() || `${this.project.name.replace(/\s+/g, '_')}.mp4`;
+      const safeName = /\.mp4$/i.test(rawName) ? rawName : `${rawName}.mp4`;
+      if (window.AndroidBridge?.pickExportLocation) {
+        window.AndroidBridge.pickExportLocation(safeName);
+        return;
+      }
+      if (typeof window.showSaveFilePicker === 'function') {
+        try {
+          const handle = await window.showSaveFilePicker({
+            suggestedName: safeName.replace(/\.mp4$/i, '.webm'),
+            types: [{ description: 'Video File', accept: { 'video/mp4': ['.mp4'], 'video/webm': ['.webm'] } }]
+          });
+          this.exportLocation = { uri: 'web-fs-handle', displayName: handle.name || safeName, webHandle: handle };
+          this.updateExportLocationUI();
+          this.showToast(`Lokasi export dipilih: ${this.exportLocation.displayName}`);
+        } catch (err) {
+          if (err?.name !== 'AbortError') this.showToast('Gagal memilih lokasi file');
+        }
+        return;
+      }
+      this.showToast('Browser otomatis menyimpan hasil export ke folder Downloads');
+    });
+
+    document.getElementById('btnClearExportLocation')?.addEventListener('click', () => {
+      window.AndroidBridge?.clearExportLocation?.();
+      this.exportLocation = { uri: '', displayName: '', webHandle: null };
+      this.updateExportLocationUI();
+      this.showToast('Lokasi export dikembalikan ke Movies/MotionFlow Studio');
+    });
 
     document.getElementById('rngExportRes')?.addEventListener('input', (e) => syncResStep(e.target.value, cachedSupports4K));
     document.querySelectorAll('#ticksExportRes .mf-tick-btn').forEach((btn) => {
@@ -3980,6 +4737,8 @@ class MotionFlowApp {
           includeAudio,
           trimTrailingEmpty,
           fileName,
+          customUri: this.exportLocation?.uri || '',
+          fileHandle: this.exportLocation?.webHandle || null,
           onProgress: (pct, detail) => {
             document.getElementById('lblExportPercent').textContent = `${pct}%`;
             document.getElementById('barExportProgress').style.width = `${pct}%`;
@@ -3991,9 +4750,12 @@ class MotionFlowApp {
         document.getElementById('exportDonePane').classList.remove('d-none');
         document.getElementById('btnCancelExport').classList.add('d-none');
         document.getElementById('btnCloseExportX').disabled = false;
-        document.getElementById('lblExportResultInfo').textContent = result.contentUri
-          ? `${result.fileName} saved to Movies/MotionFlow Studio (${Math.round((result.sizeBytes || 0) / 1024)} KB)`
-          : `${result.fileName} saved internally (${Math.round((result.sizeBytes || 0) / 1024)} KB — tap Play or Share)`;
+        const sizeKb = Math.round((result.sizeBytes || 0) / 1024);
+        document.getElementById('lblExportResultInfo').textContent = result.isCustomLocation
+          ? `${result.fileName} disimpan ke lokasi pilihan (${sizeKb} KB)`
+          : result.contentUri
+            ? `${result.fileName} saved to Movies/MotionFlow Studio (${sizeKb} KB)`
+            : `${result.fileName} saved internally (${sizeKb} KB — tap Play, Share, or Save As)`;
 
         document.getElementById('btnOpenExported').onclick = () => {
           if (window.AndroidBridge?.openExportedFile && result.internalPath) {
@@ -4005,6 +4767,16 @@ class MotionFlowApp {
             window.AndroidBridge.shareExportedFile(result.internalPath);
           }
         };
+        const btnSaveAs = document.getElementById('btnSaveExportAs');
+        if (btnSaveAs) {
+          const canSaveAs = Boolean(window.AndroidBridge?.saveExportToLocation && result.internalPath);
+          btnSaveAs.classList.toggle('d-none', !canSaveAs);
+          btnSaveAs.onclick = () => {
+            if (window.AndroidBridge?.saveExportToLocation && result.internalPath) {
+              window.AndroidBridge.saveExportToLocation(result.internalPath, result.fileName || fileName);
+            }
+          };
+        }
       } catch (err) {
         document.getElementById('exportProgressPane').classList.add('d-none');
         document.getElementById('exportConfigPane').classList.remove('d-none');

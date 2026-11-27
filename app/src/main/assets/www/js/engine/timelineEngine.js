@@ -19,6 +19,7 @@ export function createBaseLayer(type, name, project, overrides = {}) {
     id: uid('layer'),
     type,
     name,
+    adjustmentKind: overrides.adjustmentKind || null, // 'filter' | 'effect' | 'adjust' | null
     trackRole: overrides.trackRole ?? null, // 'main' | 'overlay' | null
     colorMatch: overrides.colorMatch || null,
     parentId: null,
@@ -199,17 +200,38 @@ export const TimelineEngine = {
     });
   },
 
-  createAdjustmentLayer(project, startFrame = 0) {
+  createAdjustmentLayer(project, startFrame = 0, options = {}) {
     const fps = project.fps || 30;
-    const avail = Math.max(15, (project.durationFrames || fps * 4) - startFrame);
-    const len = Math.min(avail, fps * 4);
-    return createBaseLayer('adjustment', 'Adjustment FX', project, {
+    const avail = Math.max(30, (project.durationFrames || fps * 4) - startFrame);
+    const requestedLen = Number(options.durationFrames);
+    const len = Number.isFinite(requestedLen) && requestedLen >= 15
+      ? Math.round(requestedLen)
+      : Math.min(avail, fps * 4);
+    const safeStart = Math.max(0, Math.round(startFrame || 0));
+    const adjKind = options.adjustmentKind || (options.vfx || options.vfxStack ? 'effect' : options.filterId ? 'filter' : 'adjust');
+    const defaultName = adjKind === 'filter'
+      ? 'Filter'
+      : adjKind === 'effect'
+        ? 'Effect FX'
+        : 'Adjustment FX';
+    const layer = createBaseLayer('adjustment', options.name || defaultName, project, {
+      adjustmentKind: adjKind,
       trackRole: 'overlay',
-      startFrame,
-      endFrame: startFrame + Math.max(15, len),
+      startFrame: safeStart,
+      endFrame: safeStart + Math.max(15, len),
       width: project.width || 1280,
-      height: project.height || 720
+      height: project.height || 720,
+      filterId: options.filterId || 'normal',
+      filterIntensity: options.filterIntensity ?? 1.0,
+      fx: options.fx || undefined,
+      vfx: options.vfx || undefined,
+      vfxStack: options.vfxStack || undefined
     });
+    if (options.vfxStack && options.vfxStack.length > 0) {
+      layer._vfxStackExplicit = true;
+      this.normalizeLayerVfxStack(layer);
+    }
+    return layer;
   },
 
   createMediaLayer(project, mediaItem, startFrame = 0, overrides = {}) {
@@ -249,6 +271,80 @@ export const TimelineEngine = {
     });
   },
 
+  CAMERA_PROPS: ['x', 'y', 'z', 'rotX', 'rotY', 'rotZ', 'zoom'],
+
+  getCameraLayer(project) {
+    return project?.layers?.find((l) => l && l.type === 'camera') || null;
+  },
+
+  createCameraLayer(project, options = {}) {
+    const fps = Math.max(1, project?.fps || 30);
+    const maxCamKf = Math.max(0, ...KeyframeEngine.getAllCameraKeyframeFrames(project?.camera));
+    const endF = Math.max(project?.durationFrames || fps * 5, maxCamKf, fps * 5);
+    return createBaseLayer('camera', options.name || '3D Camera Rec', project, {
+      trackRole: 'overlay',
+      startFrame: options.startFrame ?? 0,
+      endFrame: options.endFrame ?? endF,
+      ...options
+    });
+  },
+
+  syncCameraToLayer(project, camLayer = null) {
+    const layer = camLayer || this.getCameraLayer(project);
+    if (!layer || !project?.camera) return null;
+    if (!layer.keyframes) layer.keyframes = {};
+    let maxFrame = 0;
+    for (const prop of this.CAMERA_PROPS) {
+      const list = project.camera.keyframes?.[prop];
+      if (Array.isArray(list) && list.length > 0) {
+        layer.keyframes[prop] = deepClone(list).sort((a, b) => a.frame - b.frame);
+        maxFrame = Math.max(maxFrame, layer.keyframes[prop][layer.keyframes[prop].length - 1].frame);
+      } else {
+        layer.keyframes[prop] = [];
+      }
+    }
+    if (maxFrame > (layer.endFrame || 0)) {
+      layer.endFrame = maxFrame;
+      this.ensureProjectDuration(project, maxFrame);
+    }
+    return layer;
+  },
+
+  syncLayerToCamera(project, camLayer = null) {
+    const layer = camLayer || this.getCameraLayer(project);
+    if (!layer || !project?.camera) return false;
+    if (!project.camera.keyframes) {
+      project.camera.keyframes = { x: [], y: [], z: [], rotX: [], rotY: [], rotZ: [], zoom: [] };
+    }
+    let hasAny = false;
+    for (const prop of this.CAMERA_PROPS) {
+      const list = layer.keyframes?.[prop];
+      if (Array.isArray(list) && list.length > 0) {
+        project.camera.keyframes[prop] = deepClone(list).sort((a, b) => a.frame - b.frame);
+        hasAny = true;
+      } else {
+        project.camera.keyframes[prop] = [];
+      }
+    }
+    if (hasAny) project.camera.enabled = true;
+    return true;
+  },
+
+  getOrCreateCameraLayer(project, options = {}) {
+    if (!project) return null;
+    let camLayer = this.getCameraLayer(project);
+    if (!camLayer) {
+      camLayer = this.createCameraLayer(project, options);
+      camLayer.kfExpanded = options.kfExpanded !== undefined ? Boolean(options.kfExpanded) : true;
+      project.layers.unshift(camLayer);
+      this.normalizeTrackZOrder(project);
+    } else if (options.kfExpanded !== undefined) {
+      camLayer.kfExpanded = Boolean(options.kfExpanded);
+    }
+    this.syncCameraToLayer(project, camLayer);
+    return camLayer;
+  },
+
   addLayer(project, layer) {
     project.layers.unshift(layer);
     this.ensureProjectDuration(project, layer.endFrame);
@@ -258,12 +354,16 @@ export const TimelineEngine = {
   deleteLayer(project, layerId) {
     const idx = project.layers.findIndex((l) => l.id === layerId);
     if (idx < 0) return false;
+    const removed = project.layers[idx];
     // Ungroup any children and detach tracking pins first
     project.layers.forEach((l) => {
       if (l.parentId === layerId) l.parentId = null;
       if (l.pinnedSourceLayerId === layerId) l.pinnedSourceLayerId = null;
     });
     project.layers.splice(idx, 1);
+    if (removed?.type === 'camera' && project.camera) {
+      project.camera.keyframes = { x: [], y: [], z: [], rotX: [], rotY: [], rotZ: [], zoom: [] };
+    }
     return true;
   },
 
@@ -273,7 +373,7 @@ export const TimelineEngine = {
     const copy = deepClone(project.layers[idx]);
     copy.id = uid('layer');
     copy.name = `${copy.name} Copy`;
-    if (copy.type !== 'adjustment' && copy.type !== 'audio') {
+    if (copy.type !== 'adjustment' && copy.type !== 'audio' && copy.type !== 'camera') {
       copy.transform.x += 24;
       copy.transform.y += 24;
     }
@@ -411,21 +511,8 @@ export const TimelineEngine = {
     orig.transitions.outType = 'none';
     right.transitions.inType = 'none';
 
-    // Partition keyframes cleanly while preserving interpolated continuity at the split frame
-    if (orig.keyframes) {
-      for (const prop of Object.keys(orig.keyframes)) {
-        const list = orig.keyframes[prop];
-        if (!Array.isArray(list) || list.length === 0) continue;
-        const valAtSplit = KeyframeEngine.getValueAtFrame(orig, prop, f, orig.transform?.[prop] ?? 0);
-        const origHasBoundary = list.some((k) => k.frame === f);
-        orig.keyframes[prop] = list.filter((k) => k.frame <= f);
-        right.keyframes[prop] = (right.keyframes[prop] || []).filter((k) => k.frame >= f);
-        if (!origHasBoundary) {
-          KeyframeEngine.setKeyframe(orig, prop, f, valAtSplit, 'linear');
-          KeyframeEngine.setKeyframe(right, prop, f, valAtSplit, 'linear');
-        }
-      }
-    }
+    // Partition keyframes cleanly while preserving default values, easing curves, and continuity at the split frame
+    KeyframeEngine.partitionKeyframesAtSplit(orig, right, f);
     orig.endFrame = f;
     project.layers.splice(idx, 0, right);
     return right;
@@ -1148,7 +1235,7 @@ export const TimelineEngine = {
       if (delta !== 0) {
         this.shiftLayerKeyframes(copy, delta);
       }
-      if (copy.type !== 'adjustment' && copy.type !== 'audio') {
+      if (copy.type !== 'adjustment' && copy.type !== 'audio' && copy.type !== 'camera') {
         copy.transform.x = (copy.transform?.x || 0) + 18;
         copy.transform.y = (copy.transform?.y || 0) + 18;
       }
@@ -1698,18 +1785,7 @@ export const TimelineEngine = {
           ? origOffset
           : origOffset + Math.round((f - origStart) * spd);
 
-      if (layer.keyframes) {
-        for (const prop of Object.keys(layer.keyframes)) {
-          const list = layer.keyframes[prop];
-          if (!Array.isArray(list) || list.length === 0) continue;
-          const valAtSplit = KeyframeEngine.getValueAtFrame(layer, prop, f, layer.transform?.[prop] ?? 0);
-          const hasBoundary = list.some((k) => k.frame === f);
-          layer.keyframes[prop] = list.filter((k) => k.frame >= f);
-          if (!hasBoundary) {
-            KeyframeEngine.setKeyframe(layer, prop, f, valAtSplit, 'linear');
-          }
-        }
-      }
+      KeyframeEngine.trimKeyframesAtBoundary(layer, 'right', f);
       layer.startFrame = f;
       layer.mediaOffsetFrames = Math.max(0, rightOffset);
       if (layer.transitions) layer.transitions.inType = 'none';
@@ -1739,18 +1815,7 @@ export const TimelineEngine = {
         );
       }
 
-      if (layer.keyframes) {
-        for (const prop of Object.keys(layer.keyframes)) {
-          const list = layer.keyframes[prop];
-          if (!Array.isArray(list) || list.length === 0) continue;
-          const valAtSplit = KeyframeEngine.getValueAtFrame(layer, prop, f, layer.transform?.[prop] ?? 0);
-          const hasBoundary = list.some((k) => k.frame === f);
-          layer.keyframes[prop] = list.filter((k) => k.frame <= f);
-          if (!hasBoundary) {
-            KeyframeEngine.setKeyframe(layer, prop, f, valAtSplit, 'linear');
-          }
-        }
-      }
+      KeyframeEngine.trimKeyframesAtBoundary(layer, 'left', f);
       layer.endFrame = f;
       if (layer.transitions) layer.transitions.outType = 'none';
 

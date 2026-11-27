@@ -3,6 +3,7 @@ package com.example
 import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Intent
+import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.media.AudioFormat
@@ -37,11 +38,17 @@ import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color as ComposeColor
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -74,6 +81,7 @@ class MainActivity : ComponentActivity() {
     private var textToSpeech: TextToSpeech? = null
     @Volatile
     private var ttsReady: Boolean = false
+    private var isFullviewMode by mutableStateOf(false)
 
     private val requestMicPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -239,12 +247,15 @@ class MainActivity : ComponentActivity() {
         })
 
         setContent {
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .background(ComposeColor(0xFF0B0E14))
-                    .windowInsetsPadding(WindowInsets.safeDrawing)
-            ) {
+            val baseModifier = Modifier
+                .fillMaxSize()
+                .background(ComposeColor(0xFF0B0E14))
+            val rootModifier = if (isFullviewMode) {
+                baseModifier
+            } else {
+                baseModifier.windowInsetsPadding(WindowInsets.safeDrawing)
+            }
+            Box(modifier = rootModifier) {
                 AndroidView(
                     modifier = Modifier.fillMaxSize(),
                     factory = { ctx ->
@@ -539,7 +550,10 @@ class MainActivity : ComponentActivity() {
         fun isAndroidNative(): Boolean = true
 
         @JavascriptInterface
-        fun getPixabayApiKey(): String = BuildConfig.PIXABAY_API_KEY
+        fun getPixabayApiKey(): String {
+            val raw = BuildConfig.PIXABAY_API_KEY.trim()
+            return if (raw.isEmpty() || raw == "your_pixabay_api_key_here") "" else raw
+        }
 
         @JavascriptInterface
         fun pickVisualMedia(mode: String) {
@@ -758,6 +772,26 @@ class MainActivity : ComponentActivity() {
                     }
                     startActivity(intent)
                 } catch (_: Exception) {}
+            }
+        }
+
+        @JavascriptInterface
+        fun setFullviewMode(enabled: Boolean, orientationMode: String) {
+            runOnUiThread {
+                isFullviewMode = enabled
+                requestedOrientation = when {
+                    !enabled -> ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+                    orientationMode == "landscape" -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                    else -> ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                }
+                val controller = WindowCompat.getInsetsController(window, window.decorView)
+                controller.systemBarsBehavior =
+                    WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                if (enabled) {
+                    controller.hide(WindowInsetsCompat.Type.systemBars())
+                } else {
+                    controller.show(WindowInsetsCompat.Type.systemBars())
+                }
             }
         }
     }

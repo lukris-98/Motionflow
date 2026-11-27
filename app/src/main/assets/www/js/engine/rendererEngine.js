@@ -31,6 +31,8 @@ export class RendererEngine {
     this.renderedLayerQuads = [];
     this.trackerOverlay = null;
     this.viewport3D = { enabled: false, tool: 'move' }; // 'move' | 'rotate' | 'scale' | 'camera'
+    this.pending3DLayerPose = null;
+    this.pending3DCamPose = null;
   }
 
   setTrackerOverlay(state) {
@@ -39,6 +41,46 @@ export class RendererEngine {
 
   setViewport3DState(state) {
     this.viewport3D = state || { enabled: false, tool: 'move' };
+  }
+
+  setPending3DPose(layerPose = null, camPose = null) {
+    this.pending3DLayerPose = layerPose;
+    this.pending3DCamPose = camPose;
+  }
+
+  resolveEffectiveCamera(project, frame, flat2D = false, allowPending = false) {
+    const camEnabled = !flat2D && Boolean(project.camera?.enabled);
+    if (!camEnabled) {
+      return { enabled: false, x: 0, y: 0, z: 0, rotX: 0, rotY: 0, rotZ: 0, zoom: 1 };
+    }
+    const cam = KeyframeEngine.getCameraAtFrame(project.camera, frame);
+    if (allowPending && this.pending3DCamPose && Math.round(frame) === Math.round(this.pending3DCamPose.frame)) {
+      return { enabled: true, ...cam, ...this.pending3DCamPose.props };
+    }
+    return { enabled: true, ...cam };
+  }
+
+  resolveEffectiveTransform(layer, frame, allowPending = false) {
+    const tf = KeyframeEngine.getTransformAtFrame(layer, frame);
+    if (
+      allowPending &&
+      this.viewport3D?.enabled &&
+      this.pending3DLayerPose &&
+      this.pending3DLayerPose.layerId === layer.id &&
+      Math.round(frame) === Math.round(this.pending3DLayerPose.frame)
+    ) {
+      return { ...tf, ...this.pending3DLayerPose.props };
+    }
+    return tf;
+  }
+
+  getAdjustmentIntensityScale(layer, frame) {
+    if (!layer || layer.type !== 'adjustment' || !(layer.keyframes?.intensity?.length > 0)) {
+      return 1;
+    }
+    const base = Math.max(0.05, Number(KeyframeEngine.getDefaultPropValue(layer, 'intensity')) || 1);
+    const val = Math.max(0, Number(KeyframeEngine.getValueAtFrame(layer, 'intensity', frame, base)) || 0);
+    return val / base;
   }
 
   purgeMediaCache(mediaId) {
@@ -530,13 +572,29 @@ export class RendererEngine {
       const s = gl.createShader(type);
       gl.shaderSource(s, src);
       gl.compileShader(s);
+      if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+        console.warn('WebGL shader compile failed:', gl.getShaderInfoLog(s));
+        gl.deleteShader(s);
+        return null;
+      }
       return s;
     };
 
+    const vs = compile(gl.VERTEX_SHADER, vsSrc);
+    const fs = compile(gl.FRAGMENT_SHADER, fsSrc);
+    if (!vs || !fs) return null;
+
     const prog = gl.createProgram();
-    gl.attachShader(prog, compile(gl.VERTEX_SHADER, vsSrc));
-    gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, fsSrc));
+    gl.attachShader(prog, vs);
+    gl.attachShader(prog, fs);
     gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+      console.warn('WebGL program link failed:', gl.getProgramInfoLog(prog));
+      gl.deleteProgram(prog);
+      gl.deleteShader(vs);
+      gl.deleteShader(fs);
+      return null;
+    }
     gl.useProgram(prog);
 
     const posBuf = gl.createBuffer();
@@ -702,7 +760,25 @@ export class RendererEngine {
       gl.bindTexture(gl.TEXTURE_2D, tex);
     }
     try {
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, sourceEl);
+      const maxTex = Math.min(2048, Number(gl.getParameter(gl.MAX_TEXTURE_SIZE)) || 2048);
+      const sw = sourceEl?.videoWidth || sourceEl?.naturalWidth || sourceEl?.width || 0;
+      const sh = sourceEl?.videoHeight || sourceEl?.naturalHeight || sourceEl?.height || 0;
+      if (sw > maxTex || sh > maxTex) {
+        const scale = Math.min(maxTex / sw, maxTex / sh);
+        const tw = Math.max(2, Math.round(sw * scale));
+        const th = Math.max(2, Math.round(sh * scale));
+        if (!this._safeTexCanvas) this._safeTexCanvas = document.createElement('canvas');
+        if (this._safeTexCanvas.width !== tw || this._safeTexCanvas.height !== th) {
+          this._safeTexCanvas.width = tw;
+          this._safeTexCanvas.height = th;
+        }
+        const sctx = this._safeTexCanvas.getContext('2d');
+        sctx.clearRect(0, 0, tw, th);
+        sctx.drawImage(sourceEl, 0, 0, tw, th);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, this._safeTexCanvas);
+      } else {
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, sourceEl);
+      }
     } catch {
       const sw = sourceEl?.videoWidth || sourceEl?.naturalWidth || sourceEl?.width || 0;
       const sh = sourceEl?.videoHeight || sourceEl?.naturalHeight || sourceEl?.height || 0;
@@ -743,17 +819,47 @@ export class RendererEngine {
   }
 
   getImageElement(mediaItem) {
-    if (!mediaItem) return null;
+    if (!mediaItem || !mediaItem.url) return null;
+    const urlStr = String(mediaItem.url);
     if (mediaItem.isGif && !this.gifCache.has(mediaItem.id)) {
       this.gifCache.set(mediaItem.id, 'loading');
-      decodeAnimatedGif(mediaItem.url)
-        .then((decoded) => this.gifCache.set(mediaItem.id, decoded))
+      decodeAnimatedGif(urlStr)
+        .then((decoded) => {
+          this.gifCache.set(mediaItem.id, decoded);
+          this.onMediaFrameReady?.(mediaItem);
+        })
         .catch(() => this.gifCache.delete(mediaItem.id));
     }
-    if (this.imageCache.has(mediaItem.id)) return this.imageCache.get(mediaItem.id);
+    if (this.imageCache.has(mediaItem.id)) {
+      const existing = this.imageCache.get(mediaItem.id);
+      if (existing.dataset.srcUrl === urlStr && existing.dataset.failed !== '1') {
+        return existing;
+      }
+      this.imageCache.delete(mediaItem.id);
+    }
     const img = new Image();
-    img.crossOrigin = 'anonymous';
-    img.src = mediaItem.url;
+    const isExternalHttp = typeof window !== 'undefined' &&
+      /^https?:\/\//i.test(urlStr) &&
+      !urlStr.startsWith(window.location.origin);
+    if (isExternalHttp) {
+      img.crossOrigin = 'anonymous';
+    }
+    img.dataset.srcUrl = urlStr;
+    img.dataset.failed = '0';
+    img.onload = () => {
+      img.dataset.failed = '0';
+      this.onMediaFrameReady?.(mediaItem);
+    };
+    img.onerror = () => {
+      if (img.crossOrigin) {
+        img.removeAttribute('crossOrigin');
+        img.crossOrigin = null;
+        img.src = urlStr;
+        return;
+      }
+      img.dataset.failed = '1';
+    };
+    img.src = urlStr;
     this.imageCache.set(mediaItem.id, img);
     return img;
   }
@@ -840,9 +946,17 @@ export class RendererEngine {
       }
       this.onMediaFrameReady?.(mediaItem);
     };
-    vid.addEventListener('loadedmetadata', notifyReady);
+    vid.addEventListener('loadedmetadata', () => {
+      // Nudge WebView decoder off exact t=0 so the first video frame decodes reliably when paused
+      if (vid.readyState < 2 && vid.paused && !vid._primedFrame0) {
+        vid._primedFrame0 = true;
+        try { vid.currentTime = 0.001; } catch {}
+      }
+      notifyReady();
+    });
     vid.addEventListener('loadeddata', notifyReady);
     vid.addEventListener('canplay', notifyReady);
+    vid.addEventListener('playing', notifyReady);
     vid.addEventListener('seeked', () => {
       if (vid._pendingSeekTime !== undefined && vid._pendingSeekTime !== null) {
         const nextT = vid._pendingSeekTime;
@@ -929,6 +1043,9 @@ export class RendererEngine {
 
     for (const [id, vid] of this.videoCache.entries()) {
       if (!activeMediaIds.has(id) && !vid.paused) {
+        if (vid.readyState >= 2 && vid.videoWidth > 0) {
+          this.captureVideoFallbackFrame(id, vid);
+        }
         try { vid.pause(); } catch {}
       }
     }
@@ -946,6 +1063,9 @@ export class RendererEngine {
       const vid = this.getVideoElement(mediaItem);
       if (!vid) continue;
       if (!awaitSeek && !vid.paused) {
+        if (vid.readyState >= 2 && vid.videoWidth > 0) {
+          this.captureVideoFallbackFrame(mediaItem.id, vid);
+        }
         try { vid.pause(); } catch {}
       }
 
@@ -953,21 +1073,34 @@ export class RendererEngine {
       if (!isFinite(clampedTime) || clampedTime < 0) continue;
 
       const seekThreshold = awaitSeek ? 0.004 : 0.022;
-      if (Math.abs(vid.currentTime - clampedTime) > seekThreshold) {
+      const needsSeek = Math.abs(vid.currentTime - clampedTime) > seekThreshold;
+      const needsDecode = awaitSeek && vid.readyState < 2;
+      if (needsSeek || needsDecode) {
         if (awaitSeek) {
           vid._pendingSeekTime = null;
           promises.push(
             new Promise((resolve) => {
+              let settled = false;
               const done = () => {
+                if (settled) return;
+                settled = true;
                 vid.removeEventListener('seeked', done);
+                vid.removeEventListener('loadeddata', done);
+                vid.removeEventListener('canplay', done);
                 if (vid.readyState >= 2 && vid.videoWidth > 0) {
                   this.captureVideoFallbackFrame(mediaItem.id, vid);
                 }
                 resolve();
               };
               vid.addEventListener('seeked', done, { once: true });
-              try { vid.currentTime = clampedTime; } catch { resolve(); }
-              setTimeout(done, 220);
+              vid.addEventListener('loadeddata', done, { once: true });
+              vid.addEventListener('canplay', done, { once: true });
+              if (needsSeek) {
+                try { vid.currentTime = clampedTime; } catch {}
+              } else if (vid.readyState < 2) {
+                try { vid.currentTime = clampedTime > 0 ? clampedTime : 0.001; } catch {}
+              }
+              setTimeout(done, 480);
             })
           );
         } else if (vid.seeking) {
@@ -1235,8 +1368,9 @@ export class RendererEngine {
       }
       if (item.thumbUrl) {
         let thumbImg = this.videoThumbFallbackCache.get(item.id);
-        if (!thumbImg) {
+        if (!thumbImg || thumbImg.dataset.srcUrl !== item.thumbUrl) {
           thumbImg = new Image();
+          thumbImg.dataset.srcUrl = item.thumbUrl;
           thumbImg.onload = () => this.onMediaFrameReady?.(item);
           thumbImg.src = item.thumbUrl;
           this.videoThumbFallbackCache.set(item.id, thumbImg);
@@ -1280,12 +1414,14 @@ export class RendererEngine {
 
     const w = targetW || project.width;
     const h = targetH || project.height;
+    const isFlat2DPreview = !targetCanvas && !this.viewport3D?.enabled;
+    const allowPending = !targetCanvas;
 
     if (compositor) {
-      this.renderWebGL(compositor, project, frame, mediaMap, w, h);
+      this.renderWebGL(compositor, project, frame, mediaMap, w, h, isFlat2DPreview, allowPending);
     } else {
       const ctx = targetCanvas ? targetCanvas.getContext('2d', { alpha: false }) : this.ctx2dFallback;
-      this.renderCanvas2DFallback(ctx, project, frame, mediaMap, w, h);
+      this.renderCanvas2DFallback(ctx, project, frame, mediaMap, w, h, isFlat2DPreview, allowPending);
     }
 
     if (!targetCanvas) {
@@ -1455,7 +1591,7 @@ export class RendererEngine {
     if (compositor.uColorTint) gl.uniform4f(compositor.uColorTint, 1, 1, 1, 0);
   }
 
-  renderWebGL(compositor, project, frame, mediaMap, outW, outH) {
+  renderWebGL(compositor, project, frame, mediaMap, outW, outH, isFlat2DPreview = false, allowPending = false) {
     const {
       gl, prog, uMvp, uAlpha, uPremul,
       uBright, uContrast, uSat, uTemp,
@@ -1503,7 +1639,7 @@ export class RendererEngine {
       }
     }
 
-    const camEnabled = Boolean(project.camera?.enabled);
+    const camEnabled = !isFlat2DPreview && Boolean(project.camera?.enabled);
     const useMotionBlur = camEnabled && Boolean(project.camera?.motionBlur);
     const samples = useMotionBlur ? Math.max(2, Math.min(6, project.camera.motionBlurSamples || 4)) : 1;
 
@@ -1511,7 +1647,9 @@ export class RendererEngine {
     const fovRad = (45 * Math.PI) / 180;
     const aspect = project.width / Math.max(1, project.height);
     const camDist = (project.height / 2) / Math.tan(fovRad / 2);
-    const projMat = Mat4.perspective(fovRad, aspect, 10, camDist * 20);
+    const projMat = isFlat2DPreview
+      ? Mat4.ortho(-project.width / 2, project.width / 2, -project.height / 2, project.height / 2, -5000, 5000)
+      : Mat4.perspective(fovRad, aspect, 10, camDist * 20);
     const fps = Math.max(1, project.fps || 30);
 
     for (let s = samples - 1; s >= 0; s--) {
@@ -1519,10 +1657,12 @@ export class RendererEngine {
       const masterAlpha = samples === 1 ? 1.0 : (s === 0 ? 0.85 : 0.22);
 
       let viewMat = Mat4.identity();
-      viewMat = Mat4.translate(viewMat, 0, 0, -camDist);
+      if (!isFlat2DPreview) {
+        viewMat = Mat4.translate(viewMat, 0, 0, -camDist);
+      }
 
       if (camEnabled) {
-        const cam = KeyframeEngine.getCameraAtFrame(project.camera, subFrame);
+        const cam = this.resolveEffectiveCamera(project, subFrame, isFlat2DPreview, allowPending);
         viewMat = Mat4.scale(viewMat, cam.zoom, cam.zoom, 1);
         viewMat = Mat4.rotateZ(viewMat, (-cam.rotZ * Math.PI) / 180);
         viewMat = Mat4.rotateX(viewMat, (cam.rotX * Math.PI) / 180);
@@ -1532,7 +1672,7 @@ export class RendererEngine {
 
       for (let i = project.layers.length - 1; i >= 0; i--) {
         const layer = project.layers[i];
-        if (!layer.visible || layer.type === 'audio' || layer.type === 'group') continue;
+        if (!layer.visible || layer.type === 'audio' || layer.type === 'group' || layer.type === 'camera') continue;
         if (subFrame < layer.startFrame || subFrame > layer.endFrame) continue;
 
         let parentTf = null;
@@ -1540,7 +1680,7 @@ export class RendererEngine {
           const parent = layersById.get(layer.parentId);
           if (parent) {
             if (!parent.visible || subFrame < parent.startFrame || subFrame > parent.endFrame) continue;
-            parentTf = KeyframeEngine.getTransformAtFrame(parent, subFrame);
+            parentTf = this.resolveEffectiveTransform(parent, subFrame, allowPending);
           }
         }
 
@@ -1550,7 +1690,7 @@ export class RendererEngine {
         const drawable = isAdjustment ? null : this.resolveLayerDrawable(layer, subFrame, fps, mediaMap);
         if (!isAdjustment && !drawable) continue;
 
-        const tf = KeyframeEngine.getTransformAtFrame(layer, subFrame);
+        const tf = this.resolveEffectiveTransform(layer, subFrame, allowPending);
         const trState = this.computeTransitionState(layer, subFrame, project.width, project.height);
         let alpha = (isAdjustment ? 1.0 : masterAlpha) * Math.max(0, Math.min(1, tf.opacity)) * trState.alphaMul;
         if (parentTf) alpha *= Math.max(0, Math.min(1, parentTf.opacity));
@@ -1568,19 +1708,23 @@ export class RendererEngine {
         } else {
           let model = Mat4.identity();
           if (parentTf) {
-            model = Mat4.translate(model, parentTf.x, -parentTf.y, parentTf.z || 0);
+            model = Mat4.translate(model, parentTf.x, -parentTf.y, isFlat2DPreview ? 0 : (parentTf.z || 0));
             model = Mat4.rotateZ(model, (-parentTf.rotation * Math.PI) / 180);
-            model = Mat4.rotateX(model, ((parentTf.rotX || 0) * Math.PI) / 180);
-            model = Mat4.rotateY(model, ((parentTf.rotY || 0) * Math.PI) / 180);
+            if (!isFlat2DPreview) {
+              model = Mat4.rotateX(model, ((parentTf.rotX || 0) * Math.PI) / 180);
+              model = Mat4.rotateY(model, ((parentTf.rotY || 0) * Math.PI) / 180);
+            }
             model = Mat4.scale(model, parentTf.scaleX, parentTf.scaleY, 1);
           }
 
           const flipSX = layer.flipX ? -1 : 1;
           const flipSY = layer.flipY ? -1 : 1;
-          model = Mat4.translate(model, tf.x + trState.dx, -(tf.y + trState.dy), tf.z || 0);
+          model = Mat4.translate(model, tf.x + trState.dx, -(tf.y + trState.dy), isFlat2DPreview ? 0 : (tf.z || 0));
           model = Mat4.rotateZ(model, (-(tf.rotation + (trState.rotDelta || 0)) * Math.PI) / 180);
-          model = Mat4.rotateX(model, ((tf.rotX || 0) * Math.PI) / 180);
-          model = Mat4.rotateY(model, ((tf.rotY || 0) * Math.PI) / 180);
+          if (!isFlat2DPreview) {
+            model = Mat4.rotateX(model, ((tf.rotX || 0) * Math.PI) / 180);
+            model = Mat4.rotateY(model, ((tf.rotY || 0) * Math.PI) / 180);
+          }
           model = Mat4.scale(model, tf.scaleX * trState.scaleMul * flipSX, tf.scaleY * trState.scaleMul * flipSY, 1);
           model = Mat4.translate(model, -tf.anchorX, tf.anchorY, 0);
           model = Mat4.scale(model, drawable.w, drawable.h, 1);
@@ -1615,6 +1759,7 @@ export class RendererEngine {
         const maskSpec = MASK_PRESETS.find((m) => m.id === mask.type);
         const maskShaderType = maskSpec ? maskSpec.shaderType : 0;
 
+        const adjScale = isAdjustment ? this.getAdjustmentIntensityScale(layer, subFrame) : 1;
         // If 2+ stacked VFX are active, run pre-passes 0..N-2 through ping-pong FBOs first
         if (vfxList.length > 1) {
           const passW = isAdjustment ? outW : Math.min(outW, Math.max(64, Math.round(texelW)));
@@ -1644,7 +1789,7 @@ export class RendererEngine {
             gl.clear(gl.COLOR_BUFFER_BIT);
             gl.activeTexture(gl.TEXTURE0);
             gl.bindTexture(gl.TEXTURE_2D, curSrcTex);
-            gl.uniform3f(uVfx, sId, vItem.intensity ?? 0.65, vTime);
+            gl.uniform3f(uVfx, sId, (vItem.intensity ?? 0.65) * adjScale, vTime);
             gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
             curSrcTex = nextTex;
             targetIdx = 1 - targetIdx;
@@ -1665,19 +1810,19 @@ export class RendererEngine {
         gl.uniformMatrix4fv(uMvp, false, mvp);
         gl.uniform1f(uAlpha, alpha);
         gl.uniform1f(uPremul, premul);
-        gl.uniform1f(uBright, (Number(fx.brightness) || 0) + (trState.brightDelta || 0));
-        gl.uniform1f(uContrast, fx.contrast ?? 1);
-        gl.uniform1f(uSat, fx.saturation ?? 1);
-        gl.uniform1f(uTemp, Number(fx.temperature) || 0);
-        gl.uniform1f(uTint, Number(fx.tint) || 0);
-        gl.uniform1f(uExposure, Number(fx.exposure) || 0);
-        gl.uniform1f(uHighlights, Number(fx.highlights) || 0);
-        gl.uniform1f(uShadows, Number(fx.shadows) || 0);
-        gl.uniform1f(uFade, Number(fx.fade) || 0);
-        gl.uniform1f(uSharpen, Number(fx.sharpen) || 0);
-        gl.uniform1f(uBlur, (Number(fx.blur) || 0) + (trState.blurDelta || 0));
-        gl.uniform1f(uVignette, Number(fx.vignette) || 0);
-        gl.uniform1f(uGrain, Number(fx.grain) || 0);
+        gl.uniform1f(uBright, ((Number(fx.brightness) || 0) * adjScale) + (trState.brightDelta || 0));
+        gl.uniform1f(uContrast, 1 + ((fx.contrast ?? 1) - 1) * adjScale);
+        gl.uniform1f(uSat, 1 + ((fx.saturation ?? 1) - 1) * adjScale);
+        gl.uniform1f(uTemp, (Number(fx.temperature) || 0) * adjScale);
+        gl.uniform1f(uTint, (Number(fx.tint) || 0) * adjScale);
+        gl.uniform1f(uExposure, (Number(fx.exposure) || 0) * adjScale);
+        gl.uniform1f(uHighlights, (Number(fx.highlights) || 0) * adjScale);
+        gl.uniform1f(uShadows, (Number(fx.shadows) || 0) * adjScale);
+        gl.uniform1f(uFade, (Number(fx.fade) || 0) * adjScale);
+        gl.uniform1f(uSharpen, (Number(fx.sharpen) || 0) * adjScale);
+        gl.uniform1f(uBlur, ((Number(fx.blur) || 0) * adjScale) + (trState.blurDelta || 0));
+        gl.uniform1f(uVignette, (Number(fx.vignette) || 0) * adjScale);
+        gl.uniform1f(uGrain, (Number(fx.grain) || 0) * adjScale);
         gl.uniform2f(uTexel, 1 / texelW, 1 / texelH);
         gl.uniform1f(uChromaOn, isAdjustment ? 0 : (fx.chromaEnabled ? 1 : 0));
         gl.uniform3f(uChromaKey, keyRgb[0], keyRgb[1], keyRgb[2]);
@@ -1718,7 +1863,7 @@ export class RendererEngine {
             );
           }
         }
-        gl.uniform3f(uVfx, vfxShaderId, lastVfx.intensity ?? 0.65, vfxTime);
+        gl.uniform3f(uVfx, vfxShaderId, (lastVfx.intensity ?? 0.65) * adjScale, vfxTime);
         gl.uniform2f(uWipe, trState.wipeType, trState.wipeProgress);
         if (uHsl) {
           if (Array.isArray(fx.hsl) && fx.hsl.length === 8) {
@@ -1753,7 +1898,7 @@ export class RendererEngine {
     gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
   }
 
-  renderCanvas2DFallback(ctx, project, frame, mediaMap, w, h) {
+  renderCanvas2DFallback(ctx, project, frame, mediaMap, w, h, isFlat2DPreview = false, allowPending = false) {
     ctx.save();
     if (project.backgroundMode === 'gradient') {
       const g = ctx.createLinearGradient(0, 0, w, h);
@@ -1766,10 +1911,11 @@ export class RendererEngine {
     ctx.fillRect(0, 0, w, h);
     ctx.scale(w / project.width, h / project.height);
 
+    const cam = this.resolveEffectiveCamera(project, frame, isFlat2DPreview, allowPending);
     const layersById = new Map(project.layers.map((l) => [l.id, l]));
     for (let i = project.layers.length - 1; i >= 0; i--) {
       const layer = project.layers[i];
-      if (!layer.visible || layer.type === 'audio' || layer.type === 'group') continue;
+      if (!layer.visible || layer.type === 'audio' || layer.type === 'group' || layer.type === 'camera') continue;
       if (frame < layer.startFrame || frame > layer.endFrame) continue;
 
       let parentTf = null;
@@ -1777,12 +1923,12 @@ export class RendererEngine {
         const parent = layersById.get(layer.parentId);
         if (parent) {
           if (!parent.visible || frame < parent.startFrame || frame > parent.endFrame) continue;
-          parentTf = KeyframeEngine.getTransformAtFrame(parent, frame);
+          parentTf = this.resolveEffectiveTransform(parent, frame, allowPending);
         }
       }
 
       if (layer.type === 'adjustment') {
-        const tf = KeyframeEngine.getTransformAtFrame(layer, frame);
+        const tf = this.resolveEffectiveTransform(layer, frame, allowPending);
         const trState = this.computeTransitionState(layer, frame, project.width, project.height);
         let alpha = Math.max(0, Math.min(1, tf.opacity)) * trState.alphaMul;
         if (parentTf) alpha *= Math.max(0, Math.min(1, parentTf.opacity));
@@ -1798,11 +1944,13 @@ export class RendererEngine {
         actx.drawImage(ctx.canvas, 0, 0, w, h);
 
         const fx = layer.fx || {};
-        const bright = Math.max(0.1, 1 + (Number(fx.brightness) || 0) + (Number(fx.exposure) || 0) * 0.45 + (trState.brightDelta || 0));
-        const contrast = Math.max(0.1, fx.contrast ?? 1);
-        const sat = Math.max(0, fx.saturation ?? 1);
-        const blurPx = Math.max(0, ((Number(fx.blur) || 0) + (trState.blurDelta || 0)) * (w / Math.max(1, project.width)));
-        const tempHue = (Number(fx.temperature) || 0) * -22 + (Number(fx.tint) || 0) * 20;
+        const vfxList = TimelineEngine.getActiveVfxList(layer);
+        const adjScale = this.getAdjustmentIntensityScale(layer, frame);
+        const bright = Math.max(0.1, 1 + ((Number(fx.brightness) || 0) + (Number(fx.exposure) || 0) * 0.45) * adjScale + (trState.brightDelta || 0));
+        const contrast = Math.max(0.1, 1 + ((fx.contrast ?? 1) - 1) * adjScale);
+        const sat = Math.max(0, 1 + ((fx.saturation ?? 1) - 1) * adjScale);
+        const blurPx = Math.max(0, ((Number(fx.blur) || 0) * adjScale + (trState.blurDelta || 0)) * (w / Math.max(1, project.width)));
+        const tempHue = ((Number(fx.temperature) || 0) * -22 + (Number(fx.tint) || 0) * 20) * adjScale;
 
         ctx.save();
         ctx.setTransform(1, 0, 0, 1, 0, 0);
@@ -1810,14 +1958,58 @@ export class RendererEngine {
         ctx.globalCompositeOperation = blendMap[layer.blendMode] || 'source-over';
         ctx.globalAlpha = alpha;
         ctx.filter = `brightness(${bright.toFixed(2)}) contrast(${contrast.toFixed(2)}) saturate(${sat.toFixed(2)}) hue-rotate(${tempHue.toFixed(1)}deg) blur(${blurPx.toFixed(1)}px)`;
-        ctx.drawImage(this._adj2dCanvas, 0, 0, w, h);
+
+        const fps = Math.max(1, project.fps || 30);
+        let shakeDx = 0;
+        let shakeDy = 0;
+        for (const vItem of vfxList) {
+          const vt = ((frame - layer.startFrame) / fps) * (vItem.speed || 1);
+          const vi = (vItem.intensity ?? 0.65) * adjScale;
+          if (vItem.type === 'shake') {
+            shakeDx += Math.sin(vt * 29) * 14 * vi;
+            shakeDy += Math.cos(vt * 37) * 14 * vi;
+          }
+        }
+        ctx.drawImage(this._adj2dCanvas, shakeDx, shakeDy, w, h);
+        ctx.filter = 'none';
+
+        for (const vItem of vfxList) {
+          const vt = ((frame - layer.startFrame) / fps) * (vItem.speed || 1);
+          const vi = Math.max(0, Math.min(1.5, (vItem.intensity ?? 0.65) * adjScale));
+          if (vItem.type === 'nightVision') {
+            ctx.fillStyle = `rgba(30, 220, 90, ${(0.24 * vi).toFixed(3)})`;
+            ctx.fillRect(0, 0, w, h);
+          } else if (vItem.type === 'flash') {
+            const pulse = Math.pow(Math.max(0, Math.sin(vt * 8)), 4);
+            ctx.fillStyle = `rgba(255, 255, 255, ${(pulse * 0.55 * vi).toFixed(3)})`;
+            ctx.fillRect(0, 0, w, h);
+          } else if (vItem.type === 'vhs' || vItem.type === 'crt') {
+            ctx.fillStyle = `rgba(0, 0, 0, ${(0.18 * vi).toFixed(3)})`;
+            for (let sy = 0; sy < h; sy += 6) ctx.fillRect(0, sy, w, 2);
+          } else if (vItem.type === 'glitch' || vItem.type === 'rgbSplit') {
+            ctx.fillStyle = `rgba(0, 229, 255, ${(0.16 * vi).toFixed(3)})`;
+            ctx.fillRect(Math.sin(vt * 19) * 10, 0, w, h);
+          } else if (vItem.type === 'strobe') {
+            if (Math.sin(vt * 18) >= 0.45) {
+              ctx.fillStyle = `rgba(0, 0, 0, ${(0.82 * vi).toFixed(3)})`;
+              ctx.fillRect(0, 0, w, h);
+            }
+          }
+        }
+        if ((Number(fx.vignette) || 0) * adjScale > 0.01) {
+          const vg = ctx.createRadialGradient(w / 2, h / 2, w * 0.25, w / 2, h / 2, Math.hypot(w, h) * 0.55);
+          vg.addColorStop(0, 'rgba(0,0,0,0)');
+          vg.addColorStop(1, `rgba(0,0,0,${Math.min(0.88, (Number(fx.vignette) || 0) * adjScale * 0.85).toFixed(3)})`);
+          ctx.fillStyle = vg;
+          ctx.fillRect(0, 0, w, h);
+        }
         ctx.restore();
         continue;
       }
 
       const drawable = this.resolveLayerDrawable(layer, frame, project.fps || 30, mediaMap);
       if (!drawable) continue;
-      const tf = KeyframeEngine.getTransformAtFrame(layer, frame);
+      const tf = this.resolveEffectiveTransform(layer, frame, allowPending);
       const trState = this.computeTransitionState(layer, frame, project.width, project.height);
       let alpha = Math.max(0, Math.min(1, tf.opacity)) * trState.alphaMul;
       if (parentTf) alpha *= Math.max(0, Math.min(1, parentTf.opacity));
@@ -1827,6 +2019,12 @@ export class RendererEngine {
       const blendMap = { add: 'lighter', screen: 'screen', multiply: 'multiply' };
       ctx.globalCompositeOperation = blendMap[layer.blendMode] || 'source-over';
       ctx.translate(project.width / 2, project.height / 2);
+      if (cam.enabled) {
+        const camZScale = Math.max(0.25, 1 / Math.max(0.25, 1 + (cam.z || 0) / 1100));
+        ctx.scale(cam.zoom * camZScale, cam.zoom * camZScale);
+        ctx.rotate(((cam.rotZ || 0) * Math.PI) / 180);
+        ctx.translate(-(cam.x || 0), -(cam.y || 0));
+      }
       if (parentTf) {
         ctx.translate(parentTf.x, parentTf.y);
         ctx.rotate((parentTf.rotation * Math.PI) / 180);
@@ -1900,19 +2098,20 @@ export class RendererEngine {
     ctx.restore();
   }
 
-  computeCameraMatrices(project, frame) {
+  computeCameraMatrices(project, frame, flat2D = false, allowPending = true) {
     const fovRad = (45 * Math.PI) / 180;
     const aspect = project.width / Math.max(1, project.height);
     const camDist = (project.height / 2) / Math.tan(fovRad / 2);
-    const projMat = Mat4.perspective(fovRad, aspect, 10, camDist * 20);
-    const camEnabled = Boolean(project.camera?.enabled);
-    const cam = camEnabled
-      ? KeyframeEngine.getCameraAtFrame(project.camera, frame)
-      : { x: 0, y: 0, z: 0, rotX: 0, rotY: 0, rotZ: 0, zoom: 1 };
+    const projMat = flat2D
+      ? Mat4.ortho(-project.width / 2, project.width / 2, -project.height / 2, project.height / 2, -5000, 5000)
+      : Mat4.perspective(fovRad, aspect, 10, camDist * 20);
+    const cam = this.resolveEffectiveCamera(project, frame, flat2D, allowPending);
 
     let viewMat = Mat4.identity();
-    viewMat = Mat4.translate(viewMat, 0, 0, -camDist);
-    if (camEnabled) {
+    if (!flat2D) {
+      viewMat = Mat4.translate(viewMat, 0, 0, -camDist);
+    }
+    if (cam.enabled) {
       viewMat = Mat4.scale(viewMat, cam.zoom, cam.zoom, 1);
       viewMat = Mat4.rotateZ(viewMat, (-cam.rotZ * Math.PI) / 180);
       viewMat = Mat4.rotateX(viewMat, (cam.rotX * Math.PI) / 180);
@@ -2046,8 +2245,9 @@ export class RendererEngine {
       octx.restore();
     }
 
-    const mats = this.computeCameraMatrices(project, frame);
-    if (this.viewport3D?.enabled) {
+    const is3DMode = Boolean(this.viewport3D?.enabled);
+    const mats = this.computeCameraMatrices(project, frame, !is3DMode, true);
+    if (is3DMode) {
       this.drawBlender3DFloorAndTriad(octx, project, mats, ow, oh);
     }
 
@@ -2062,7 +2262,7 @@ export class RendererEngine {
     // Collect projected hit-test quads for all visible visual layers (front-to-back)
     for (let i = 0; i < project.layers.length; i++) {
       const l = project.layers[i];
-      if (!l.visible || l.type === 'audio' || l.type === 'group' || l.type === 'adjustment') continue;
+      if (!l.visible || l.type === 'audio' || l.type === 'group' || l.type === 'adjustment' || l.type === 'camera') continue;
       if (frame < l.startFrame || frame > l.endFrame) continue;
 
       let parentTf = null;
@@ -2070,27 +2270,31 @@ export class RendererEngine {
         const parent = project.layers.find((p) => p.id === l.parentId);
         if (parent) {
           if (!parent.visible || frame < parent.startFrame || frame > parent.endFrame) continue;
-          parentTf = KeyframeEngine.getTransformAtFrame(parent, frame);
+          parentTf = this.resolveEffectiveTransform(parent, frame, true);
         }
       }
 
-      const tf = KeyframeEngine.getTransformAtFrame(l, frame);
+      const tf = this.resolveEffectiveTransform(l, frame, true);
       const cachedRaster = this.rasterCache.get(l.id);
       const baseW = Math.max(l.width || 300, cachedRaster?.contentW || 0);
       const baseH = Math.max(l.height || 200, cachedRaster?.contentH || 0);
 
       let model = Mat4.identity();
       if (parentTf) {
-        model = Mat4.translate(model, parentTf.x, -parentTf.y, parentTf.z || 0);
+        model = Mat4.translate(model, parentTf.x, -parentTf.y, is3DMode ? (parentTf.z || 0) : 0);
         model = Mat4.rotateZ(model, (-parentTf.rotation * Math.PI) / 180);
-        model = Mat4.rotateX(model, ((parentTf.rotX || 0) * Math.PI) / 180);
-        model = Mat4.rotateY(model, ((parentTf.rotY || 0) * Math.PI) / 180);
+        if (is3DMode) {
+          model = Mat4.rotateX(model, ((parentTf.rotX || 0) * Math.PI) / 180);
+          model = Mat4.rotateY(model, ((parentTf.rotY || 0) * Math.PI) / 180);
+        }
         model = Mat4.scale(model, parentTf.scaleX, parentTf.scaleY, 1);
       }
-      model = Mat4.translate(model, tf.x, -tf.y, tf.z || 0);
+      model = Mat4.translate(model, tf.x, -tf.y, is3DMode ? (tf.z || 0) : 0);
       model = Mat4.rotateZ(model, (-tf.rotation * Math.PI) / 180);
-      model = Mat4.rotateX(model, ((tf.rotX || 0) * Math.PI) / 180);
-      model = Mat4.rotateY(model, ((tf.rotY || 0) * Math.PI) / 180);
+      if (is3DMode) {
+        model = Mat4.rotateX(model, ((tf.rotX || 0) * Math.PI) / 180);
+        model = Mat4.rotateY(model, ((tf.rotY || 0) * Math.PI) / 180);
+      }
       model = Mat4.scale(model, tf.scaleX, tf.scaleY, 1);
       model = Mat4.translate(model, -tf.anchorX, tf.anchorY, 0);
 
@@ -2111,7 +2315,51 @@ export class RendererEngine {
       }
     }
 
-    if (!selectedBoxInfo) return;
+    if (!selectedBoxInfo) {
+      const selectedLayer = project.layers.find((l) => l.id === selectedLayerId);
+      if (is3DMode && (selectedLayer?.type === 'camera' || (this.viewport3D?.autoRecord && !selectedLayerId))) {
+        const cx = ow * 0.5;
+        const cy = oh * 0.5;
+        const half = 68;
+        const corners = [
+          { x: cx - half, y: cy - half },
+          { x: cx + half, y: cy - half },
+          { x: cx + half, y: cy + half },
+          { x: cx - half, y: cy + half }
+        ];
+        this.lastOverlayBox = {
+          cx,
+          cy,
+          bw: half * 2,
+          bh: half * 2,
+          rad: 0,
+          sx,
+          sy,
+          layerId: selectedLayer?.id || '__camera__',
+          isCameraGizmo: true,
+          corners
+        };
+        octx.save();
+        octx.strokeStyle = this.viewport3D?.autoRecord ? 'rgba(248, 113, 113, 0.85)' : 'rgba(56, 189, 248, 0.8)';
+        octx.lineWidth = 1.4;
+        octx.setLineDash([5, 4]);
+        octx.strokeRect(cx - half, cy - half, half * 2, half * 2);
+        octx.setLineDash([]);
+        const camModel = Mat4.identity();
+        this.draw3DGizmo(octx, mats, camModel, { x: cx, y: cy }, ow, oh);
+        const camTag = this.viewport3D?.autoRecord ? '3D CAM AUTO-REC (Geser X/Y/Z)' : '3D CAMERA RIG';
+        octx.font = 'bold 10px system-ui, sans-serif';
+        const tw = octx.measureText(camTag).width + 12;
+        octx.fillStyle = 'rgba(11, 16, 26, 0.88)';
+        octx.fillRect(cx - tw / 2, cy - half - 22, tw, 16);
+        octx.fillStyle = this.viewport3D?.autoRecord ? '#fca5a5' : '#7dd3fc';
+        octx.textAlign = 'center';
+        octx.textBaseline = 'middle';
+        octx.fillText(camTag, cx, cy - half - 14);
+        octx.restore();
+      }
+      return;
+    }
     const { l: layer, model, pCenter, pTL, pTR, pBR, pBL } = selectedBoxInfo;
 
     const bw = Math.max(16, Math.hypot(pTR.x - pTL.x, pTR.y - pTL.y));
@@ -2130,9 +2378,17 @@ export class RendererEngine {
       corners: [pTL, pTR, pBR, pBL]
     };
 
+    const isPending3D = Boolean(
+      is3DMode &&
+      this.pending3DLayerPose &&
+      this.pending3DLayerPose.layerId === layer.id &&
+      Math.round(frame) === Math.round(this.pending3DLayerPose.frame)
+    );
+
     octx.save();
-    octx.strokeStyle = this.viewport3D?.enabled ? '#40C4FF' : '#00E5FF';
-    octx.lineWidth = 1.6;
+    octx.strokeStyle = isPending3D ? '#FFAB40' : (this.viewport3D?.enabled ? '#40C4FF' : '#00E5FF');
+    octx.lineWidth = isPending3D ? 2 : 1.6;
+    if (isPending3D) octx.setLineDash([5, 3]);
     octx.beginPath();
     octx.moveTo(pTL.x, pTL.y);
     octx.lineTo(pTR.x, pTR.y);
@@ -2140,11 +2396,29 @@ export class RendererEngine {
     octx.lineTo(pBL.x, pBL.y);
     octx.closePath();
     octx.stroke();
+    octx.setLineDash([]);
 
     // Scale corner squares
-    octx.fillStyle = '#00E5FF';
+    octx.fillStyle = isPending3D ? '#FFAB40' : '#00E5FF';
     for (const c of [pTL, pTR, pBR, pBL]) {
       octx.fillRect(c.x - 4.5, c.y - 4.5, 9, 9);
+    }
+
+    if (isPending3D) {
+      const badgeTxt = '3D Belum Di-Key · Klik ◆ Keyframe';
+      octx.font = 'bold 10px system-ui, sans-serif';
+      const tw = octx.measureText(badgeTxt).width + 12;
+      const bx = Math.max(8, Math.min(ow - tw - 8, pCenter.x - tw / 2));
+      const by = Math.max(8, Math.min(pTL.y, pTR.y) - 24);
+      octx.fillStyle = 'rgba(20, 14, 4, 0.9)';
+      octx.strokeStyle = '#FFAB40';
+      octx.lineWidth = 1;
+      octx.fillRect(bx, by, tw, 17);
+      octx.strokeRect(bx, by, tw, 17);
+      octx.fillStyle = '#FFAB40';
+      octx.textAlign = 'center';
+      octx.textBaseline = 'middle';
+      octx.fillText(badgeTxt, bx + tw / 2, by + 8.5);
     }
 
     if (this.viewport3D?.enabled) {
