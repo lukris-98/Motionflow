@@ -622,10 +622,12 @@ export const KeyframeEngine = {
           const h10 = u3 - 2 * u2 + u;
           const h01 = -2 * u3 + 3 * u2;
           const h11 = u3 - u2;
-          return h00 * a.value + h10 * m0 + h01 * b.value + h11 * m1;
+          const res = h00 * a.value + h10 * m0 + h01 * b.value + h11 * m1;
+          return Number.isFinite(res) ? res : fallbackValue;
         }
         const easedT = applyEasing(rawT, easingMode, a.bezier || [0.42, 0, 0.58, 1]);
-        return lerp(a.value, b.value, easedT);
+        const res = lerp(a.value, b.value, easedT);
+        return Number.isFinite(res) ? res : fallbackValue;
       }
     }
     return fallbackValue;
@@ -780,6 +782,107 @@ export const KeyframeEngine = {
       layer.activePresetId = layer.presetInId || layer.presetOutId || layer.presetComboId || null;
     }
     return removed;
+  },
+
+  getPrimaryPresetProp(layer, category) {
+    if (!layer?.keyframes || !category || category === 'none') return null;
+    const priority = ['x', 'y', 'scaleX', 'rotation', 'rotX', 'rotY', 'opacity', 'scaleY', 'z', 'color'];
+    for (const p of priority) {
+      const arr = layer.keyframes[p];
+      if (Array.isArray(arr) && arr.some((k) => k.presetTag === category)) {
+        return p;
+      }
+    }
+    for (const [p, arr] of Object.entries(layer.keyframes)) {
+      if (Array.isArray(arr) && arr.some((k) => k.presetTag === category)) {
+        return p;
+      }
+    }
+    return null;
+  },
+
+  getPresetCategoryCurve(layer, category, preferredProp = null) {
+    if (!layer?.keyframes || !category || category === 'none') {
+      return null;
+    }
+    const checkOrder = [];
+    if (preferredProp && Array.isArray(layer.keyframes[preferredProp])) {
+      checkOrder.push(preferredProp);
+    }
+    const primary = this.getPrimaryPresetProp(layer, category);
+    if (primary && !checkOrder.includes(primary)) {
+      checkOrder.push(primary);
+    }
+    for (const p of Object.keys(layer.keyframes)) {
+      if (!checkOrder.includes(p)) checkOrder.push(p);
+    }
+    for (const prop of checkOrder) {
+      const arr = layer.keyframes[prop];
+      if (!Array.isArray(arr) || arr.length === 0) continue;
+      const tagged = arr.filter((k) => k.presetTag === category);
+      if (tagged.length === 0) continue;
+      const nonLast = tagged.find((k) => {
+        const idx = arr.indexOf(k);
+        return idx >= 0 && idx < arr.length - 1;
+      });
+      const pick = nonLast || tagged[0];
+      return {
+        prop,
+        easing: pick.easing || 'easeInOut',
+        bezier: Array.isArray(pick.bezier) && pick.bezier.length >= 4
+          ? [...pick.bezier]
+          : [0.42, 0, 0.58, 1]
+      };
+    }
+    return null;
+  },
+
+  setPresetCategoryCurve(layer, category, easing = 'easeInOut', bezier = [0.42, 0, 0.58, 1]) {
+    if (!layer?.keyframes || !category || category === 'none') return 0;
+    const safeBez = Array.isArray(bezier) && bezier.length >= 4
+      ? bezier.slice(0, 4).map((n, i) => {
+          const fallback = [0.42, 0, 0.58, 1][i];
+          const v = Number(n);
+          return Number.isFinite(v) ? v : fallback;
+        })
+      : [0.42, 0, 0.58, 1];
+    let updated = 0;
+    for (const arr of Object.values(layer.keyframes)) {
+      if (!Array.isArray(arr) || arr.length === 0) continue;
+      for (let i = 0; i < arr.length; i++) {
+        const kf = arr[i];
+        if (kf?.presetTag !== category) continue;
+        kf.easing = easing;
+        kf.bezier = [...safeBez];
+        updated++;
+      }
+    }
+    return updated;
+  },
+
+  getSegmentStartKeyframeAtOrBefore(layer, prop, frame) {
+    const f = Math.round(frame);
+    const list = layer?.keyframes?.[prop];
+    if (!Array.isArray(list) || list.length === 0) return null;
+    const sorted = [...list].sort((a, b) => a.frame - b.frame);
+    const exact = sorted.find((k) => k.frame === f);
+    if (exact) {
+      const idx = sorted.indexOf(exact);
+      // If exact is the final keyframe with no outgoing segment and there is a preceding segment, edit the incoming segment start
+      if (idx === sorted.length - 1 && idx > 0) {
+        return sorted[idx - 1];
+      }
+      return exact;
+    }
+    for (let i = 0; i < sorted.length - 1; i++) {
+      if (f >= sorted[i].frame && f < sorted[i + 1].frame) {
+        return sorted[i];
+      }
+    }
+    if (sorted.length >= 2) {
+      return f < sorted[0].frame ? sorted[0] : sorted[sorted.length - 2];
+    }
+    return sorted[0];
   },
 
   applyBatchPreset(layers, presetId, projectWidth, projectHeight, durationFrames = 24, category = null) {

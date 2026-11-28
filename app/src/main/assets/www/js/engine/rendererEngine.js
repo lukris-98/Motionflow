@@ -38,6 +38,7 @@ export class RendererEngine {
 
     this.glPreview = this.createWebGLCompositor(this.canvas, false);
     this.ctx2dFallback = this.glPreview ? null : this.canvas.getContext('2d', { alpha: false });
+    this._fallback2dCanvas = null;
     this.exportCompositors = new WeakMap();
     this.lastOverlayBox = null;
     this.lastTrackerBox = null;
@@ -100,16 +101,27 @@ export class RendererEngine {
 
   resolveEffectiveTransform(layer, frame, allowPending = false) {
     const tf = KeyframeEngine.getTransformAtFrame(layer, frame);
-    if (
+    const merged = (
       allowPending &&
       this.viewport3D?.enabled &&
       this.pending3DLayerPose &&
       this.pending3DLayerPose.layerId === layer.id &&
       Math.round(frame) === Math.round(this.pending3DLayerPose.frame)
-    ) {
-      return { ...tf, ...this.pending3DLayerPose.props };
-    }
-    return tf;
+    ) ? { ...tf, ...this.pending3DLayerPose.props } : tf;
+    const finiteOr = (v, fb) => (Number.isFinite(Number(v)) ? Number(v) : fb);
+    return {
+      x: finiteOr(merged.x, 0),
+      y: finiteOr(merged.y, 0),
+      z: finiteOr(merged.z, 0),
+      scaleX: finiteOr(merged.scaleX, 1),
+      scaleY: finiteOr(merged.scaleY, 1),
+      rotation: finiteOr(merged.rotation, 0),
+      rotX: finiteOr(merged.rotX, 0),
+      rotY: finiteOr(merged.rotY, 0),
+      opacity: Math.max(0, Math.min(1, finiteOr(merged.opacity, 1))),
+      anchorX: finiteOr(merged.anchorX, 0),
+      anchorY: finiteOr(merged.anchorY, 0)
+    };
   }
 
   getAdjustmentIntensityScale(layer, frame) {
@@ -155,6 +167,8 @@ export class RendererEngine {
     try {
       vid._wantsPlay = false;
       vid._wantsPlaySinceMs = 0;
+      vid._playInFlight = false;
+      vid._playInFlightSinceMs = 0;
       vid._pendingPlayTargetTime = null;
       vid.pause();
       vid.removeAttribute('src');
@@ -271,6 +285,20 @@ export class RendererEngine {
       powerPreference: 'default'
     });
     if (!gl) return null;
+    if (typeof canvas.addEventListener === 'function' && !canvas._mfGlListenersAttached) {
+      canvas._mfGlListenersAttached = true;
+      canvas.addEventListener('webglcontextlost', (e) => {
+        if (typeof e?.preventDefault === 'function') e.preventDefault();
+        if (this.glPreview && this.glPreview.canvas === canvas) {
+          this.glPreview.contextLost = true;
+        }
+      }, false);
+      canvas.addEventListener('webglcontextrestored', () => {
+        if (canvas === this.canvas) {
+          this.glPreview = this.createWebGLCompositor(this.canvas, false);
+        }
+      }, false);
+    }
 
     const vsSrc = `
       attribute vec2 aPos;
@@ -575,8 +603,8 @@ export class RendererEngine {
         c.b -= uTemp * 0.14 - uTint * 0.06;
         c.rgb += uBright * 0.45;
         float lumAdj = dot(c.rgb, vec3(0.299, 0.587, 0.114));
-        float shadowW = pow(clamp(1.0 - lumAdj, 0.0, 1.0), 1.6);
-        float highW = pow(clamp(lumAdj, 0.0, 1.0), 1.6);
+        float shadowW = pow(max(0.0001, clamp(1.0 - lumAdj, 0.0, 1.0)), 1.6);
+        float highW = pow(max(0.0001, clamp(lumAdj, 0.0, 1.0)), 1.6);
         c.rgb += uShadows * 0.35 * shadowW + uHighlights * 0.35 * highW;
         c.rgb = (c.rgb - 0.5) * uContrast + 0.5;
         float lum = dot(c.rgb, vec3(0.299, 0.587, 0.114));
@@ -621,7 +649,8 @@ export class RendererEngine {
         }
         // Flash Pulse (5)
         if (vfxType > 4.5 && vfxType < 5.5 && vfxInt > 0.01) {
-          float pulse = pow(max(0.0, sin(vfxTime * 8.0)), 4.0);
+          float pulseRaw = max(0.0, sin(vfxTime * 8.0));
+          float pulse = pulseRaw * pulseRaw * pulseRaw * pulseRaw;
           c.rgb += vec3(pulse * 0.55 * vfxInt);
         }
         // Film Grain VFX (6)
@@ -800,13 +829,17 @@ export class RendererEngine {
     gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
 
     return {
+      canvas,
       gl,
+      contextLost: false,
       prog,
       posBuf,
       fboPosBuf,
       aPos,
       aUv,
       adjTex: null,
+      adjW: 0,
+      adjH: 0,
       uMvp: gl.getUniformLocation(prog, 'uMvp'),
       uAlpha: gl.getUniformLocation(prog, 'uAlpha'),
       uPremul: gl.getUniformLocation(prog, 'uPremul'),
@@ -865,6 +898,7 @@ export class RendererEngine {
     const { gl } = compositor;
     const fw = Math.max(2, Math.min(1920, Math.round(w)));
     const fh = Math.max(2, Math.min(1920, Math.round(h)));
+    gl.activeTexture(gl.TEXTURE0);
     const createTarget = () => {
       const tex = gl.createTexture();
       gl.bindTexture(gl.TEXTURE_2D, tex);
@@ -876,19 +910,25 @@ export class RendererEngine {
       const fbo = gl.createFramebuffer();
       gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
       gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
-      return { tex, fbo };
+      const complete = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
+      return { tex, fbo, complete };
     };
     if (!compositor.fxFboA || !compositor.fxFboB) {
       const a = createTarget();
       const b = createTarget();
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      if (!a.complete || !b.complete) {
+        try { if (a.fbo) gl.deleteFramebuffer(a.fbo); if (a.tex) gl.deleteTexture(a.tex); } catch {}
+        try { if (b.fbo) gl.deleteFramebuffer(b.fbo); if (b.tex) gl.deleteTexture(b.tex); } catch {}
+        return false;
+      }
       compositor.fxTexA = a.tex;
       compositor.fxFboA = a.fbo;
       compositor.fxTexB = b.tex;
       compositor.fxFboB = b.fbo;
       compositor.fxW = fw;
       compositor.fxH = fh;
-      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-      return;
+      return true;
     }
     if (compositor.fxW !== fw || compositor.fxH !== fh) {
       gl.bindTexture(gl.TEXTURE_2D, compositor.fxTexA);
@@ -897,23 +937,52 @@ export class RendererEngine {
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, fw, fh, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
       compositor.fxW = fw;
       compositor.fxH = fh;
+      gl.bindFramebuffer(gl.FRAMEBUFFER, compositor.fxFboA);
+      const okA = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      return okA;
     }
+    return true;
   }
 
   copyFramebufferToAdjustmentTex(compositor, w, h) {
     const { gl } = compositor;
+    const maxW = Math.max(1, gl.drawingBufferWidth || w || 1);
+    const maxH = Math.max(1, gl.drawingBufferHeight || h || 1);
+    const cw = Math.max(1, Math.min(maxW, Math.round(w || maxW)));
+    const ch = Math.max(1, Math.min(maxH, Math.round(h || maxH)));
+    gl.activeTexture(gl.TEXTURE0);
     if (!compositor.adjTex) {
       compositor.adjTex = gl.createTexture();
+      if (!compositor.adjTex) return null;
       gl.bindTexture(gl.TEXTURE_2D, compositor.adjTex);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      compositor.adjW = 0;
+      compositor.adjH = 0;
     } else {
       gl.bindTexture(gl.TEXTURE_2D, compositor.adjTex);
     }
-    gl.copyTexImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 0, 0, Math.max(1, w), Math.max(1, h), 0);
-    return compositor.adjTex;
+    try {
+      if (compositor.adjW !== cw || compositor.adjH !== ch) {
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, cw, ch, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+        compositor.adjW = cw;
+        compositor.adjH = ch;
+      }
+      gl.copyTexSubImage2D(gl.TEXTURE_2D, 0, 0, 0, 0, 0, cw, ch);
+      return compositor.adjTex;
+    } catch {
+      try {
+        gl.copyTexImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 0, 0, cw, ch, 0);
+        compositor.adjW = cw;
+        compositor.adjH = ch;
+        return compositor.adjTex;
+      } catch {
+        return null;
+      }
+    }
   }
 
   getOrCreateTexture(compositor, key, sourceEl, cacheToken = null) {
@@ -925,6 +994,7 @@ export class RendererEngine {
     const sh = sourceEl?.videoHeight || sourceEl?.naturalHeight || sourceEl?.height || 0;
     const srcId = sourceEl?.dataset?.srcUrl || sourceEl?.currentSrc || sourceEl?.src || '';
 
+    if (typeof gl.activeTexture === 'function') gl.activeTexture(gl.TEXTURE0);
     let tex = textures.get(key);
     if (!tex) {
       tex = gl.createTexture();
@@ -1265,23 +1335,30 @@ export class RendererEngine {
     vid._armVfc = armVfc;
 
     const safePlay = () => {
-      if (vid._playInFlight || !vid._wantsPlay) return;
+      const nowMs = typeof performance !== 'undefined' ? performance.now() : Date.now();
+      if (!vid._wantsPlay) return;
+      if (vid._playInFlight && (nowMs - (vid._playInFlightSinceMs || 0)) < 900) return;
       vid._playInFlight = true;
+      vid._playInFlightSinceMs = nowMs;
       try {
         const p = vid.play?.();
         if (p && typeof p.then === 'function') {
           p.then(() => {
             vid._playInFlight = false;
+            vid._playInFlightSinceMs = 0;
             armVfc();
           }).catch(() => {
             vid._playInFlight = false;
+            vid._playInFlightSinceMs = 0;
           });
         } else {
           vid._playInFlight = false;
+          vid._playInFlightSinceMs = 0;
           armVfc();
         }
       } catch {
         vid._playInFlight = false;
+        vid._playInFlightSinceMs = 0;
       }
     };
 
@@ -1330,6 +1407,8 @@ export class RendererEngine {
       notifyReady(false);
     });
     vid.addEventListener('playing', () => {
+      vid._playInFlight = false;
+      vid._playInFlightSinceMs = 0;
       armVfc();
       notifyReady(false);
     });
@@ -1369,12 +1448,23 @@ export class RendererEngine {
       : (mediaItem?.durationMs ? mediaItem.durationMs / 1000 : null);
     let targetTime;
     if (layer.reversed) {
-      const endWindow = knownDur ? Math.min(knownDur - 0.02, baseSec + spanSec) : baseSec + spanSec;
+      const endWindow = knownDur ? Math.min(Math.max(0, knownDur - 0.04), baseSec + spanSec) : baseSec + spanSec;
       targetTime = Math.max(0, endWindow - elapsedSec);
     } else {
       targetTime = Math.max(0, baseSec + elapsedSec);
     }
-    return knownDur ? Math.max(0, Math.min(knownDur - 0.02, targetTime)) : Math.max(0, targetTime);
+    return knownDur ? Math.max(0, Math.min(Math.max(0, knownDur - 0.04), targetTime)) : Math.max(0, targetTime);
+  }
+
+  resetVideoPlayTransientState() {
+    for (const vid of this.videoCache.values()) {
+      vid._pendingSeekTime = null;
+      vid._pendingPlayTargetTime = null;
+      vid._playInFlight = false;
+      vid._playInFlightSinceMs = 0;
+      vid._stallCount = 0;
+      vid._forceScratchCopy = false;
+    }
   }
 
   syncVideoPlayback(project, frame, mediaMap, isPlaying, shuttleRate = 1) {
@@ -1384,23 +1474,28 @@ export class RendererEngine {
     const maxConcurrentDecoders = Math.max(1, this.maxVideoDecoders || 3);
 
     const triggerSafePlay = (vid) => {
-      if (vid._playInFlight) return;
+      if (vid._playInFlight && (nowMs - (vid._playInFlightSinceMs || 0)) < 900) return;
       vid._playInFlight = true;
+      vid._playInFlightSinceMs = nowMs;
       try {
         const p = vid.play?.();
         if (p && typeof p.then === 'function') {
           p.then(() => {
             vid._playInFlight = false;
+            vid._playInFlightSinceMs = 0;
             vid._armVfc?.();
           }).catch(() => {
             vid._playInFlight = false;
+            vid._playInFlightSinceMs = 0;
           });
         } else {
           vid._playInFlight = false;
+          vid._playInFlightSinceMs = 0;
           vid._armVfc?.();
         }
       } catch {
         vid._playInFlight = false;
+        vid._playInFlightSinceMs = 0;
       }
     };
 
@@ -1432,6 +1527,7 @@ export class RendererEngine {
           Math.min(4.0, shuttleRate * (layer.speed || 1) * TimelineEngine.evaluateLayerSpeedFactor(layer, normT))
         );
         vid.muted = true;
+        vid._pendingSeekTime = null;
         if (!vid._wantsPlay) {
           vid._wantsPlay = true;
           vid._wantsPlaySinceMs = nowMs;
@@ -1453,8 +1549,14 @@ export class RendererEngine {
           triggerSafePlay(vid);
         } else if (vid.paused) {
           vid._pendingPlayTargetTime = null;
-          if (!vid.seeking && Math.abs(vid.currentTime - targetTime) > 0.08) {
+          const stuckSeeking = vid.seeking && (nowMs - (vid._wantsPlaySinceMs || nowMs)) > 450;
+          if ((!vid.seeking || stuckSeeking) && Math.abs(vid.currentTime - targetTime) > 0.08) {
             vid._lastSyncSeekMs = nowMs;
+            if (stuckSeeking) {
+              vid._wantsPlaySinceMs = nowMs;
+              vid._playInFlight = false;
+              vid._playInFlightSinceMs = 0;
+            }
             try { vid.currentTime = targetTime; } catch {}
           }
           triggerSafePlay(vid);
@@ -1477,9 +1579,11 @@ export class RendererEngine {
               vid._forceScratchCopy = false;
             }
           } else if (
-            vid.readyState >= 2 &&
             !vid.seeking &&
-            (nowMs - (vid._lastProgressWallMs || nowMs)) > 170 &&
+            (
+              (vid.readyState >= 2 && (nowMs - (vid._lastProgressWallMs || nowMs)) > 170) ||
+              (vid.readyState === 1 && (nowMs - (vid._lastProgressWallMs || nowMs)) > 350)
+            ) &&
             Math.abs(targetTime - (vid._lastObservedTargetTime ?? targetTime)) > 0.08
           ) {
             vid._stallCount = (vid._stallCount || 0) + 1;
@@ -1495,6 +1599,7 @@ export class RendererEngine {
             if (!vid.seeking && Math.abs(vid.currentTime - targetTime) > 0.04 && nowMs - (vid._lastSyncSeekMs || 0) > 40) {
               vid._lastSyncSeekMs = nowMs;
               try { vid.currentTime = targetTime; } catch {}
+              if (vid.paused) triggerSafePlay(vid);
             }
           } else if (
             !vid.seeking &&
@@ -1534,6 +1639,8 @@ export class RendererEngine {
         const wasPlaying = vid._wantsPlay || !vid.paused;
         vid._wantsPlay = false;
         vid._wantsPlaySinceMs = 0;
+        vid._playInFlight = false;
+        vid._playInFlightSinceMs = 0;
         vid._pendingPlayTargetTime = null;
         vid._stallCount = 0;
         vid._forceScratchCopy = false;
@@ -1564,6 +1671,9 @@ export class RendererEngine {
       if (!awaitSeek) {
         vid._wantsPlay = false;
         vid._wantsPlaySinceMs = 0;
+        vid._playInFlight = false;
+        vid._playInFlightSinceMs = 0;
+        vid._pendingPlayTargetTime = null;
       }
       if (!awaitSeek && !vid.paused) {
         if (vid.readyState >= 2 && vid.videoWidth > 0) {
@@ -2136,11 +2246,39 @@ export class RendererEngine {
     const isFlat2DPreview = !targetCanvas && !this.viewport3D?.enabled && !has3D;
     const allowPending = !targetCanvas;
 
-    if (compositor) {
-      this.renderWebGL(compositor, project, frame, mediaMap, w, h, isFlat2DPreview, allowPending);
-    } else {
-      const ctx = targetCanvas ? targetCanvas.getContext('2d', { alpha: false }) : this.ctx2dFallback;
-      this.renderCanvas2DFallback(ctx, project, frame, mediaMap, w, h, isFlat2DPreview, allowPending);
+    let rendered = false;
+    if (compositor && !compositor.contextLost && !compositor.gl?.isContextLost?.()) {
+      try {
+        this.renderWebGL(compositor, project, frame, mediaMap, w, h, isFlat2DPreview, allowPending);
+        rendered = true;
+      } catch (err) {
+        console.warn('WebGL render failed, falling back safely:', err);
+      }
+    }
+    if (!rendered) {
+      let ctx = targetCanvas ? targetCanvas.getContext('2d', { alpha: false }) : this.ctx2dFallback;
+      if (ctx) {
+        this.renderCanvas2DFallback(ctx, project, frame, mediaMap, w, h, isFlat2DPreview, allowPending);
+      } else if (!targetCanvas && this.octx) {
+        if (!this._fallback2dCanvas) this._fallback2dCanvas = document.createElement('canvas');
+        if (this._fallback2dCanvas.width !== w || this._fallback2dCanvas.height !== h) {
+          this._fallback2dCanvas.width = w;
+          this._fallback2dCanvas.height = h;
+        }
+        ctx = this._fallback2dCanvas.getContext('2d', { alpha: false });
+        if (ctx) {
+          this.renderCanvas2DFallback(ctx, project, frame, mediaMap, w, h, isFlat2DPreview, allowPending);
+          if (this.overlay) {
+            this.octx.save();
+            this.octx.setTransform(1, 0, 0, 1, 0, 0);
+            this.octx.clearRect(0, 0, this.overlay.width, this.overlay.height);
+            this.octx.drawImage(this._fallback2dCanvas, 0, 0, this.overlay.width, this.overlay.height);
+            this.octx.restore();
+            this.drawOverlay(project, frame, selectedLayerId, true);
+            return;
+          }
+        }
+      }
     }
 
     if (!targetCanvas) {
@@ -2489,7 +2627,8 @@ export class RendererEngine {
           let texelW;
           let texelH;
           if (isAdjustment) {
-            this.copyFramebufferToAdjustmentTex(compositor, outW, outH);
+            const adjTex = this.copyFramebufferToAdjustmentTex(compositor, outW, outH);
+            if (!adjTex) continue;
             this.bindCompositorQuadBuffer(compositor, compositor.fboPosBuf);
             mvp = Mat4.scale(Mat4.identity(), 2, 2, 1);
             texelW = Math.max(1, outW);
@@ -2553,43 +2692,46 @@ export class RendererEngine {
         if (vfxList.length > 1) {
           const passW = isAdjustment ? outW : Math.min(outW, Math.max(64, Math.round(texelW)));
           const passH = isAdjustment ? outH : Math.min(outH, Math.max(64, Math.round(texelH)));
-          this.ensureFxPingPong(compositor, passW, passH);
           const srcTex = isAdjustment
             ? compositor.adjTex
             : compositor.textures.get(drawable.cacheKey || layer.mediaId || layer.id);
-          this._resetDefaultShaderUniforms(compositor);
-          this.bindCompositorQuadBuffer(compositor, compositor.fboPosBuf);
-          gl.disable(gl.BLEND);
-          gl.viewport(0, 0, compositor.fxW, compositor.fxH);
-          gl.uniformMatrix4fv(uMvp, false, Mat4.scale(Mat4.identity(), 2, 2, 1));
-          gl.uniform2f(uTexel, 1 / Math.max(1, passW), 1 / Math.max(1, passH));
+          if (srcTex && this.ensureFxPingPong(compositor, passW, passH)) {
+            let curSrcTex = srcTex;
+            try {
+              this._resetDefaultShaderUniforms(compositor);
+              this.bindCompositorQuadBuffer(compositor, compositor.fboPosBuf);
+              gl.disable(gl.BLEND);
+              gl.viewport(0, 0, compositor.fxW, compositor.fxH);
+              gl.uniformMatrix4fv(uMvp, false, Mat4.scale(Mat4.identity(), 2, 2, 1));
+              gl.uniform2f(uTexel, 1 / Math.max(1, passW), 1 / Math.max(1, passH));
 
-          let curSrcTex = srcTex;
-          let targetIdx = 0;
-          for (let vi = 0; vi < vfxList.length - 1; vi++) {
-            const vItem = vfxList[vi];
-            const spec = VIDEO_EFFECT_PRESETS.find((v) => v.id === vItem.type);
-            const sId = spec ? spec.shaderId : 0;
-            const vTime = ((subFrame - layer.startFrame) / fps) * (vItem.speed || 1);
-            const targetFbo = targetIdx === 0 ? compositor.fxFboA : compositor.fxFboB;
-            const nextTex = targetIdx === 0 ? compositor.fxTexA : compositor.fxTexB;
-            gl.bindFramebuffer(gl.FRAMEBUFFER, targetFbo);
-            gl.clearColor(0, 0, 0, 0);
-            gl.clear(gl.COLOR_BUFFER_BIT);
-            gl.activeTexture(gl.TEXTURE0);
-            gl.bindTexture(gl.TEXTURE_2D, curSrcTex);
-            gl.uniform3f(uVfx, sId, (vItem.intensity ?? 0.65) * adjScale, vTime);
-            gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-            curSrcTex = nextTex;
-            targetIdx = 1 - targetIdx;
+              let targetIdx = 0;
+              for (let vi = 0; vi < vfxList.length - 1; vi++) {
+                const vItem = vfxList[vi];
+                const spec = VIDEO_EFFECT_PRESETS.find((v) => v.id === vItem.type);
+                const sId = spec ? spec.shaderId : 0;
+                const vTime = ((subFrame - layer.startFrame) / fps) * (vItem.speed || 1);
+                const targetFbo = targetIdx === 0 ? compositor.fxFboA : compositor.fxFboB;
+                const nextTex = targetIdx === 0 ? compositor.fxTexA : compositor.fxTexB;
+                gl.bindFramebuffer(gl.FRAMEBUFFER, targetFbo);
+                gl.clearColor(0, 0, 0, 0);
+                gl.clear(gl.COLOR_BUFFER_BIT);
+                gl.activeTexture(gl.TEXTURE0);
+                gl.bindTexture(gl.TEXTURE_2D, curSrcTex);
+                gl.uniform3f(uVfx, sId, (vItem.intensity ?? 0.65) * adjScale, vTime);
+                gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+                curSrcTex = nextTex;
+                targetIdx = 1 - targetIdx;
+              }
+            } finally {
+              gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+              gl.viewport(0, 0, outW, outH);
+              gl.enable(gl.BLEND);
+              gl.activeTexture(gl.TEXTURE0);
+              gl.bindTexture(gl.TEXTURE_2D, curSrcTex || srcTex);
+              this.bindCompositorQuadBuffer(compositor, isAdjustment ? compositor.fboPosBuf : compositor.posBuf);
+            }
           }
-
-          gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-          gl.viewport(0, 0, outW, outH);
-          gl.enable(gl.BLEND);
-          gl.activeTexture(gl.TEXTURE0);
-          gl.bindTexture(gl.TEXTURE_2D, curSrcTex);
-          this.bindCompositorQuadBuffer(compositor, isAdjustment ? compositor.fboPosBuf : compositor.posBuf);
         }
 
         const vfxSpec = VIDEO_EFFECT_PRESETS.find((v) => v.id === lastVfx.type);
@@ -2757,7 +2899,7 @@ export class RendererEngine {
         for (const vItem of vfxList) {
           const vt = ((frame - layer.startFrame) / fps) * (vItem.speed || 1);
           const vi = (vItem.intensity ?? 0.65) * adjScale;
-          if (vItem.type === 'shake') {
+          if (vItem.type === 'shake' || vItem.type === 'shakeCam') {
             shakeDx += Math.sin(vt * 29) * 14 * vi;
             shakeDy += Math.cos(vt * 37) * 14 * vi;
           }
@@ -2771,21 +2913,36 @@ export class RendererEngine {
           if (vItem.type === 'nightVision') {
             ctx.fillStyle = `rgba(30, 220, 90, ${(0.24 * vi).toFixed(3)})`;
             ctx.fillRect(0, 0, w, h);
-          } else if (vItem.type === 'flash') {
+          } else if (vItem.type === 'flash' || vItem.type === 'flashPulse') {
             const pulse = Math.pow(Math.max(0, Math.sin(vt * 8)), 4);
             ctx.fillStyle = `rgba(255, 255, 255, ${(pulse * 0.55 * vi).toFixed(3)})`;
             ctx.fillRect(0, 0, w, h);
-          } else if (vItem.type === 'vhs' || vItem.type === 'crt') {
+          } else if (vItem.type === 'vhs' || vItem.type === 'vhsRetro' || vItem.type === 'crt' || vItem.type === 'crtScan') {
             ctx.fillStyle = `rgba(0, 0, 0, ${(0.18 * vi).toFixed(3)})`;
             for (let sy = 0; sy < h; sy += 6) ctx.fillRect(0, sy, w, 2);
           } else if (vItem.type === 'glitch' || vItem.type === 'rgbSplit') {
             ctx.fillStyle = `rgba(0, 229, 255, ${(0.16 * vi).toFixed(3)})`;
             ctx.fillRect(Math.sin(vt * 19) * 10, 0, w, h);
-          } else if (vItem.type === 'strobe') {
+          } else if (vItem.type === 'strobe' || vItem.type === 'strobeBlack') {
             if (Math.sin(vt * 18) >= 0.45) {
               ctx.fillStyle = `rgba(0, 0, 0, ${(0.82 * vi).toFixed(3)})`;
               ctx.fillRect(0, 0, w, h);
             }
+          } else if (vItem.type === 'dreamGlow') {
+            ctx.fillStyle = `rgba(255, 240, 255, ${(0.16 * vi).toFixed(3)})`;
+            ctx.fillRect(0, 0, w, h);
+          } else if (vItem.type === 'edgeNeon') {
+            ctx.fillStyle = `rgba(0, 229, 255, ${(0.14 * vi).toFixed(3)})`;
+            ctx.fillRect(0, 0, w, h);
+          } else if (vItem.type === 'filmGrain' || vItem.type === 'halftone') {
+            ctx.fillStyle = `rgba(20, 20, 20, ${(0.12 * vi).toFixed(3)})`;
+            ctx.fillRect(0, 0, w, h);
+          } else if (vItem.type === 'zoomBlur') {
+            ctx.save();
+            ctx.globalAlpha = Math.min(0.45, 0.28 * vi);
+            const z = 1 + 0.06 * vi;
+            ctx.drawImage(this._adj2dCanvas, w * (1 - z) * 0.5, h * (1 - z) * 0.5, w * z, h * z);
+            ctx.restore();
           }
         }
         if ((Number(fx.vignette) || 0) * adjScale > 0.01) {
@@ -3143,11 +3300,13 @@ export class RendererEngine {
     octx.restore();
   }
 
-  drawOverlay(project, frame, selectedLayerId) {
+  drawOverlay(project, frame, selectedLayerId, preserveBackground = false) {
     const octx = this.octx;
     const ow = this.overlay.width;
     const oh = this.overlay.height;
-    octx.clearRect(0, 0, ow, oh);
+    if (!preserveBackground) {
+      octx.clearRect(0, 0, ow, oh);
+    }
     this.lastOverlayBox = null;
     this.lastTrackerBox = null;
     this.lastGizmoHandles = null;

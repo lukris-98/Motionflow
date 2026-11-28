@@ -42,6 +42,31 @@ export function scrollLeftToCenterFrame(scrollLeft, pxPerFrame, totalFrames = In
   return Number.isFinite(totalFrames) ? Math.max(0, Math.min(totalFrames, raw)) : Math.max(0, raw);
 }
 
+export function resolvePlayheadScrollLeft({
+  targetX = 0,
+  currentScrollLeft = 0,
+  viewportWidth = 360,
+  maxScroll = Infinity,
+  autoScroll = false,
+  manualPanActive = false,
+  forceAutoScroll = false,
+  frame = 0
+} = {}) {
+  if (!autoScroll) return null;
+  if (manualPanActive && !forceAutoScroll) return null;
+  const vw = Math.max(200, Number(viewportWidth) || 360);
+  const curScroll = Math.max(0, Number(currentScrollLeft) || 0);
+  const maxS = Number.isFinite(maxScroll) ? Math.max(0, maxScroll) : Infinity;
+  const tx = Number(targetX) || 0;
+  if (tx > curScroll + vw - 24) {
+    return Math.min(maxS, Math.max(0, tx - Math.round(vw * 0.25)));
+  }
+  if (tx < curScroll + (frame === 0 ? 0 : 12)) {
+    return Math.max(0, tx - 24);
+  }
+  return null;
+}
+
 export function computeRulerLodSpec(pxPerFrame, fps = 30) {
   const safeFps = Math.max(1, Math.round(fps || 30));
   const wasmTier = WasmBridge.getRulerLodTier(pxPerFrame, safeFps);
@@ -402,6 +427,7 @@ export class TimelineView {
     this._currentFrame = 0;
     this._suppressBgTapUntil = 0;
     this._suppressScrollSeekUntil = 0;
+    this._manualPanHoldUntil = 0;
     this._pendingScrollLeft = null;
     this._padLeft = TIMELINE_LEFT_PAD;
     this._lastRulerParams = null;
@@ -1042,16 +1068,24 @@ export class TimelineView {
   }
 
   bindRulerAndScroll() {
-    const clearProgrammaticLock = () => { this._suppressScrollSeekUntil = 0; };
-    this.scrollEl.addEventListener('pointerdown', clearProgrammaticLock, { passive: true });
-    this.scrollEl.addEventListener('touchstart', clearProgrammaticLock, { passive: true });
+    const markManualPan = (durationMs = 1500) => {
+      const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
+      this._suppressScrollSeekUntil = 0;
+      this._manualPanHoldUntil = Math.max(this._manualPanHoldUntil || 0, now + durationMs);
+    };
+    this.scrollEl.addEventListener('pointerdown', () => markManualPan(1600), { passive: true });
+    this.scrollEl.addEventListener('touchstart', () => markManualPan(1600), { passive: true });
     this.scrollEl.addEventListener('wheel', (e) => {
-      if (!e.ctrlKey && !e.metaKey) clearProgrammaticLock();
+      if (!e.ctrlKey && !e.metaKey) markManualPan(1500);
     }, { passive: true });
 
     this.scrollEl.addEventListener('scroll', () => {
       this._cancelHoverTooltip();
       this.headersList.scrollTop = this.scrollEl.scrollTop;
+      const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
+      if (now >= (this._suppressScrollSeekUntil || 0) && !this._isPinching && !this._isClipGestureActive) {
+        this._manualPanHoldUntil = Math.max(this._manualPanHoldUntil || 0, now + 900);
+      }
       const curScrollLeft = Math.max(0, this.scrollEl.scrollLeft || 0);
       this._ensureRulerCoversViewport();
       if (Math.abs(curScrollLeft - this._lastClipSliceScrollLeft) >= 12) {
@@ -1373,11 +1407,7 @@ export class TimelineView {
     this._lastTimelineMarkers = Array.isArray(project.markers) ? project.markers : [];
     this._lastBeatMarkers = Array.isArray(project.beatMarkers) ? project.beatMarkers : [];
 
-    if (hasPendingScroll) {
-      this._syncPlayheadOverlayPosition(this._currentFrame);
-    } else {
-      this.updatePlayhead(this._currentFrame);
-    }
+    this._syncPlayheadOverlayPosition(this._currentFrame);
     this.drawRuler(totalWidth, fps, totalFrames, maxPlayheadFrame);
     this.renderHeadersAndLanes(project, selectedLayerId, audioEngine, mediaMap);
     this._syncOverlayLineHeights();
@@ -1604,7 +1634,7 @@ export class TimelineView {
     }
   }
 
-  updatePlayhead(currentFrame) {
+  updatePlayhead(currentFrame, opts = {}) {
     const rawF = Number.isFinite(Number(currentFrame)) ? Number(currentFrame) : 0;
     const maxF = this._lastRenderContext?.project
       ? TimelineEngine.getPlayheadMaxFrame(this._lastRenderContext.project)
@@ -1617,13 +1647,20 @@ export class TimelineView {
       const targetX = frameToTimelineX(f, this.pxPerFrame, padLeft);
       const curScroll = this.scrollEl.scrollLeft || 0;
       const maxScroll = Math.max(0, this.scrollEl.scrollWidth - vw);
-      let nextScroll = null;
-      if (targetX > curScroll + vw - 24) {
-        nextScroll = Math.min(maxScroll, Math.max(0, targetX - Math.round(vw * 0.25)));
-      } else if (targetX < curScroll + (f === 0 ? 0 : 12)) {
-        nextScroll = Math.max(0, targetX - 24);
-      }
+      const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
+      const manualPanActive = now < (this._manualPanHoldUntil || 0);
+      const nextScroll = resolvePlayheadScrollLeft({
+        targetX,
+        currentScrollLeft: curScroll,
+        viewportWidth: vw,
+        maxScroll,
+        autoScroll: Boolean(opts?.autoScroll),
+        manualPanActive,
+        forceAutoScroll: Boolean(opts?.forceAutoScroll),
+        frame: f
+      });
       if (nextScroll !== null && Math.abs(nextScroll - curScroll) >= 0.5) {
+        this._suppressScrollSeekUntil = now + 70;
         this.scrollEl.scrollLeft = nextScroll;
         this._ensureRulerCoversViewport();
         this.redrawVisibleClipCanvases();

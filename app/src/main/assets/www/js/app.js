@@ -68,7 +68,11 @@ class MotionFlowApp {
       if (this.isPlaying && mediaItem?.type !== 'video') return;
       this._mediaRafId = requestAnimationFrame(() => {
         this._mediaRafId = null;
-        this.renderPreview();
+        try {
+          this.renderPreview();
+        } catch (err) {
+          console.warn('Media frame render error:', err);
+        }
       });
     };
     this.exportEngine = new ExportEngine(this.renderer, this.audioEngine);
@@ -444,8 +448,10 @@ class MotionFlowApp {
     this.updateUndoRedoButtons();
   }
 
-  mutateProject(mutator) {
-    this.stopTemplateLivePreview({ skipRender: true });
+  mutateProject(mutator, opts = {}) {
+    if (!opts.preserveTemplatePreview) {
+      this.stopTemplateLivePreview({ skipRender: true });
+    }
     this.clearPending3DPose(false);
     this.pushUndo();
     mutator();
@@ -810,12 +816,12 @@ class MotionFlowApp {
     this.showToast(`${items.length} keyframe digeser ${deltaFrames >= 0 ? `+${deltaFrames}` : deltaFrames}f`);
   }
 
-  setSelectedKeyframesEasingAction(items, easing, bezier = null) {
+  setSelectedKeyframesEasingAction(items, easing, bezier = null, opts = {}) {
     if (!Array.isArray(items) || items.length === 0) return;
     this.mutateProject(() => {
       KeyframeEngine.setSelectedKeyframesEasing(this.project, items, easing, bezier);
       this._syncAffectedCameraLayers(items);
-    });
+    }, opts);
     this.showToast(`Kurva ${items.length} keyframe → ${easing}`);
   }
 
@@ -948,6 +954,9 @@ class MotionFlowApp {
         durF
       );
       const cat = KeyframeEngine.getPresetCategory(spec.presetId);
+      if (spec.easing && cat !== 'none') {
+        KeyframeEngine.setPresetCategoryCurve(cloned, cat, spec.easing, spec.bezier);
+      }
       const appliedDur = cat === 'in'
         ? (cloned.presetInDurFrames || durF)
         : (cat === 'out' ? (cloned.presetOutDurFrames || durF) : (cloned.presetComboDurFrames || durF));
@@ -960,6 +969,45 @@ class MotionFlowApp {
       } else {
         winStart = cloned.startFrame;
         const loopCap = Math.min(90, Math.max(appliedDur + 6, cloned.endFrame - cloned.startFrame));
+        winEnd = Math.min(cloned.endFrame, cloned.startFrame + loopCap);
+      }
+    } else if (spec.kind === 'layerAnimation') {
+      const targetId = spec.layerId || this.selectedLayerId;
+      const idx = previewProject.layers.findIndex((l) => l.id === targetId);
+      if (idx === -1) return false;
+      const orig = previewProject.layers[idx];
+      if (!orig || orig.type === 'audio' || orig.type === 'group') return false;
+
+      const cloned = cloneLayer(orig);
+      previewProject.layers[idx] = cloned;
+      const cat = spec.category || 'in';
+      const durProp = cat === 'in'
+        ? 'presetInDurFrames'
+        : (cat === 'out' ? 'presetOutDurFrames' : 'presetComboDurFrames');
+      let minF = Infinity;
+      let maxF = -Infinity;
+      for (const arr of Object.values(cloned.keyframes || {})) {
+        if (!Array.isArray(arr)) continue;
+        for (const k of arr) {
+          if (k?.presetTag === cat) {
+            minF = Math.min(minF, k.frame);
+            maxF = Math.max(maxF, k.frame);
+          }
+        }
+      }
+      const fallbackDur = Math.max(3, Math.min(600, Number(cloned[durProp]) || Number(spec.durationFrames) || 24));
+      if (Number.isFinite(minF) && Number.isFinite(maxF) && maxF > minF) {
+        winStart = Math.max(cloned.startFrame, minF);
+        winEnd = Math.min(cloned.endFrame, maxF + 4);
+      } else if (cat === 'in') {
+        winStart = cloned.startFrame;
+        winEnd = Math.min(cloned.endFrame, cloned.startFrame + fallbackDur + 4);
+      } else if (cat === 'out') {
+        winEnd = cloned.endFrame;
+        winStart = Math.max(cloned.startFrame, cloned.endFrame - fallbackDur - 4);
+      } else {
+        winStart = cloned.startFrame;
+        const loopCap = Math.min(90, Math.max(fallbackDur + 6, cloned.endFrame - cloned.startFrame));
         winEnd = Math.min(cloned.endFrame, cloned.startFrame + loopCap);
       }
     } else if (spec.kind === 'transition') {
@@ -1010,6 +1058,7 @@ class MotionFlowApp {
     const state = {
       active: true,
       token,
+      spec,
       previewProject,
       previewFrame: winStart,
       rafId: null
@@ -1024,20 +1073,30 @@ class MotionFlowApp {
 
     const step = (now) => {
       if (!this._templatePreview || this._templatePreview.token !== token) return;
-      const elapsedInCycle = (now - startMs) % Math.max(200, cycleMs);
-      const rawStep = elapsedInCycle / frameMs;
-      const curF = Math.min(winEnd, Math.round(winStart + Math.min(span, rawStep)));
-      state.previewFrame = curF;
-      if (Math.abs(curF - lastSeekFrame) >= 2) {
-        lastSeekFrame = curF;
-        this.renderer.seekVideosForFrame(previewProject, curF, this.mediaMap, false).catch(() => {});
+      try {
+        const elapsedInCycle = (now - startMs) % Math.max(200, cycleMs);
+        const rawStep = elapsedInCycle / frameMs;
+        const curF = Math.min(winEnd, Math.round(winStart + Math.min(span, rawStep)));
+        state.previewFrame = curF;
+        if (Math.abs(curF - lastSeekFrame) >= 2) {
+          lastSeekFrame = curF;
+          this.renderer.seekVideosForFrame(previewProject, curF, this.mediaMap, false).catch(() => {});
+        }
+        this.renderer.renderFrame(previewProject, curF, this.mediaMap, this.selectedLayerId);
+      } catch (err) {
+        console.warn('Template preview step recovery:', err);
       }
-      this.renderer.renderFrame(previewProject, curF, this.mediaMap, this.selectedLayerId);
-      state.rafId = requestAnimationFrame(step);
+      if (this._templatePreview && this._templatePreview.token === token) {
+        state.rafId = requestAnimationFrame(step);
+      }
     };
 
-    this.renderer.seekVideosForFrame(previewProject, winStart, this.mediaMap, false).catch(() => {});
-    this.renderer.renderFrame(previewProject, winStart, this.mediaMap, this.selectedLayerId);
+    try {
+      this.renderer.seekVideosForFrame(previewProject, winStart, this.mediaMap, false).catch(() => {});
+      this.renderer.renderFrame(previewProject, winStart, this.mediaMap, this.selectedLayerId);
+    } catch (err) {
+      console.warn('Template preview initial render recovery:', err);
+    }
     state.rafId = requestAnimationFrame(step);
     return true;
   }
@@ -1052,7 +1111,7 @@ class MotionFlowApp {
       this.clearPending3DPose(false);
     }
     this.currentFrame = clamped;
-    this.timelineView.updatePlayhead(this.currentFrame);
+    this.timelineView.updatePlayhead(this.currentFrame, { autoScroll: true, forceAutoScroll: true });
     this.updateTransportLabels();
     this.syncViewport3DUI();
     if (this.isPlaying && this.shuttleRate > 0) {
@@ -1106,6 +1165,9 @@ class MotionFlowApp {
   }
 
   togglePlay() {
+    if (this.isPlaying && !this.rafId) {
+      this.isPlaying = false;
+    }
     if (this.isPlaying) {
       this.pause();
     } else {
@@ -1120,18 +1182,20 @@ class MotionFlowApp {
     const maxPlayheadFrame = this.getPlayheadMaxFrame();
     if (maxPlayheadFrame <= 0) {
       this.currentFrame = 0;
-      this.timelineView.updatePlayhead(0);
+      this.timelineView.updatePlayhead(0, { autoScroll: true, forceAutoScroll: true });
       this.updateTransportLabels();
       this.showToast('Tambahkan item ke timeline terlebih dahulu');
       return;
     }
-    if (this.isPlaying) {
+    if (this.isPlaying && this.rafId) {
       if (this.shuttleRate !== 1) this.audioEngine.stopAll();
       this.renderer.syncVideoPlayback(this.project, this.currentFrame, this.mediaMap, true, this.shuttleRate);
       return;
     }
     this.stopTemplateLivePreview({ skipRender: true });
+    this.renderer.resetVideoPlayTransientState?.();
     this.clearPending3DPose(false);
+    if (!Number.isFinite(this.currentFrame)) this.currentFrame = 0;
     if (dir > 0 && this.currentFrame >= maxPlayheadFrame) {
       this.currentFrame = 0;
     } else if (dir < 0 && this.currentFrame <= 0) {
@@ -1143,20 +1207,27 @@ class MotionFlowApp {
     const fvIconPlay = document.getElementById('iconFullviewPlayPause');
     if (fvIconPlay) fvIconPlay.className = 'bi bi-pause-fill';
     this.lastTickMs = performance.now();
-    if (this.shuttleRate === 1) {
-      this.audioEngine.startPlayback(this.project, this.currentFrame, this.mediaMap);
+    try {
+      if (this.shuttleRate === 1) {
+        Promise.resolve(this.audioEngine.startPlayback(this.project, this.currentFrame, this.mediaMap)).catch(() => {});
+      }
+      if (this.shuttleRate > 0) {
+        this.renderer.syncVideoPlayback(this.project, this.currentFrame, this.mediaMap, true, this.shuttleRate);
+      } else {
+        this.renderer.seekVideosForFrame(this.project, this.currentFrame, this.mediaMap, false).catch(() => {});
+      }
+      this.renderPreview();
+    } catch (err) {
+      console.warn('Playback startup render warning:', err);
     }
-    if (this.shuttleRate > 0) {
-      this.renderer.syncVideoPlayback(this.project, this.currentFrame, this.mediaMap, true, this.shuttleRate);
-    } else {
-      this.renderer.seekVideosForFrame(this.project, this.currentFrame, this.mediaMap, false).catch(() => {});
-    }
-    this.renderPreview();
 
     const frameIntervalMs = 1000 / (this.project.fps || 30);
     let ticking = false;
     const tick = async (now) => {
-      if (!this.isPlaying || token !== this.playToken) return;
+      if (!this.isPlaying || token !== this.playToken) {
+        if (token === this.playToken) this.rafId = null;
+        return;
+      }
       if (ticking) {
         this.rafId = requestAnimationFrame(tick);
         return;
@@ -1165,6 +1236,7 @@ class MotionFlowApp {
       if (elapsed >= frameIntervalMs) {
         ticking = true;
         try {
+          if (!Number.isFinite(this.currentFrame)) this.currentFrame = 0;
           const advance = Math.floor(elapsed / frameIntervalMs) * this.shuttleRate;
           this.lastTickMs = now - (elapsed % frameIntervalMs);
           this.currentFrame += advance;
@@ -1172,7 +1244,7 @@ class MotionFlowApp {
           if (loopMaxF <= 0) {
             this.currentFrame = 0;
             this.pause();
-            this.timelineView.updatePlayhead(0);
+            this.timelineView.updatePlayhead(0, { autoScroll: true, forceAutoScroll: true });
             this.updateTransportLabels();
             this.renderPreview();
             return;
@@ -1180,17 +1252,17 @@ class MotionFlowApp {
           if (this.currentFrame >= loopMaxF) {
             this.currentFrame = 0;
             if (this.shuttleRate === 1) {
-              this.audioEngine.startPlayback(this.project, 0, this.mediaMap);
+              Promise.resolve(this.audioEngine.startPlayback(this.project, 0, this.mediaMap)).catch(() => {});
             }
           } else if (this.currentFrame <= 0) {
             this.currentFrame = 0;
             this.pause();
-            this.timelineView.updatePlayhead(0);
+            this.timelineView.updatePlayhead(0, { autoScroll: true, forceAutoScroll: true });
             this.updateTransportLabels();
             this.renderPreview();
             return;
           }
-          this.timelineView.updatePlayhead(this.currentFrame);
+          this.timelineView.updatePlayhead(this.currentFrame, { autoScroll: true });
           this.updateTransportLabels();
           if (this.shuttleRate > 0) {
             this.renderer.syncVideoPlayback(this.project, this.currentFrame, this.mediaMap, true, this.shuttleRate);
@@ -1199,12 +1271,16 @@ class MotionFlowApp {
           }
           if (!this.isPlaying || token !== this.playToken) return;
           this.renderPreview();
+        } catch (err) {
+          console.warn('Playback tick recovery:', err);
         } finally {
           ticking = false;
         }
       }
       if (this.isPlaying && token === this.playToken) {
         this.rafId = requestAnimationFrame(tick);
+      } else if (token === this.playToken) {
+        this.rafId = null;
       }
     };
     this.rafId = requestAnimationFrame(tick);
@@ -1571,6 +1647,9 @@ class MotionFlowApp {
         this.panels.selectedVfxId = nextVfxId;
         this.panels.renderEffectsPanel();
       }
+      if (this.isPlaying && this.shuttleRate > 0) {
+        this.renderer.syncVideoPlayback(this.project, this.currentFrame, this.mediaMap, true, this.shuttleRate);
+      }
       this.showToast(`${stackOnExisting ? 'Efek dilapis' : 'Efek timeline diperbarui'}: ${vfxPreset.label}`);
       return cur;
     }
@@ -1598,6 +1677,9 @@ class MotionFlowApp {
       if (this.panels) this.panels.selectedVfxId = stack[0]?.id || null;
     });
     if (this.panels) this.panels.renderEffectsPanel();
+    if (this.isPlaying && this.shuttleRate > 0) {
+      this.renderer.syncVideoPlayback(this.project, this.currentFrame, this.mediaMap, true, this.shuttleRate);
+    }
     this.showToast(`Efek "${vfxPreset.label}" ditambahkan ke timeline — tahan pojok kiri/kanan atas untuk atur durasi`);
     return created;
   }
@@ -3521,7 +3603,7 @@ class MotionFlowApp {
           if (!src.trackData) src.trackData = { points: [] };
           src.trackData.points = [...(src.trackData.points || []).filter((p) => p.frame !== pt.frame), pt];
           this.currentFrame = pt.frame;
-          this.timelineView.updatePlayhead(this.currentFrame);
+          this.timelineView.updatePlayhead(this.currentFrame, { autoScroll: true });
           this.updateTransportLabels();
           this.renderPreview();
           const bar = document.querySelector('#trackerBody .progress-bar');

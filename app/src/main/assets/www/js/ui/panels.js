@@ -81,14 +81,49 @@ export class PanelsUI {
       case 'cubicBezier':
       default: {
         const b = Array.isArray(curBez) && curBez.length >= 4 ? curBez : [0.42, 0, 0.58, 1];
+        const parseCoord = (raw, fallback, min, max) => {
+          const n = Number(raw);
+          return Number.isFinite(n) ? Math.max(min, Math.min(max, n)) : fallback;
+        };
         return [
-          Math.max(0, Math.min(1, Number(b[0]) || 0.42)),
-          Math.max(-0.5, Math.min(1.5, Number(b[1]) || 0)),
-          Math.max(0, Math.min(1, Number(b[2]) || 0.58)),
-          Math.max(-0.5, Math.min(1.5, Number(b[3]) || 1))
+          parseCoord(b[0], 0.42, 0, 1),
+          parseCoord(b[1], 0, -0.5, 1.5),
+          parseCoord(b[2], 0.58, 0, 1),
+          parseCoord(b[3], 1, -0.5, 1.5)
         ];
       }
     }
+  }
+
+  buildEaseCurveThumbSvg(easingMode, bezier = [0.42, 0, 0.58, 1]) {
+    const W = 56;
+    const H = 40;
+    const padX = 7;
+    const padY = 9;
+    const boxW = W - padX * 2;
+    const boxH = H - padY * 2;
+    const toX = (t) => padX + t * boxW;
+    const toY = (v) => (padY + boxH) - v * boxH;
+    const safeBez = this.getBezierForEasingMode(easingMode, bezier);
+    const steps = 28;
+    const pts = [];
+    for (let i = 0; i <= steps; i++) {
+      const t = i / steps;
+      const y = applyEasing(t, easingMode, safeBez);
+      pts.push(`${i === 0 ? 'M' : 'L'} ${toX(t).toFixed(1)} ${toY(y).toFixed(1)}`);
+    }
+    const pathD = easingMode === 'cubicBezier'
+      ? `M ${padX} ${padY + boxH} C ${toX(safeBez[0]).toFixed(1)} ${toY(safeBez[1]).toFixed(1)}, ${toX(safeBez[2]).toFixed(1)} ${toY(safeBez[3]).toFixed(1)}, ${padX + boxW} ${padY}`
+      : pts.join(' ');
+    return `
+      <svg viewBox="0 0 ${W} ${H}" class="mf-ease-thumb-svg" aria-hidden="true">
+        <rect x="${padX}" y="${padY}" width="${boxW}" height="${boxH}" rx="2" fill="none" stroke="rgba(148,163,184,0.24)" stroke-width="0.9" />
+        <line x1="${padX}" y1="${padY + boxH}" x2="${padX + boxW}" y2="${padY}" stroke="rgba(148,163,184,0.28)" stroke-width="0.9" stroke-dasharray="2,2" />
+        <path d="${pathD}" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" />
+        <circle cx="${padX}" cy="${padY + boxH}" r="2" fill="currentColor" />
+        <circle cx="${padX + boxW}" cy="${padY}" r="2" fill="currentColor" />
+      </svg>
+    `;
   }
 
   _ensureLandscapeImageLoaded() {
@@ -728,8 +763,30 @@ export class PanelsUI {
     const propFrames = list.map((k) => k.frame);
     const hasPrevPropKf = KeyframeEngine.getPrevKeyframeFrame(propFrames, frame) !== null;
     const hasNextPropKf = KeyframeEngine.getNextKeyframeFrame(propFrames, frame) !== null;
-    const activeEasing = kfAtCur?.easing || 'easeInOut';
-    const bez = this.getBezierForEasingMode(activeEasing, kfAtCur?.bezier || [0.42, 0, 0.58, 1]);
+    const activeTabPresetId = this.activeAnimTab === 'in'
+      ? layer?.presetInId
+      : (this.activeAnimTab === 'out' ? layer?.presetOutId : layer?.presetComboId);
+    const hasActiveTabPreset = Boolean(
+      canApplyToLayer && activeTabPresetId && KeyframeEngine.getPrimaryPresetProp(layer, this.activeAnimTab)
+    );
+    const curveFallback = layer ? KeyframeEngine.getSegmentStartKeyframeAtOrBefore(layer, prop, frame) : null;
+    const activeCurve = (hasActiveTabPreset && (!kfAtCur || kfAtCur.presetTag === this.activeAnimTab))
+      ? KeyframeEngine.getPresetCategoryCurve(layer, this.activeAnimTab, prop)
+      : (kfAtCur || curveFallback);
+    const previewAnimSpec = (this.app._templatePreview?.active && this.app._templatePreview.spec?.kind === 'animation')
+      ? this.app._templatePreview.spec
+      : null;
+    const activeEasing = previewAnimSpec?.easing || activeCurve?.easing || 'easeInOut';
+    const bez = this.getBezierForEasingMode(
+      activeEasing,
+      previewAnimSpec?.bezier || activeCurve?.bezier || [0.42, 0, 0.58, 1]
+    );
+    const isBezierPresetMatch = (targetBez) => (
+      activeEasing === 'cubicBezier' &&
+      Array.isArray(targetBez) &&
+      targetBez.length >= 4 &&
+      targetBez.every((v, idx) => Math.abs(Number(v) - Number(bez[idx])) < 0.02)
+    );
     const animItems = getAnimationCatalogForLayerType(layer?.type, this.activeAnimTab);
     const fps = Math.max(1, Number(this.app.project?.fps) || 30);
     const clipLenFrames = layer ? Math.max(2, (layer.endFrame ?? 90) - (layer.startFrame ?? 0)) : 180;
@@ -748,9 +805,6 @@ export class PanelsUI {
       : 180;
     const minTabDur = Math.min(3, maxTabDur);
     const curSecText = (effectiveDur / fps).toFixed(2);
-    const activeTabPresetId = this.activeAnimTab === 'in'
-      ? layer?.presetInId
-      : (this.activeAnimTab === 'out' ? layer?.presetOutId : layer?.presetComboId);
     const getPresetLabel = (id) => (id ? (ANIMATION_CATALOG.find((x) => x.id === id)?.label || id) : 'Kosong');
     const slotList = [
       { cat: 'in', title: 'In', id: layer?.presetInId || null, dur: layer?.presetInDurFrames },
@@ -832,7 +886,7 @@ export class PanelsUI {
             </div>
           ` : ''}
           ${animItems.map((a) => `
-            <div role="button" tabindex="0" class="mf-preview-tile has-add-btn ${isPresetActive(a.id) ? 'active' : ''}" data-anim-preview="${a.id}" aria-label="Preview ${a.label}">
+            <div role="button" tabindex="0" class="mf-preview-tile has-add-btn ${isPresetActive(a.id) ? 'active' : ''} ${previewAnimSpec?.presetId === a.id ? 'is-previewing' : ''}" data-anim-preview="${a.id}" aria-label="Preview ${a.label}">
               <div class="mf-tile-stage">
                 ${isTextLayer
                   ? `<div class="mf-anim-chip mf-anim-text-chip ${a.animClass}" style="background:linear-gradient(135deg, ${a.color}, #7c4dff);">Teks</div>`
@@ -945,28 +999,35 @@ export class PanelsUI {
               ${activeEasing === 'cubicBezier' ? `cubic-bezier(${bez.map((n) => Number(n).toFixed(2)).join(', ')})` : activeEasing}
             </span>
           </div>
+          <div class="mb-2">
+            <div class="small text-secondary mb-1" style="font-size:0.65rem;">Template Kurva</div>
+            <div class="mf-ease-template-strip">
+              ${[
+                { id: 'linear', lbl: 'Linear' },
+                { id: 'easeIn', lbl: 'Ease In' },
+                { id: 'easeOut', lbl: 'Ease Out' },
+                { id: 'easeInOut', lbl: 'In-Out' },
+                { id: 'spring', lbl: 'Spring' }
+              ].map((mc) => `
+                <button type="button" class="mf-ease-template-card ${activeEasing === mc.id ? 'active' : ''}" data-ease-mode-chip="${mc.id}" title="${mc.lbl}">
+                  ${this.buildEaseCurveThumbSvg(mc.id, this.getBezierForEasingMode(mc.id))}
+                  <span class="mf-ease-thumb-label">${mc.lbl}</span>
+                </button>
+              `).join('')}
+              ${CUBIC_BEZIER_PRESETS.map((bp) => `
+                <button type="button" class="mf-ease-template-card ${isBezierPresetMatch(bp.bezier) ? 'active' : ''}" data-bezier-preset="${bp.id}" title="${bp.label}">
+                  ${this.buildEaseCurveThumbSvg('cubicBezier', bp.bezier)}
+                  <span class="mf-ease-thumb-label">${bp.label}</span>
+                </button>
+              `).join('')}
+            </div>
+          </div>
           <div class="row g-2 align-items-start">
             <div class="col-6">
               <label class="form-label small text-secondary mb-0">Curve Mode</label>
               <select id="kfEasingSel" class="form-select form-select-sm mb-2">
                 ${EASING_TYPES.map((e) => `<option value="${e.key}" ${e.key === activeEasing ? 'selected' : ''}>${e.label}</option>`).join('')}
               </select>
-              <div class="d-flex flex-wrap gap-1 mb-2">
-                ${[
-                  { id: 'linear', lbl: 'Linear' },
-                  { id: 'easeIn', lbl: 'In' },
-                  { id: 'easeOut', lbl: 'Out' },
-                  { id: 'easeInOut', lbl: 'I/O' },
-                  { id: 'spring', lbl: 'Spring' }
-                ].map((mc) => `
-                  <button type="button" class="mf-ease-chip ${activeEasing === mc.id ? 'active' : ''}" data-ease-mode-chip="${mc.id}">${mc.lbl}</button>
-                `).join('')}
-              </div>
-              <div class="d-flex flex-wrap gap-1 mb-2">
-                ${CUBIC_BEZIER_PRESETS.map((bp) => `
-                  <button type="button" class="btn btn-xs btn-dark border-secondary-subtle text-light" data-bezier-preset="${bp.id}" style="font-size:0.61rem;">${bp.label}</button>
-                `).join('')}
-              </div>
               <div id="kfBezierWrap">
                 <label class="form-label small text-secondary mb-0" style="font-size:0.66rem;">Handles (x1, y1, x2, y2)</label>
                 <div class="input-group input-group-sm">
@@ -1066,13 +1127,26 @@ export class PanelsUI {
         });
       }
       if (canApplyToLayer && activeTabPresetId) {
+        const prevCurve = KeyframeEngine.getPresetCategoryCurve(layer, this.activeAnimTab, prop);
         if (live) {
           KeyframeEngine.applyPreset(layer, activeTabPresetId, this.app.project.width, this.app.project.height, clamped);
+          if (prevCurve) {
+            KeyframeEngine.setPresetCategoryCurve(layer, this.activeAnimTab, prevCurve.easing, prevCurve.bezier);
+          }
           this.app.renderPreview();
           this.app.refreshTimelineOnly();
         } else {
           this.app.mutateProject(() => {
             KeyframeEngine.applyPreset(layer, activeTabPresetId, this.app.project.width, this.app.project.height, clamped);
+            if (prevCurve) {
+              KeyframeEngine.setPresetCategoryCurve(layer, this.activeAnimTab, prevCurve.easing, prevCurve.bezier);
+            }
+          }, { preserveTemplatePreview: true });
+          this.app.startTemplateLivePreview({
+            kind: 'layerAnimation',
+            category: this.activeAnimTab,
+            layerId: layer.id,
+            durationFrames: clamped
           });
         }
       }
@@ -1221,15 +1295,91 @@ export class PanelsUI {
         if (target !== null) this.app.seekToFrame(target);
       });
 
+      const parseBezInput = (sel, fallback, min, max) => {
+        const raw = Number(body.querySelector(sel)?.value);
+        return Number.isFinite(raw) ? Math.max(min, Math.min(max, raw)) : fallback;
+      };
+      const applyCurveEdit = (nextEasing, nextBezRaw = bez, toastMsg = null) => {
+        const nextBez = this.getBezierForEasingMode(nextEasing, nextBezRaw);
+        ['#bzX1', '#bzY1', '#bzX2', '#bzY2'].forEach((s, idx) => {
+          const inp = body.querySelector(s);
+          if (inp) inp.value = nextBez[idx];
+        });
+        const selEl = body.querySelector('#kfEasingSel');
+        if (selEl) selEl.value = nextEasing;
+
+        const curSpec = this.app._templatePreview?.active ? this.app._templatePreview.spec : null;
+        if (selectedKfs.length > 1) {
+          this.app.setSelectedKeyframesEasingAction(
+            selectedKfs,
+            nextEasing,
+            nextBez,
+            { preserveTemplatePreview: Boolean(curSpec || hasActiveTabPreset) }
+          );
+          if (hasActiveTabPreset) {
+            this.app.startTemplateLivePreview({
+              kind: 'layerAnimation',
+              category: this.activeAnimTab,
+              layerId: layer.id,
+              durationFrames: effectiveDur
+            });
+          }
+        } else if (curSpec?.kind === 'animation' && curSpec.presetId && !hasActiveTabPreset) {
+          const durF = Number(body.querySelector('#presetDurFrames')?.value) || effectiveDur || 24;
+          this.app.startTemplateLivePreview({
+            ...curSpec,
+            durationFrames: durF,
+            easing: nextEasing,
+            bezier: nextBez
+          });
+          this.renderKeyframesPanel();
+        } else if (hasActiveTabPreset && (!kfAtCur || kfAtCur.presetTag === this.activeAnimTab)) {
+          this.app.mutateProject(() => {
+            KeyframeEngine.setPresetCategoryCurve(layer, this.activeAnimTab, nextEasing, nextBez);
+            if (layer.type === 'camera') TimelineEngine.syncLayerToCamera(this.app.project, layer);
+          }, { preserveTemplatePreview: true });
+          this.app.startTemplateLivePreview({
+            kind: 'layerAnimation',
+            category: this.activeAnimTab,
+            layerId: layer.id,
+            durationFrames: effectiveDur
+          });
+        } else {
+          const targetKf = kfAtCur || KeyframeEngine.getSegmentStartKeyframeAtOrBefore(layer, prop, frame);
+          this.app.mutateProject(() => {
+            if (targetKf) {
+              targetKf.easing = nextEasing;
+              targetKf.bezier = [...nextBez];
+            } else {
+              KeyframeEngine.setKeyframe(layer, prop, frame, curVal, nextEasing, nextBez);
+            }
+            if (layer.type === 'camera') TimelineEngine.syncLayerToCamera(this.app.project, layer);
+          }, { preserveTemplatePreview: Boolean(curSpec) });
+          if (curSpec?.kind === 'animation' && curSpec.presetId) {
+            const durF = Number(body.querySelector('#presetDurFrames')?.value) || effectiveDur || 24;
+            this.app.startTemplateLivePreview({
+              ...curSpec,
+              durationFrames: durF,
+              easing: nextEasing,
+              bezier: nextBez
+            });
+          } else if (curSpec?.kind === 'layerAnimation') {
+            this.app.startTemplateLivePreview(curSpec);
+          }
+        }
+        if (toastMsg) this.app.showToast(toastMsg);
+      };
+      this._activeCurveCommitFn = applyCurveEdit;
+
       body.querySelector('#btnAddSetKf').onclick = () => {
         const rawVal = body.querySelector('#kfValInp').value;
         const val = isColorProp ? normalizeHexColor(String(rawVal), '#ffffff') : Number(rawVal);
         const easing = body.querySelector('#kfEasingSel').value;
         const bezVal = [
-          Number(body.querySelector('#bzX1').value) || 0.42,
-          Number(body.querySelector('#bzY1').value) || 0,
-          Number(body.querySelector('#bzX2').value) || 0.58,
-          Number(body.querySelector('#bzY2').value) || 1
+          parseBezInput('#bzX1', 0.42, 0, 1),
+          parseBezInput('#bzY1', 0, -0.5, 1.5),
+          parseBezInput('#bzX2', 0.58, 0, 1),
+          parseBezInput('#bzY2', 1, -0.5, 1.5)
         ];
         this.app.mutateProject(() => {
           KeyframeEngine.setKeyframe(layer, prop, frame, val, easing, bezVal);
@@ -1240,35 +1390,14 @@ export class PanelsUI {
       body.querySelector('#kfEasingSel').onchange = (e) => {
         const easing = e.target.value;
         const mappedBez = this.getBezierForEasingMode(easing, bez);
-        ['#bzX1', '#bzY1', '#bzX2', '#bzY2'].forEach((s, idx) => {
-          const inp = body.querySelector(s);
-          if (inp) inp.value = mappedBez[idx];
-        });
-        if (selectedKfs.length > 1) {
-          this.app.setSelectedKeyframesEasingAction(selectedKfs, easing, mappedBez);
-        } else if (kfAtCur) {
-          this.app.mutateProject(() => {
-            kfAtCur.easing = easing;
-            if (easing === 'cubicBezier') kfAtCur.bezier = mappedBez;
-            if (layer.type === 'camera') TimelineEngine.syncLayerToCamera(this.app.project, layer);
-          });
-        } else {
-          this.drawBezierGraph(body.querySelector('#svgBezier'), mappedBez, kfAtCur, body, layer, prop, frame, curVal, easing);
-        }
+        applyCurveEdit(easing, mappedBez);
       };
 
       body.querySelectorAll('[data-ease-mode-chip]').forEach((btn) => {
         btn.onclick = () => {
           const easing = btn.dataset.easeModeChip;
           const mappedBez = this.getBezierForEasingMode(easing, bez);
-          if (selectedKfs.length > 1) {
-            this.app.setSelectedKeyframesEasingAction(selectedKfs, easing, mappedBez);
-          } else {
-            this.app.mutateProject(() => {
-              KeyframeEngine.setKeyframe(layer, prop, frame, curVal, easing, mappedBez);
-              if (layer.type === 'camera') TimelineEngine.syncLayerToCamera(this.app.project, layer);
-            });
-          }
+          applyCurveEdit(easing, mappedBez);
         };
       });
 
@@ -1276,15 +1405,7 @@ export class PanelsUI {
         btn.onclick = () => {
           const spec = CUBIC_BEZIER_PRESETS.find((p) => p.id === btn.dataset.bezierPreset);
           if (!spec) return;
-          if (selectedKfs.length > 1) {
-            this.app.setSelectedKeyframesEasingAction(selectedKfs, 'cubicBezier', spec.bezier);
-          } else {
-            this.app.mutateProject(() => {
-              KeyframeEngine.setKeyframe(layer, prop, frame, curVal, 'cubicBezier', spec.bezier);
-              if (layer.type === 'camera') TimelineEngine.syncLayerToCamera(this.app.project, layer);
-            });
-          }
-          this.app.showToast(`Kurva: ${spec.label}`);
+          applyCurveEdit('cubicBezier', spec.bezier, `Kurva: ${spec.label}`);
         };
       });
 
@@ -1292,30 +1413,20 @@ export class PanelsUI {
         const inp = body.querySelector(sel);
         if (!inp) return;
         inp.onchange = (e) => {
+          const rawVal = Number(e.target.value);
+          const fallback = [0.42, 0, 0.58, 1][idx];
           const val = idx % 2 === 0
-            ? Math.max(0, Math.min(1, Number(e.target.value) || 0))
-            : Math.max(-0.5, Math.min(1.5, Number(e.target.value) || 0));
+            ? Math.max(0, Math.min(1, Number.isFinite(rawVal) ? rawVal : fallback))
+            : Math.max(-0.5, Math.min(1.5, Number.isFinite(rawVal) ? rawVal : fallback));
           e.target.value = val;
           const nextBez = [
-            Number(body.querySelector('#bzX1')?.value) || 0,
-            Number(body.querySelector('#bzY1')?.value) || 0,
-            Number(body.querySelector('#bzX2')?.value) || 1,
-            Number(body.querySelector('#bzY2')?.value) || 1
+            parseBezInput('#bzX1', 0.42, 0, 1),
+            parseBezInput('#bzY1', 0, -0.5, 1.5),
+            parseBezInput('#bzX2', 0.58, 0, 1),
+            parseBezInput('#bzY2', 1, -0.5, 1.5)
           ];
           nextBez[idx] = val;
-          if (selectedKfs.length > 1) {
-            this.app.setSelectedKeyframesEasingAction(selectedKfs, 'cubicBezier', nextBez);
-          } else {
-            this.app.mutateProject(() => {
-              if (kfAtCur) {
-                kfAtCur.easing = 'cubicBezier';
-                kfAtCur.bezier = nextBez;
-              } else {
-                KeyframeEngine.setKeyframe(layer, prop, frame, curVal, 'cubicBezier', nextBez);
-              }
-              if (layer.type === 'camera') TimelineEngine.syncLayerToCamera(this.app.project, layer);
-            });
-          }
+          applyCurveEdit('cubicBezier', nextBez);
         };
       });
 
@@ -1360,6 +1471,8 @@ export class PanelsUI {
           });
         };
       });
+    } else {
+      this._activeCurveCommitFn = null;
     }
 
     this.bindTemplatePreviewTiles(body, '[data-anim-preview]', (tile, isPreviewing) => {
@@ -1380,7 +1493,6 @@ export class PanelsUI {
     body.querySelectorAll('[data-preset]').forEach((btn) => {
       btn.onclick = (e) => {
         e.stopPropagation();
-        this.app.stopTemplateLivePreview({ skipRender: true });
         if (!canApplyToLayer) {
           this.app.showToast('Pilih item video, gambar, teks, atau shape di timeline terlebih dahulu');
           return;
@@ -1400,8 +1512,22 @@ export class PanelsUI {
           layer.activePresetId = pid;
           layer.kfExpanded = true;
           KeyframeEngine.applyPreset(layer, pid, this.app.project.width, this.app.project.height, durF);
+          if (pCat !== 'none') {
+            const curPropHasTag = Array.isArray(layer.keyframes?.[this.selectedKfProp]) &&
+              layer.keyframes[this.selectedKfProp].some((k) => k.presetTag === pCat);
+            if (!curPropHasTag) {
+              const primaryProp = KeyframeEngine.getPrimaryPresetProp(layer, pCat);
+              if (primaryProp) this.selectedKfProp = primaryProp;
+            }
+          }
+        }, { preserveTemplatePreview: true });
+        this.app.startTemplateLivePreview({
+          kind: 'layerAnimation',
+          category: pCat !== 'none' ? pCat : this.activeAnimTab,
+          layerId: layer.id,
+          durationFrames: durF
         });
-        this.app.showToast(`Preset "${tileLabel}" (${(durF / fps).toFixed(2)}s) diterapkan — atur durasi di bawah`);
+        this.app.showToast(`Preset "${tileLabel}" (${(durF / fps).toFixed(2)}s) diterapkan — atur durasi & kurva di bawah`);
       };
     });
 
@@ -1544,20 +1670,25 @@ export class PanelsUI {
     const finishHandle = () => {
       if (activeHandle) {
         const nextBez = [...bez];
-        const selectedKfs = this.app.timelineView?.selectedKfs || [];
-        if (selectedKfs.length > 1) {
-          this.app.setSelectedKeyframesEasingAction(selectedKfs, 'cubicBezier', nextBez);
-        } else {
+        if (typeof this._activeCurveCommitFn === 'function') {
           if (kfAtCur) kfAtCur.bezier = [...origBez];
-          this.app.mutateProject(() => {
-            if (kfAtCur) {
-              kfAtCur.bezier = nextBez;
-              kfAtCur.easing = 'cubicBezier';
-            } else if (layer) {
-              KeyframeEngine.setKeyframe(layer, prop, frame, curVal, 'cubicBezier', nextBez);
-            }
-            if (layer?.type === 'camera') TimelineEngine.syncLayerToCamera(this.app.project, layer);
-          });
+          this._activeCurveCommitFn('cubicBezier', nextBez);
+        } else {
+          const selectedKfs = this.app.timelineView?.selectedKfs || [];
+          if (selectedKfs.length > 1) {
+            this.app.setSelectedKeyframesEasingAction(selectedKfs, 'cubicBezier', nextBez);
+          } else {
+            if (kfAtCur) kfAtCur.bezier = [...origBez];
+            this.app.mutateProject(() => {
+              if (kfAtCur) {
+                kfAtCur.bezier = nextBez;
+                kfAtCur.easing = 'cubicBezier';
+              } else if (layer) {
+                KeyframeEngine.setKeyframe(layer, prop, frame, curVal, 'cubicBezier', nextBez);
+              }
+              if (layer?.type === 'camera') TimelineEngine.syncLayerToCamera(this.app.project, layer);
+            });
+          }
         }
       }
       activeHandle = null;

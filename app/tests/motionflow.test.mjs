@@ -2,7 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { KEYFRAME_LANE_GROUPS, CAMERA_LANE_GROUPS, CUBIC_BEZIER_PRESETS, KeyframeEngine, EASING_TYPES } from '../src/main/assets/www/js/engine/keyframeEngine.js';
-import { applyEasing, lerpColorHex, normalizeHexColor } from '../src/main/assets/www/js/utils/math.js';
+import { applyEasing, evalCubicBezier, lerpColorHex, normalizeHexColor } from '../src/main/assets/www/js/utils/math.js';
+import { PanelsUI } from '../src/main/assets/www/js/ui/panels.js';
 import {
   STABILIZE_PRESETS,
   StabilizerEngine,
@@ -50,7 +51,8 @@ import {
   frameToCenterScrollLeft,
   scrollLeftToCenterFrame,
   shouldActivateClipHold,
-  computeRulerWindow
+  computeRulerWindow,
+  resolvePlayheadScrollLeft
 } from '../src/main/assets/www/js/ui/timelineView.js';
 
 test('KeyframeEngine smooth Catmull-Rom spline & smoothCameraKeyframes', () => {
@@ -2565,3 +2567,273 @@ test('Roadside text pinning preserves custom offsetX & offsetY beside tracked co
   assert.equal(KeyframeEngine.getValueAtFrame(txt2d, 'x', 20, 0), Number((220 + -80 * 1.4).toFixed(1)));
   assert.equal(KeyframeEngine.getValueAtFrame(txt2d, 'y', 20, 0), Number((40 + -50 * 1.4).toFixed(1)));
 });
+
+test('TimelineView resolvePlayheadScrollLeft preserves right-panned scroll after zoom & re-render', () => {
+  // Simulates zooming in and panning right (scrollLeft = 480) while playhead is at frame 0 (targetX = 0):
+  // re-rendering timeline tracks or clips (autoScroll: false) MUST NOT snap scrollLeft back to 0.
+  assert.equal(
+    resolvePlayheadScrollLeft({
+      targetX: 0,
+      currentScrollLeft: 480,
+      viewportWidth: 360,
+      maxScroll: 1200,
+      autoScroll: false,
+      manualPanActive: false,
+      forceAutoScroll: false,
+      frame: 0
+    }),
+    null
+  );
+
+  // During active manual touch/scroll pan inertia, automatic playback follow yields unless explicitly forced
+  assert.equal(
+    resolvePlayheadScrollLeft({
+      targetX: 900,
+      currentScrollLeft: 480,
+      viewportWidth: 360,
+      maxScroll: 1200,
+      autoScroll: true,
+      manualPanActive: true,
+      forceAutoScroll: false,
+      frame: 120
+    }),
+    null
+  );
+
+  // Forced seek/autoScroll when playhead passes right viewport edge advances scroll cleanly
+  const advanceScroll = resolvePlayheadScrollLeft({
+    targetX: 900,
+    currentScrollLeft: 480,
+    viewportWidth: 360,
+    maxScroll: 1200,
+    autoScroll: true,
+    manualPanActive: false,
+    forceAutoScroll: false,
+    frame: 120
+  });
+  assert.equal(advanceScroll, 900 - Math.round(360 * 0.25));
+
+  // Explicit reset/seek back to frame 0 (forceAutoScroll: true) brings playhead back into view
+  assert.equal(
+    resolvePlayheadScrollLeft({
+      targetX: 0,
+      currentScrollLeft: 480,
+      viewportWidth: 360,
+      maxScroll: 1200,
+      autoScroll: true,
+      manualPanActive: true,
+      forceAutoScroll: true,
+      frame: 0
+    }),
+    0
+  );
+});
+
+test('Adjustment effect layers preserve Main Track Z-order, playhead bounds, and render safely across all effect presets', () => {
+  const proj = createEmptyProject('EffectPlayProj', { width: 1080, height: 1920, fps: 30, durationSec: 10 });
+  const mainVid = TimelineEngine.createMediaLayer(
+    proj,
+    { id: 'vid_main', name: 'Main.mp4', type: 'video', width: 1080, height: 1920, durationMs: 4000 },
+    0,
+    { trackRole: 'main' }
+  );
+  TimelineEngine.addToMainTrack(proj, mainVid);
+
+  const adj = TimelineEngine.createAdjustmentLayer(proj, 15, {
+    durationFrames: 75,
+    name: 'Flash Effect',
+    adjustmentKind: 'effect'
+  });
+  adj.vfx = { type: 'flashPulse', intensity: 0.75, speed: 1.0, active: true };
+  TimelineEngine.addLayer(proj, adj);
+  TimelineEngine.normalizeTrackZOrder(proj);
+
+  // Adjustment effect sits above Main Track without mutating or shortening video bounds
+  const adjIdx = proj.layers.findIndex((l) => l.id === adj.id);
+  const vidIdx = proj.layers.findIndex((l) => l.id === mainVid.id);
+  assert.ok(adjIdx >= 0 && vidIdx > adjIdx);
+  assert.equal(mainVid.startFrame, 0);
+  assert.equal(mainVid.endFrame, 120);
+  assert.equal(TimelineEngine.getPlayheadMaxFrame(proj), 120);
+
+  // Exercise Canvas2D fallback across every VIDEO_EFFECT_PRESETS entry (including shakeCam, flashPulse, strobeBlack, zoomBlur)
+  const makeMock2dCtx = (canvas) => ({
+    canvas,
+    fillStyle: '#000',
+    strokeStyle: '#000',
+    lineWidth: 1,
+    globalAlpha: 1,
+    globalCompositeOperation: 'source-over',
+    filter: 'none',
+    save: () => {},
+    restore: () => {},
+    setTransform: () => {},
+    scale: () => {},
+    translate: () => {},
+    rotate: () => {},
+    beginPath: () => {},
+    closePath: () => {},
+    moveTo: () => {},
+    lineTo: () => {},
+    quadraticCurveTo: () => {},
+    arc: () => {},
+    rect: () => {},
+    clip: () => {},
+    fill: () => {},
+    stroke: () => {},
+    clearRect: () => {},
+    fillRect: () => {},
+    drawImage: () => {},
+    createLinearGradient: () => ({ addColorStop: () => {} }),
+    createRadialGradient: () => ({ addColorStop: () => {} })
+  });
+  const makeMockCanvas = (w = 320, h = 568) => {
+    const c = { width: w, height: h, style: {}, getBoundingClientRect: () => ({ width: w, height: h }) };
+    const ctx = makeMock2dCtx(c);
+    c.getContext = (t) => (t === '2d' ? ctx : null);
+    return c;
+  };
+
+  const prevDocument = globalThis.document;
+  globalThis.document = { createElement: () => makeMockCanvas() };
+  try {
+    const mainCanvas = makeMockCanvas();
+    const renderer = new RendererEngine(mainCanvas, makeMockCanvas());
+    renderer._adj2dCanvas = makeMockCanvas();
+
+    const mediaMap = new Map();
+    const shapeLayer = TimelineEngine.createShapeLayer(proj, 'rectangle', 0);
+    shapeLayer.endFrame = 120;
+    TimelineEngine.addLayer(proj, shapeLayer);
+    TimelineEngine.normalizeTrackZOrder(proj);
+
+    for (const preset of VIDEO_EFFECT_PRESETS) {
+      adj.vfx = { type: preset.id, intensity: 0.7, speed: 1.2, active: true };
+      assert.doesNotThrow(() => {
+        renderer.renderCanvas2DFallback(mainCanvas.getContext('2d'), proj, 30, mediaMap, 320, 568, false, true);
+      }, `Expected Canvas2D effect fallback not to throw for preset "${preset.id}"`);
+    }
+  } finally {
+    globalThis.document = prevDocument;
+  }
+});
+
+test('Ease curve math and template SVG thumbnails stay finite across presets and invalid inputs', () => {
+  assert.equal(evalCubicBezier(0.5, Number.NaN, Number.POSITIVE_INFINITY, 0.58, 1) >= 0, true);
+  assert.equal(Number.isFinite(applyEasing(0.5, 'cubicBezier', [0, 0, 0, 1])), true);
+  assert.equal(Number.isFinite(applyEasing(Number.NaN, 'easeOutBack', [0.34, 1.45, 0.64, 1])), true);
+  assert.equal(Number.isFinite(applyEasing(0.4, 'anticipate', [0.36, -0.35, 0.65, 1])), true);
+
+  const panelsStub = {
+    getBezierForEasingMode: PanelsUI.prototype.getBezierForEasingMode,
+    buildEaseCurveThumbSvg: PanelsUI.prototype.buildEaseCurveThumbSvg
+  };
+  assert.deepEqual(panelsStub.getBezierForEasingMode('cubicBezier', [0, 0, 0, 1]), [0, 0, 0, 1]);
+
+  for (const mode of ['linear', 'easeIn', 'easeOut', 'easeInOut', 'spring']) {
+    const svg = panelsStub.buildEaseCurveThumbSvg(mode, panelsStub.getBezierForEasingMode(mode));
+    assert.ok(svg.includes('<svg') && svg.includes('<path d="M '), `Expected SVG thumbnail for ${mode}`);
+    assert.ok(!svg.includes('NaN'), `SVG thumbnail for ${mode} must not contain NaN`);
+  }
+  for (const bp of CUBIC_BEZIER_PRESETS) {
+    const svg = panelsStub.buildEaseCurveThumbSvg('cubicBezier', bp.bezier);
+    assert.ok(svg.includes('class="mf-ease-thumb-svg"') && svg.includes(' C '), `Expected Bezier curve path for ${bp.id}`);
+    assert.ok(!svg.includes('NaN'), `SVG thumbnail for ${bp.id} must not contain NaN`);
+  }
+});
+
+test('KeyframeEngine preset curve helpers target item animation keyframes regardless of playhead position', () => {
+  const proj = createEmptyProject('EaseItemProj', { width: 1080, height: 1920, fps: 30, durationSec: 10 });
+  const vid = TimelineEngine.createMediaLayer(
+    proj,
+    { id: 'vid_1', name: 'Clip.mp4', type: 'video', width: 1080, height: 1920, durationMs: 4000 },
+    0,
+    { trackRole: 'main' }
+  );
+  TimelineEngine.addToMainTrack(proj, vid);
+
+  // fadeIn animates opacity only (not x), so primary prop should resolve to opacity
+  KeyframeEngine.applyPreset(vid, 'fadeIn', proj.width, proj.height, 24);
+  assert.equal(KeyframeEngine.getPrimaryPresetProp(vid, 'in'), 'opacity');
+
+  const updated = KeyframeEngine.setPresetCategoryCurve(vid, 'in', 'cubicBezier', [0.34, 1.45, 0.64, 1]);
+  assert.ok(updated >= 2);
+  const curve = KeyframeEngine.getPresetCategoryCurve(vid, 'in', 'x');
+  assert.equal(curve.prop, 'opacity');
+  assert.equal(curve.easing, 'cubicBezier');
+  assert.deepEqual(curve.bezier, [0.34, 1.45, 0.64, 1]);
+
+  // Mid-segment and end-frame segment lookup should still resolve start keyframe cleanly
+  const segStartMid = KeyframeEngine.getSegmentStartKeyframeAtOrBefore(vid, 'opacity', 10);
+  const segStartEnd = KeyframeEngine.getSegmentStartKeyframeAtOrBefore(vid, 'opacity', 24);
+  assert.equal(segStartMid.frame, 0);
+  assert.equal(segStartEnd.frame, 0);
+});
+
+test('RendererEngine clears stale video preview seek locks and sanitizes non-finite transforms on playback start', () => {
+  const makeMock2dCtx = (canvas) => ({ canvas, save() {}, restore() {}, clearRect() {}, fillRect() {} });
+  const makeMockCanvas = (w = 320, h = 568) => {
+    const c = { width: w, height: h, style: {}, getBoundingClientRect: () => ({ width: w, height: h }) };
+    const ctx = makeMock2dCtx(c);
+    c.getContext = (t) => (t === '2d' ? ctx : null);
+    return c;
+  };
+  const renderer = new RendererEngine(makeMockCanvas(), makeMockCanvas());
+  const proj = createEmptyProject('VidRecoverProj', { width: 1080, height: 1920, fps: 30, durationSec: 5 });
+  const vidLayer = TimelineEngine.createMediaLayer(
+    proj,
+    { id: 'vid_r', name: 'Clip.mp4', type: 'video', width: 1080, height: 1920, durationMs: 4000 },
+    0,
+    { trackRole: 'main' }
+  );
+  vidLayer.transform.scaleX = Number.NaN;
+  vidLayer.transform.opacity = Number.NaN;
+  TimelineEngine.addToMainTrack(proj, vidLayer);
+
+  const safeTf = renderer.resolveEffectiveTransform(proj, vidLayer, 10, new Map(), 1080, 1920);
+  assert.equal(Number.isFinite(safeTf.scaleX), true);
+  assert.equal(Number.isFinite(safeTf.opacity), true);
+
+  let playCalls = 0;
+  const mockVid = {
+    currentTime: 0.1,
+    duration: 4.0,
+    readyState: 2,
+    networkState: 1,
+    paused: true,
+    seeking: true,
+    ended: false,
+    playbackRate: 1,
+    muted: false,
+    isConnected: true,
+    dataset: { srcUrl: 'mock://clip.mp4' },
+    _pendingSeekTime: 1.5,
+    _pendingPlayTargetTime: 1.5,
+    _playInFlight: true,
+    _playInFlightSinceMs: 123,
+    _stallCount: 3,
+    _forceScratchCopy: true,
+    _armVfc: () => {},
+    play: () => {
+      playCalls++;
+      mockVid.paused = false;
+      return Promise.resolve();
+    },
+    pause: () => {
+      mockVid.paused = true;
+    }
+  };
+  renderer.videoCache.set('vid_r', mockVid);
+  renderer.resetVideoPlayTransientState();
+  assert.equal(mockVid._pendingSeekTime, null);
+  assert.equal(mockVid._playInFlight, false);
+  assert.equal(mockVid._stallCount, 0);
+
+  const mediaMap = new Map([['vid_r', { id: 'vid_r', type: 'video', url: 'mock://clip.mp4', element: mockVid, durationMs: 4000 }]]);
+  renderer.syncVideoPlayback(proj, 15, mediaMap, true, 1);
+  assert.equal(playCalls, 1);
+  assert.equal(mockVid._wantsPlay, true);
+  assert.equal(mockVid._pendingSeekTime, null);
+});
+
+
