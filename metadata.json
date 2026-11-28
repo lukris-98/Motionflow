@@ -1,6 +1,6 @@
 {
-  "name": "MotionFlow Studio",
-  "description": "Mobile video editor and motion graphics studio with multi-layer frame timeline, keyframe animation, audio waveform, and native MP4 export.",
+  "name": "LUKRIS",
+  "description": "LUKRIS — Professional video editing and motion graphics dashboard & studio with multi-layer timeline, keyframe animation, AI tools, and native MP4 export.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

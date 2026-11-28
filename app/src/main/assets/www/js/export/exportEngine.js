@@ -46,9 +46,9 @@ export class ExportEngine {
   getBitrateMbps(quality, resPreset, fps = 30) {
     const resScale = resPreset === '4k' ? 1.8 : resPreset === '480p' ? 0.55 : resPreset === '720p' ? 0.75 : 1.0;
     const base = quality === 'ultra' ? 20 : quality === 'high' ? 12 : quality === 'medium' ? 7 : 4;
-    const safeFps = Math.max(12, Math.min(60, Number(fps) || 30));
-    const fpsScale = safeFps >= 50 ? 1.45 : safeFps >= 45 ? 1.3 : safeFps <= 24 ? 0.9 : 1.0;
-    return Math.max(2, Math.min(40, Math.round(base * resScale * fpsScale)));
+    const safeFps = Math.max(12, Math.min(120, Number(fps) || 30));
+    const fpsScale = safeFps >= 100 ? 1.9 : safeFps >= 50 ? 1.45 : safeFps >= 45 ? 1.3 : safeFps <= 24 ? 0.9 : 1.0;
+    return Math.max(2, Math.min(60, Math.round(base * resScale * fpsScale)));
   }
 
   getEffectiveDurationFrames(project, trimTrailingEmpty = true) {
@@ -89,7 +89,7 @@ export class ExportEngine {
     onProgress
   }) {
     this.cancelled = false;
-    const safeFps = Math.max(12, Math.min(60, Math.round(Number(fps) || 30)));
+    const safeFps = Math.max(12, Math.min(120, Math.round(Number(fps) || 30)));
     const { width, height } = this.computeOutputDimensions(project, resPreset);
     const bitrateMbps = this.getBitrateMbps(quality, resPreset, safeFps);
     const useLosslessFrames = quality === 'ultra';

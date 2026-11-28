@@ -1,0 +1,788 @@
+<!DOCTYPE html>
+<html lang="en" data-bs-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <title>LUKRIS Studio — Editor</title>
+  <link rel="stylesheet" href="./vendor/bootstrap.min.css" />
+  <link rel="stylesheet" href="./vendor/bootstrap-icons.min.css" />
+  <link rel="stylesheet" href="./css/studio.css" />
+</head>
+<body class="mf-body d-flex flex-column overflow-hidden">
+
+  <!-- TOP TOOLBAR -->
+  <header class="mf-toolbar d-flex align-items-center justify-content-between gap-1 px-2 py-1 border-bottom border-secondary-subtle">
+    <div class="d-flex align-items-center gap-1 flex-grow-1 min-w-0 overflow-hidden">
+      <button id="btnGoHome" class="btn btn-sm btn-dark mf-icon-btn flex-shrink-0" title="Back to LUKRIS Home" aria-label="Back to LUKRIS Home">
+        <i class="bi bi-house-door-fill"></i>
+      </button>
+      <button id="btnProjects" class="btn btn-sm btn-dark mf-icon-btn flex-shrink-0" title="Projects" aria-label="Projects">
+        <i class="bi bi-folder2-open"></i>
+      </button>
+      <button id="btnRenameQuick" class="btn btn-sm btn-dark text-truncate mf-project-pill min-w-0" title="Project Name">
+        <span id="lblProjectName">Untitled Project</span>
+      </button>
+      <span id="badgeSaveState" class="mf-save-dot is-saved flex-shrink-0" role="status" title="Saved" aria-label="Saved"></span>
+    </div>
+
+    <div class="d-flex align-items-center gap-1 flex-shrink-0">
+      <button id="btnUndo" class="btn btn-sm btn-dark mf-icon-btn" title="Undo" aria-label="Undo" disabled>
+        <i class="bi bi-arrow-counterclockwise"></i>
+      </button>
+      <button id="btnRedo" class="btn btn-sm btn-dark mf-icon-btn" title="Redo" aria-label="Redo" disabled>
+        <i class="bi bi-arrow-clockwise"></i>
+      </button>
+      <button id="btnProjectSettings" class="btn btn-sm btn-dark mf-icon-btn" title="Project Settings" aria-label="Project Settings">
+        <i class="bi bi-gear-fill"></i>
+      </button>
+      <button id="btnQuickExportSpec" class="btn btn-sm btn-dark mf-res-pill" title="Export Resolution &amp; FPS">1080p·30</button>
+      <button id="btnOpenExport" class="btn btn-sm mf-btn-accent fw-semibold px-2 mf-export-btn">
+        <i class="bi bi-film me-1"></i>Export
+      </button>
+    </div>
+  </header>
+
+  <!-- PREVIEW VIEWPORT -->
+  <section class="mf-preview-section position-relative d-flex align-items-center justify-content-center flex-shrink-0">
+    <div id="previewStage" class="mf-preview-stage position-relative d-flex align-items-center justify-content-center">
+      <canvas id="previewCanvas" class="mf-preview-canvas"></canvas>
+      <canvas id="overlayCanvas" class="mf-overlay-canvas"></canvas>
+    </div>
+
+    <!-- Floating Preview HUD -->
+    <div class="mf-preview-hud-top position-absolute top-0 start-0 end-0 d-flex align-items-center justify-content-between gap-1 px-2 pt-1 pointer-none">
+      <span id="hudResFps" class="badge mf-hud-pill min-w-0 text-truncate">1280×720 · 30 FPS</span>
+      <div class="d-flex gap-1 flex-shrink-0 pointer-auto">
+        <button id="btnOpenTrackerQuick" class="btn btn-xs mf-hud-btn" title="Motion &amp; Camera Track" aria-label="Motion Tracker">
+          <i class="bi bi-crosshair me-1 text-warning"></i>Track
+        </button>
+        <button id="btnToggleGrid" class="btn btn-xs mf-hud-btn" title="Toggle Safe Grid" aria-label="Toggle Safe Grid">
+          <i class="bi bi-grid-3x3"></i>
+        </button>
+        <div class="btn-group btn-group-xs mf-mode-switch" role="group" aria-label="Preview Mode 2D / 3D">
+          <button id="btnPreviewMode2D" type="button" class="btn btn-xs mf-hud-btn active" title="Mode Preview Canvas 2D Biasa" aria-label="2D Canvas Mode">2D</button>
+          <button id="btnResetCameraQuick" type="button" class="btn btn-xs mf-hud-btn" title="Mode Preview 3D Viewport" aria-label="3D Viewport Mode">
+            <i class="bi bi-badge-3d me-1 text-info"></i>3D
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Blender-Style 3D Viewport Mini-HUD -->
+    <div id="hud3DViewport" class="mf-3d-hud position-absolute bottom-0 start-0 end-0 d-none justify-content-between align-items-center gap-1 px-2 pb-1 pointer-none">
+      <div class="mf-3d-pill-bar d-flex align-items-center gap-1 flex-shrink-0 pointer-auto">
+        <button id="btn3DToolMove" class="btn btn-xs mf-hud-btn active" title="Move Gizmo (X/Y/Z)" aria-label="3D Move Tool">
+          <i class="bi bi-arrows-move"></i>
+        </button>
+        <button id="btn3DToolRotate" class="btn btn-xs mf-hud-btn" title="3D Rotate Gimbal" aria-label="3D Rotate Tool">
+          <i class="bi bi-arrow-repeat"></i>
+        </button>
+        <button id="btn3DToolScale" class="btn btn-xs mf-hud-btn" title="Scale Corners" aria-label="3D Scale Tool">
+          <i class="bi bi-bounding-box-circles"></i>
+        </button>
+        <button id="btn3DToolCam" class="btn btn-xs mf-hud-btn" title="Orbit Camera Only" aria-label="3D Camera Orbit">
+          <i class="bi bi-camera-video"></i>
+        </button>
+        <button id="btn3DAxisLock" class="btn btn-xs mf-hud-btn fw-bold" data-axis-lock="free" title="Kunci Sumbu Transformasi (Free / X / Y / Z)" aria-label="Axis Lock">Free</button>
+        <button id="btn3DViewToggle" class="btn btn-xs mf-hud-btn fw-semibold" title="Tukar Active Camera View vs Scene Orbit View" aria-label="Toggle Scene Orbit View">Cam</button>
+        <button id="btn3DSnapCam" class="btn btn-xs mf-hud-btn text-warning d-none fw-semibold" title="Snap Active Camera ke Scene View (Ctrl+Alt+0)" aria-label="Snap Active Camera to View">
+          <i class="bi bi-crosshair2"></i>
+        </button>
+      </div>
+      <span id="lbl3DHudReadout" class="badge mf-hud-pill text-info text-truncate min-w-0 mx-1">3D · 1F Orbit · 2F Zoom/Pan</span>
+      <div class="mf-3d-pill-bar d-flex align-items-center gap-1 flex-shrink-0 pointer-auto">
+        <button id="btn3DCamAutoRec" class="btn btn-xs mf-hud-btn text-danger" title="Auto-Record 3D Keyframes (OFF = wajib klik ◆ Keyframe setelah pindah 3D)" aria-label="Auto-Record 3D Camera">
+          <i class="bi bi-record-circle-fill"></i>
+        </button>
+        <button id="btn3DCamKf" class="btn btn-xs mf-hud-btn text-warning" title="Tambah / Hapus Keyframe Kamera 3D" aria-label="Keyframe 3D Camera">
+          <i class="bi bi-diamond-fill"></i>
+        </button>
+        <button id="btn3DCamSmoothPath" class="btn btn-xs mf-hud-btn text-info" title="Smooth Recorded 3D Camera Path" aria-label="Smooth 3D Camera Path">
+          <i class="bi bi-bezier2"></i>
+        </button>
+        <button id="btn3DCamReset" class="btn btn-xs mf-hud-btn" title="Reset 3D Camera" aria-label="Reset 3D Camera">
+          <i class="bi bi-arrow-counterclockwise"></i>
+        </button>
+        <button id="btn3DOpenSheet" class="btn btn-xs mf-hud-btn" title="Camera 3D Inspector" aria-label="Open Camera 3D Sheet">
+          <i class="bi bi-sliders2"></i>
+        </button>
+      </div>
+    </div>
+
+    <!-- Floating Color Picker HUD for CapCut-style Remove BG -->
+    <div id="chromaPickerHud" class="mf-chroma-picker-hud d-none align-items-center gap-2 pointer-auto">
+      <span id="chromaPickerSwatch" class="mf-chroma-hud-swatch" style="background:#00FF00;"></span>
+      <span id="chromaPickerHexLbl" class="small fw-semibold">#00FF00 · Tap/Drag Video</span>
+      <button id="btnChromaPickerDone" type="button" class="btn btn-xs btn-success fw-semibold px-2 py-0">Done</button>
+    </div>
+
+    <!-- Fullview 1-Screen Floating Controls -->
+    <div id="fullviewOverlayBar" class="mf-fullview-bar d-none align-items-center gap-2 pointer-auto">
+      <button id="btnFullviewPlayPause" type="button" class="btn btn-xs mf-hud-btn" title="Play / Pause" aria-label="Play or Pause Fullview">
+        <i id="iconFullviewPlayPause" class="bi bi-play-fill"></i>
+      </button>
+      <span id="lblFullviewTime" class="mf-fullview-time">00:00</span>
+      <span id="lblFullviewModeTag" class="badge bg-info bg-opacity-25 text-info" style="font-size:0.62rem;">Portrait</span>
+      <button id="btnExitFullview" type="button" class="btn btn-xs mf-hud-btn text-warning fw-semibold" title="Keluar Fullview" aria-label="Keluar Fullview">
+        <i class="bi bi-fullscreen-exit me-1"></i>Keluar
+      </button>
+    </div>
+  </section>
+
+  <!-- TRANSPORT & TIMELINE TOOLS BAR -->
+  <section class="mf-transport-bar d-flex align-items-center justify-content-between gap-1 px-2 py-1 border-top border-bottom border-secondary-subtle">
+    <div class="d-flex align-items-center gap-1 flex-shrink-0 mf-transport-group">
+      <button id="btnJumpStart" class="btn btn-sm btn-dark mf-icon-btn" title="Jump to Start" aria-label="Jump to Start">
+        <i class="bi bi-skip-start-fill"></i>
+      </button>
+      <button id="btnStepBack" class="btn btn-sm btn-dark mf-icon-btn" title="Previous Frame" aria-label="Previous Frame">
+        <i class="bi bi-chevron-left"></i>
+      </button>
+      <button id="btnPlayPause" class="btn btn-sm mf-play-btn" title="Play / Pause" aria-label="Play or Pause">
+        <i id="iconPlayPause" class="bi bi-play-fill"></i>
+      </button>
+      <button id="btnStepForward" class="btn btn-sm btn-dark mf-icon-btn" title="Next Frame" aria-label="Next Frame">
+        <i class="bi bi-chevron-right"></i>
+      </button>
+    </div>
+
+    <div class="text-center mf-timecode-wrap flex-shrink-0">
+      <div id="lblTimecode" class="mf-timecode">00:00:00:00</div>
+      <div id="lblFrameCounter" class="mf-frame-counter">F 0 / 300</div>
+    </div>
+
+    <div class="d-flex align-items-center gap-1 flex-shrink-0 mf-transport-group">
+      <div class="btn-group btn-group-sm mf-kf-nav-group" role="group" aria-label="Keyframe Navigation">
+        <button id="btnPrevKeyframe" class="btn btn-sm btn-dark mf-icon-btn mf-kf-step-btn" title="Keyframe Sebelumnya" aria-label="Previous Keyframe">
+          <i class="bi bi-caret-left-fill"></i>
+        </button>
+        <button id="btnQuickKeyframe" class="btn btn-sm btn-dark mf-icon-btn" title="Tambah / Hapus Keyframe" aria-label="Toggle Keyframe">
+          <i class="bi bi-diamond"></i>
+        </button>
+        <button id="btnNextKeyframe" class="btn btn-sm btn-dark mf-icon-btn mf-kf-step-btn" title="Keyframe Berikutnya" aria-label="Next Keyframe">
+          <i class="bi bi-caret-right-fill"></i>
+        </button>
+      </div>
+      <button id="btnSplitClip" class="btn btn-sm btn-dark mf-icon-btn" title="Split Clip at Playhead" aria-label="Split Clip">
+        <i class="bi bi-scissors"></i>
+      </button>
+      <button id="btnToggleSnap" class="btn btn-sm btn-dark mf-icon-btn active" title="Snap to Timeline" aria-label="Toggle Snap">
+        <i class="bi bi-magnet-fill"></i>
+      </button>
+      <button id="btnToggleRipple" class="btn btn-sm btn-dark mf-icon-btn active" title="Magnetic Main Track (Auto Close Gaps)" aria-label="Toggle Magnetic Main Track">
+        <i class="bi bi-link-45deg"></i>
+      </button>
+      <button id="btnZoomOut" class="btn btn-sm btn-dark mf-icon-btn" title="Zoom Out Timeline (-)" aria-label="Zoom Out">
+        <i class="bi bi-zoom-out"></i>
+      </button>
+      <button id="btnZoomFit" class="btn btn-sm btn-dark mf-icon-btn" title="Fullview 1 Layar (Auto Portrait / Landscape)" aria-label="Fullview 1 Layar">
+        <i id="iconFullviewBtn" class="bi bi-fullscreen"></i>
+      </button>
+      <button id="btnZoomIn" class="btn btn-sm btn-dark mf-icon-btn" title="Zoom In Timeline (+)" aria-label="Zoom In">
+        <i class="bi bi-zoom-in"></i>
+      </button>
+    </div>
+  </section>
+
+  <!-- MULTI-LAYER TIMELINE -->
+  <main class="mf-timeline-wrapper flex-grow-1 d-flex flex-column overflow-hidden position-relative">
+    <div id="timelineDragTooltip" class="mf-timeline-tooltip d-none"></div>
+    <div id="timelineKfBar" class="mf-kf-floating-bar d-none" role="toolbar" aria-label="Keyframe Controls"></div>
+    <div id="timelineBody" class="mf-timeline-body d-flex flex-grow-1 overflow-hidden">
+      <!-- Left Track Headers (Drag Handle + Wheel Button only) -->
+      <div class="mf-track-headers d-flex flex-column flex-shrink-0 border-end border-secondary-subtle">
+        <div class="mf-ruler-corner border-bottom border-secondary-subtle flex-shrink-0"></div>
+        <div id="trackHeadersList" class="mf-track-headers-list flex-grow-1 overflow-y-auto overflow-x-hidden"></div>
+      </div>
+
+      <!-- Right Scrollable Ruler + Lanes with Compositor-Synced Playhead -->
+      <div id="timelineViewport" class="mf-timeline-viewport flex-grow-1 position-relative overflow-hidden d-flex flex-column">
+        <div id="timelineScroll" class="mf-timeline-scroll flex-grow-1 position-relative overflow-auto">
+          <div id="timelineContent" class="mf-timeline-content position-relative">
+            <div id="rulerTrack" class="mf-ruler-track border-bottom border-secondary-subtle">
+              <canvas id="rulerCanvas" class="mf-ruler-canvas d-block"></canvas>
+            </div>
+            <div id="trackLanesList" class="mf-track-lanes-list position-relative"></div>
+            <div id="timelineSnapGuide" class="mf-snap-guide d-none">
+              <span class="mf-snap-guide-tag"></span>
+            </div>
+            <div id="playheadLine" class="mf-playhead-line" aria-hidden="true">
+              <div class="mf-playhead-head"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <!-- CAPCUT-STYLE CONTEXTUAL BOTTOM TOOLBAR -->
+  <nav id="mfBottomNav" class="mf-bottom-nav border-top border-secondary-subtle flex-shrink-0">
+    <div id="bottomNavScroll" class="mf-nav-scroll d-flex align-items-center w-100 h-100 overflow-x-auto"></div>
+  </nav>
+
+  <!-- ================= BOTTOM SHEETS (OFFCANVAS) ================= -->
+
+  <!-- 1. PROJECTS SHEET -->
+  <div class="offcanvas offcanvas-bottom mf-sheet" tabindex="-1" id="sheetProjects">
+    <div class="offcanvas-header flex-wrap gap-2 py-2 border-bottom border-secondary-subtle">
+      <h6 class="offcanvas-title mb-0"><i class="bi bi-folder2-open me-2 text-info"></i>Projects</h6>
+      <div class="d-flex flex-wrap gap-1 ms-auto me-1">
+        <button id="btnCaptureCover" class="btn btn-xs btn-outline-warning px-2 py-1"><i class="bi bi-image me-1"></i>Cover</button>
+        <button id="btnNewProject" class="btn btn-xs mf-btn-accent px-2 py-1"><i class="bi bi-file-earmark-plus me-1"></i>New</button>
+        <button id="btnImportProjectJson" class="btn btn-xs btn-outline-light px-2 py-1"><i class="bi bi-upload me-1"></i>Import</button>
+        <button id="btnExportProjectJson" class="btn btn-xs btn-outline-info px-2 py-1"><i class="bi bi-download me-1"></i>Save</button>
+      </div>
+      <button type="button" class="btn-close flex-shrink-0" data-bs-dismiss="offcanvas" aria-label="Close"></button>
+    </div>
+    <div class="offcanvas-body py-2">
+      <div id="projectsList" class="row g-2"></div>
+    </div>
+  </div>
+
+  <!-- 2. MEDIA LIBRARY SHEET -->
+  <div class="offcanvas offcanvas-bottom mf-sheet" tabindex="-1" id="sheetMedia">
+    <div class="offcanvas-header flex-wrap gap-2 py-2 border-bottom border-secondary-subtle">
+      <h6 class="offcanvas-title mb-0"><i class="bi bi-collection-play me-2 text-info"></i>Media Library</h6>
+      <div class="d-flex flex-wrap gap-1 ms-auto me-1">
+        <button id="btnImportVisual" class="btn btn-xs mf-btn-accent px-2 py-1"><i class="bi bi-film me-1"></i>Video / Image / GIF</button>
+        <button id="btnImportAudio" class="btn btn-xs btn-outline-warning px-2 py-1"><i class="bi bi-music-note-beamed me-1"></i>Audio</button>
+      </div>
+      <button type="button" class="btn-close flex-shrink-0" data-bs-dismiss="offcanvas" aria-label="Close"></button>
+    </div>
+    <div class="offcanvas-body py-2">
+      <input id="fallbackFileInput" type="file" multiple accept="video/*,image/*,audio/*" class="d-none" />
+      <input id="coverImageFileInput" type="file" accept="image/*" class="d-none" />
+      <div id="mediaFilterBar" class="d-flex flex-wrap align-items-center justify-content-between gap-2 mb-2">
+        <div class="btn-group btn-group-sm" role="group" aria-label="Filter media">
+          <button type="button" class="btn btn-info text-dark fw-semibold" data-media-cat="all">All</button>
+          <button type="button" class="btn btn-dark border-secondary-subtle" data-media-cat="video">Video</button>
+          <button type="button" class="btn btn-dark border-secondary-subtle" data-media-cat="image">Photo</button>
+          <button type="button" class="btn btn-dark border-secondary-subtle" data-media-cat="audio">Audio</button>
+        </div>
+        <div class="d-flex align-items-center gap-2 ms-auto">
+          <span id="lblMediaCount" class="small text-secondary"></span>
+          <button id="btnCleanupStorage" type="button" class="btn btn-xs btn-outline-warning px-2 py-1" title="Hapus media yang tidak terpakai dan bersihkan cache RAM">
+            <i class="bi bi-stars me-1"></i>Bersihkan
+          </button>
+        </div>
+      </div>
+      <div id="lblStorageStats" class="small text-secondary mb-2" style="font-size:0.7rem;"></div>
+      <div id="mediaLibraryEmpty" class="text-center py-4 text-secondary">
+        <i class="bi bi-cloud-plus fs-2 d-block mb-2"></i>
+        <p class="mb-2 small">Import videos, photos, GIFs, or audio from your device.</p>
+      </div>
+      <div id="mediaLibraryGrid" class="row g-2"></div>
+    </div>
+  </div>
+
+  <!-- 3. ADD LAYER SHEET -->
+  <div class="offcanvas offcanvas-bottom mf-sheet mf-sheet-compact" tabindex="-1" id="sheetAddLayer">
+    <div class="offcanvas-header py-2 border-bottom border-secondary-subtle">
+      <h6 class="offcanvas-title mb-0"><i class="bi bi-plus-square me-2 text-info"></i>Add Layer to Timeline</h6>
+      <button type="button" class="btn-close" data-bs-dismiss="offcanvas" aria-label="Close"></button>
+    </div>
+    <div class="offcanvas-body py-3">
+      <div class="row g-2">
+        <div class="col-4 col-sm-2">
+          <button id="btnAddTextLayer" class="btn btn-dark border border-secondary-subtle w-100 py-3 d-flex flex-column align-items-center gap-1">
+            <i class="bi bi-fonts fs-4 text-info"></i><span class="small">Text</span>
+          </button>
+        </div>
+        <div class="col-4 col-sm-2">
+          <button id="btnAddShapeRect" class="btn btn-dark border border-secondary-subtle w-100 py-3 d-flex flex-column align-items-center gap-1">
+            <i class="bi bi-square fs-4 text-warning"></i><span class="small">Rectangle</span>
+          </button>
+        </div>
+        <div class="col-4 col-sm-2">
+          <button id="btnAddShapeCircle" class="btn btn-dark border border-secondary-subtle w-100 py-3 d-flex flex-column align-items-center gap-1">
+            <i class="bi bi-circle fs-4 text-warning"></i><span class="small">Circle</span>
+          </button>
+        </div>
+        <div class="col-4 col-sm-2">
+          <button id="btnAddShapeEllipse" class="btn btn-dark border border-secondary-subtle w-100 py-3 d-flex flex-column align-items-center gap-1">
+            <i class="bi bi-egg fs-4 text-warning"></i><span class="small">Ellipse</span>
+          </button>
+        </div>
+        <div class="col-4 col-sm-2">
+          <button id="btnAddShapeLine" class="btn btn-dark border border-secondary-subtle w-100 py-3 d-flex flex-column align-items-center gap-1">
+            <i class="bi bi-slash-lg fs-4 text-warning"></i><span class="small">Line</span>
+          </button>
+        </div>
+        <div class="col-4 col-sm-2">
+          <button id="btnAddGroupLayer" class="btn btn-dark border border-secondary-subtle w-100 py-3 d-flex flex-column align-items-center gap-1">
+            <i class="bi bi-collection fs-4 text-primary"></i><span class="small">Group</span>
+          </button>
+        </div>
+        <div class="col-4 col-sm-2">
+          <button id="btnAddAdjustmentLayer" class="btn btn-dark border border-secondary-subtle w-100 py-3 d-flex flex-column align-items-center gap-1">
+            <i class="bi bi-sliders2-vertical fs-4 text-warning"></i><span class="small">Adjustment FX</span>
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 4. INSPECTOR / TRANSFORM SHEET -->
+  <div class="offcanvas offcanvas-bottom mf-sheet" tabindex="-1" id="sheetInspector">
+    <div class="offcanvas-header py-2 border-bottom border-secondary-subtle">
+      <h6 class="offcanvas-title mb-0"><i class="bi bi-bounding-box me-2 text-info"></i>Layer Transform &amp; Clip</h6>
+      <button type="button" class="btn-close" data-bs-dismiss="offcanvas" aria-label="Close"></button>
+    </div>
+    <div class="offcanvas-body py-2" id="inspectorBody"></div>
+  </div>
+
+  <!-- 5. ANIMATIONS & KEYFRAMES SHEET -->
+  <div class="offcanvas offcanvas-bottom mf-sheet" tabindex="-1" id="sheetKeyframes">
+    <div class="offcanvas-header py-2 border-bottom border-secondary-subtle">
+      <h6 class="offcanvas-title mb-0"><i class="bi bi-diamond-half me-2 text-info"></i>Animations &amp; Keyframes</h6>
+      <button type="button" class="btn-close" data-bs-dismiss="offcanvas" aria-label="Close"></button>
+    </div>
+    <div class="offcanvas-body py-2" id="keyframesBody"></div>
+  </div>
+
+  <!-- 6A. EDIT CLIP SHEET -->
+  <div class="offcanvas offcanvas-bottom mf-sheet" tabindex="-1" id="sheetEdit">
+    <div class="offcanvas-header py-2 border-bottom border-secondary-subtle">
+      <h6 class="offcanvas-title mb-0"><i class="bi bi-sliders me-2 text-info"></i>Edit Clip</h6>
+      <button type="button" class="btn-close" data-bs-dismiss="offcanvas" aria-label="Close"></button>
+    </div>
+    <div class="offcanvas-body py-2" id="editBody"></div>
+  </div>
+
+  <!-- 6B. FILTERS SHEET -->
+  <div class="offcanvas offcanvas-bottom mf-sheet" tabindex="-1" id="sheetFilters">
+    <div class="offcanvas-header py-2 border-bottom border-secondary-subtle">
+      <h6 class="offcanvas-title mb-0"><i class="bi bi-palette-fill me-2 text-success"></i>Filters</h6>
+      <button type="button" class="btn-close" data-bs-dismiss="offcanvas" aria-label="Close"></button>
+    </div>
+    <div class="offcanvas-body py-2" id="filtersBody"></div>
+  </div>
+
+  <!-- 6C. EFFECTS SHEET -->
+  <div class="offcanvas offcanvas-bottom mf-sheet" tabindex="-1" id="sheetEffects">
+    <div class="offcanvas-header py-2 border-bottom border-secondary-subtle">
+      <h6 class="offcanvas-title mb-0"><i class="bi bi-stars me-2 text-info"></i>Effects</h6>
+      <button type="button" class="btn-close" data-bs-dismiss="offcanvas" aria-label="Close"></button>
+    </div>
+    <div class="offcanvas-body py-2" id="effectsBody"></div>
+  </div>
+
+  <!-- 6D. 3D CAMERA SHEET -->
+  <div class="offcanvas offcanvas-bottom mf-sheet" tabindex="-1" id="sheetCamera">
+    <div class="offcanvas-header py-2 border-bottom border-secondary-subtle">
+      <h6 class="offcanvas-title mb-0"><i class="bi bi-badge-3d me-2 text-info"></i>3D Camera</h6>
+      <button type="button" class="btn-close" data-bs-dismiss="offcanvas" aria-label="Close"></button>
+    </div>
+    <div class="offcanvas-body py-2" id="cameraBody"></div>
+  </div>
+
+  <!-- 6E. ADJUST & CUTOUT SHEET -->
+  <div class="offcanvas offcanvas-bottom mf-sheet" tabindex="-1" id="sheetAdjust">
+    <div class="offcanvas-header py-2 border-bottom border-secondary-subtle">
+      <h6 class="offcanvas-title mb-0"><i class="bi bi-sliders2 me-2 text-warning"></i>Adjust &amp; Cutout</h6>
+      <button type="button" class="btn-close" data-bs-dismiss="offcanvas" aria-label="Close"></button>
+    </div>
+    <div class="offcanvas-body py-2" id="adjustBody"></div>
+  </div>
+
+  <!-- 6F. MASK, CROP & PIP SHEET -->
+  <div class="offcanvas offcanvas-bottom mf-sheet" tabindex="-1" id="sheetMask">
+    <div class="offcanvas-header py-2 border-bottom border-secondary-subtle">
+      <h6 class="offcanvas-title mb-0"><i class="bi bi-bounding-box-circles me-2 text-info"></i>Mask, Crop &amp; PIP</h6>
+      <button type="button" class="btn-close" data-bs-dismiss="offcanvas" aria-label="Close"></button>
+    </div>
+    <div class="offcanvas-body py-2" id="maskBody"></div>
+  </div>
+
+  <!-- 6G. 3D MOTION TRACKER SHEET -->
+  <div class="offcanvas offcanvas-bottom mf-sheet" tabindex="-1" id="sheetTracker">
+    <div class="offcanvas-header py-2 border-bottom border-secondary-subtle">
+      <h6 class="offcanvas-title mb-0"><i class="bi bi-crosshair me-2 text-warning"></i>3D Motion Tracker</h6>
+      <button type="button" class="btn-close" data-bs-dismiss="offcanvas" aria-label="Close"></button>
+    </div>
+    <div class="offcanvas-body py-2" id="trackerBody"></div>
+  </div>
+
+  <!-- 7. ASPECT RATIO & CANVAS BG QUICK SHEET -->
+  <div class="offcanvas offcanvas-bottom mf-sheet mf-sheet-compact" tabindex="-1" id="sheetRatio">
+    <div class="offcanvas-header py-2 border-bottom border-secondary-subtle">
+      <h6 class="offcanvas-title mb-0"><i class="bi bi-aspect-ratio me-2 text-info"></i>Canvas Ratio &amp; Background</h6>
+      <button type="button" class="btn-close" data-bs-dismiss="offcanvas" aria-label="Close"></button>
+    </div>
+    <div class="offcanvas-body py-2" id="ratioBody"></div>
+  </div>
+
+  <!-- 8. STICKERS & TEXT TEMPLATES SHEET -->
+  <div class="offcanvas offcanvas-bottom mf-sheet" tabindex="-1" id="sheetStickers">
+    <div class="offcanvas-header py-2 border-bottom border-secondary-subtle">
+      <h6 class="offcanvas-title mb-0"><i class="bi bi-emoji-smile me-2 text-warning"></i>Stickers &amp; Text Templates</h6>
+      <button type="button" class="btn-close" data-bs-dismiss="offcanvas" aria-label="Close"></button>
+    </div>
+    <div class="offcanvas-body py-2" id="stickersBody"></div>
+  </div>
+
+  <!-- 9. AUDIO HUB SHEET (SOUNDS / SFX / VOICEOVER / EXTRACT) -->
+  <div class="offcanvas offcanvas-bottom mf-sheet" tabindex="-1" id="sheetAudioTools">
+    <div class="offcanvas-header py-2 border-bottom border-secondary-subtle">
+      <h6 class="offcanvas-title mb-0"><i class="bi bi-music-note-beamed me-2 text-warning"></i>Audio, SFX &amp; Voiceover</h6>
+      <button type="button" class="btn-close" data-bs-dismiss="offcanvas" aria-label="Close"></button>
+    </div>
+    <div class="offcanvas-body py-2" id="audioToolsBody"></div>
+  </div>
+
+  <!-- 10. AUTO-EDIT TEMPLATES SHEET -->
+  <div class="offcanvas offcanvas-bottom mf-sheet" tabindex="-1" id="sheetTemplates">
+    <div class="offcanvas-header py-2 border-bottom border-secondary-subtle">
+      <h6 class="offcanvas-title mb-0"><i class="bi bi-magic me-2 text-info"></i>1-Tap Auto-Edit Templates</h6>
+      <button type="button" class="btn-close" data-bs-dismiss="offcanvas" aria-label="Close"></button>
+    </div>
+    <div class="offcanvas-body py-2" id="templatesBody"></div>
+  </div>
+
+  <!-- 11. TRANSITIONS SHEET -->
+  <div class="offcanvas offcanvas-bottom mf-sheet" tabindex="-1" id="sheetTransitions">
+    <div class="offcanvas-header py-2 border-bottom border-secondary-subtle">
+      <h6 class="offcanvas-title mb-0"><i class="bi bi-intersect me-2 text-info"></i>Transitions</h6>
+      <button type="button" class="btn-close" data-bs-dismiss="offcanvas" aria-label="Close"></button>
+    </div>
+    <div class="offcanvas-body py-2" id="transitionsBody"></div>
+  </div>
+
+  <!-- ================= MODALS ================= -->
+
+  <!-- BATCH CAPTIONS / LYRICS / SRT MODAL -->
+  <div class="modal fade" id="modalCaptions" tabindex="-1">
+    <div class="modal-dialog modal-dialog-centered">
+      <div class="modal-content bg-dark border-secondary-subtle">
+        <div class="modal-header py-2 border-secondary-subtle">
+          <h6 class="modal-title"><i class="bi bi-badge-cc me-2 text-info"></i>Captions &amp; .SRT Lyrics</h6>
+          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body">
+          <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-2">
+            <span class="small text-secondary">Paste .SRT timestamps, lyrics, or auto-generate synced captions</span>
+            <div class="d-flex gap-1">
+              <button id="btnAutoBeatCaptions" type="button" class="btn btn-xs btn-outline-warning py-1 px-2">
+                <i class="bi bi-stars me-1"></i>Auto Caption
+              </button>
+              <label class="btn btn-xs btn-outline-info py-1 px-2 mb-0" style="cursor:pointer;">
+                <i class="bi bi-file-earmark-text me-1"></i>Load .SRT
+                <input id="inpSrtFile" type="file" accept=".srt,.txt,.vtt" class="d-none" />
+              </label>
+            </div>
+          </div>
+          <textarea id="txtBatchCaptions" rows="6" class="form-control form-control-sm font-monospace mb-2" placeholder="1&#10;00:00:00,500 --> 00:00:02,500&#10;Welcome to LUKRIS&#10;&#10;Or plain lyric lines (1 line = 1 subtitle)"></textarea>
+          <div class="row g-2 align-items-center">
+            <div class="col-6">
+              <label class="form-label small text-secondary mb-0">Sec / Plain Line</label>
+              <input id="inpCaptionSecPerLine" type="number" min="0.5" max="10" step="0.5" value="2.0" class="form-control form-control-sm" />
+            </div>
+            <div class="col-6">
+              <label class="form-label small text-secondary mb-0">Caption Style</label>
+              <select id="selCaptionStyle" class="form-select form-select-sm">
+                <option value="minimalSub">Clean Subtitle Pill</option>
+                <option value="vlogTag">Vlog Yellow Tag</option>
+                <option value="neonTitle">Cyber Neon</option>
+                <option value="breakingNews">Breaking News</option>
+              </select>
+            </div>
+          </div>
+        </div>
+        <div class="modal-footer py-2 border-secondary-subtle">
+          <button type="button" class="btn btn-sm btn-secondary" data-bs-dismiss="modal">Cancel</button>
+          <button id="btnApplyBatchCaptions" type="button" class="btn btn-sm mf-btn-accent fw-semibold"><i class="bi bi-check-lg me-1"></i>Generate Captions</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- DOODLE DRAW / CUTOUT BRUSH MODAL -->
+  <div class="modal fade" id="modalDraw" tabindex="-1">
+    <div class="modal-dialog modal-dialog-centered modal-lg">
+      <div class="modal-content bg-dark border-secondary-subtle">
+        <div class="modal-header py-2 border-secondary-subtle">
+          <h6 class="modal-title"><i id="drawModalIcon" class="bi bi-brush me-2 text-info"></i><span id="drawModalTitleText">Doodle / Brush Overlay</span></h6>
+          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body p-2">
+          <div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mb-2">
+            <div class="d-flex align-items-center gap-1" id="drawColorsRow">
+              <button type="button" class="btn p-0 rounded-circle border border-light" style="width:24px;height:24px;background:#00E5FF;" data-draw-color="#00E5FF" aria-label="Cyan Brush"></button>
+              <button type="button" class="btn p-0 rounded-circle border border-secondary" style="width:24px;height:24px;background:#FFFFFF;" data-draw-color="#FFFFFF" aria-label="White Brush"></button>
+              <button type="button" class="btn p-0 rounded-circle border border-secondary" style="width:24px;height:24px;background:#FFEB3B;" data-draw-color="#FFEB3B" aria-label="Yellow Brush"></button>
+              <button type="button" class="btn p-0 rounded-circle border border-secondary" style="width:24px;height:24px;background:#FF4081;" data-draw-color="#FF4081" aria-label="Pink Brush"></button>
+              <button type="button" class="btn p-0 rounded-circle border border-secondary" style="width:24px;height:24px;background:#69F0AE;" data-draw-color="#69F0AE" aria-label="Green Brush"></button>
+              <input id="drawCustomColor" type="color" class="form-control form-control-color form-control-sm" style="width:34px;height:26px;" value="#00E5FF" />
+            </div>
+            <div id="drawCutoutHint" class="d-none small text-info fw-semibold">
+              Erase BG or toggle brush to Restore
+            </div>
+            <div class="d-flex align-items-center gap-2">
+              <span class="small text-secondary">Size</span>
+              <input id="drawBrushSize" type="range" min="2" max="52" value="14" class="form-range" style="width:92px;" />
+              <button id="btnDrawEraser" type="button" class="btn btn-xs btn-outline-light py-1 px-2" title="Eraser / Cut Alpha"><i class="bi bi-eraser"></i></button>
+              <button id="btnDrawUndo" type="button" class="btn btn-xs btn-outline-light py-1 px-2" title="Undo Stroke"><i class="bi bi-arrow-counterclockwise"></i></button>
+              <button id="btnDrawClear" type="button" class="btn btn-xs btn-outline-danger py-1 px-2">Reset</button>
+            </div>
+          </div>
+          <div class="mf-draw-stage rounded border border-secondary-subtle d-flex align-items-center justify-content-center">
+            <canvas id="drawPadCanvas"></canvas>
+          </div>
+        </div>
+        <div class="modal-footer py-2 border-secondary-subtle">
+          <button type="button" class="btn btn-sm btn-secondary" data-bs-dismiss="modal">Cancel</button>
+          <button id="btnSaveDrawLayer" type="button" class="btn btn-sm mf-btn-accent fw-semibold"><i class="bi bi-check-lg me-1"></i><span id="btnSaveDrawText">Add Doodle to Timeline</span></button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- PROJECT SETTINGS MODAL -->
+  <div class="modal fade" id="modalSettings" tabindex="-1">
+    <div class="modal-dialog modal-dialog-centered">
+      <div class="modal-content bg-dark border-secondary-subtle">
+        <div class="modal-header py-2 border-secondary-subtle">
+          <h6 class="modal-title"><i class="bi bi-gear-fill me-2 text-info"></i>Project Settings</h6>
+          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body">
+          <div class="mb-2">
+            <label class="form-label small text-secondary">Project Name</label>
+            <input id="inpProjectName" type="text" class="form-control form-control-sm" />
+          </div>
+          <div class="row g-2 mb-2">
+            <div class="col-6">
+              <label class="form-label small text-secondary">Aspect / Resolution</label>
+              <select id="selProjectRes" class="form-select form-select-sm">
+                <option value="1280x720">16:9 HD (1280×720)</option>
+                <option value="1920x1080">16:9 FHD (1920×1080)</option>
+                <option value="720x1280">9:16 Vertical (720×1280)</option>
+                <option value="1080x1920">9:16 FHD Vertical (1080×1920)</option>
+                <option value="1080x1080">1:1 Square (1080×1080)</option>
+                <option value="1080x1350">4:5 Portrait (1080×1350)</option>
+                <option value="1080x1440">3:4 Classic (1080×1440)</option>
+                <option value="1440x1080">4:3 Standard (1440×1080)</option>
+                <option value="1920x816">2.35:1 Cinema (1920×816)</option>
+              </select>
+            </div>
+            <div class="col-6">
+              <label class="form-label small text-secondary">Frame Rate (FPS)</label>
+              <select id="selProjectFps" class="form-select form-select-sm">
+                <option value="24">24 FPS (Cinema)</option>
+                <option value="30">30 FPS (Standard)</option>
+                <option value="60">60 FPS (Smooth)</option>
+                <option value="120">120 FPS (Ultra Smooth)</option>
+              </select>
+            </div>
+          </div>
+          <div class="row g-2 mb-2">
+            <div class="col-6">
+              <label class="form-label small text-secondary">Duration (Seconds)</label>
+              <input id="inpProjectDuration" type="number" min="2" max="300" step="1" class="form-control form-control-sm" />
+            </div>
+            <div class="col-6">
+              <label class="form-label small text-secondary">Canvas Background</label>
+              <input id="inpProjectBg" type="color" class="form-control form-control-color form-control-sm w-100" value="#05070B" />
+            </div>
+          </div>
+          <div class="p-2 rounded bg-black bg-opacity-25 border border-secondary-subtle">
+            <div class="d-flex align-items-center justify-content-between py-1">
+              <label class="small mb-0" for="chkSettingRipple"><i class="bi bi-link-45deg me-1 text-info"></i>Magnetic Main Track (Auto Ripple Gaps)</label>
+              <div class="form-check form-switch m-0">
+                <input class="form-check-input" type="checkbox" id="chkSettingRipple" checked />
+              </div>
+            </div>
+            <div class="d-flex align-items-center justify-content-between py-1 border-top border-secondary-subtle">
+              <label class="small mb-0" for="chkSettingAutoColorMatch"><i class="bi bi-palette2 me-1 text-warning"></i>Auto-Match Color Palette on New Media</label>
+              <div class="form-check form-switch m-0">
+                <input class="form-check-input" type="checkbox" id="chkSettingAutoColorMatch" checked />
+              </div>
+            </div>
+            <div class="d-flex align-items-center justify-content-between gap-2 pt-2 mt-1 border-top border-secondary-subtle">
+              <label class="small mb-0" for="selProjectTheme"><i class="bi bi-circle-half me-1 text-info"></i>Tampilan Tema (Dark / Light)</label>
+              <div class="btn-group btn-group-sm" role="group" aria-label="Theme Mode">
+                <button type="button" id="btnThemeDark" class="btn btn-info text-dark fw-semibold px-2 py-1" data-theme-opt="dark"><i class="bi bi-moon-stars-fill me-1"></i>Dark</button>
+                <button type="button" id="btnThemeLight" class="btn btn-dark border-secondary-subtle px-2 py-1" data-theme-opt="light"><i class="bi bi-sun-fill me-1"></i>Light</button>
+              </div>
+              <input type="hidden" id="selProjectTheme" value="dark" />
+            </div>
+          </div>
+        </div>
+        <div class="modal-footer py-2 border-secondary-subtle">
+          <button type="button" class="btn btn-sm btn-secondary" data-bs-dismiss="modal">Cancel</button>
+          <button id="btnApplySettings" type="button" class="btn btn-sm mf-btn-accent">Apply Settings</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- EXPORT MP4 SHEET / MODAL (CAPCUT STYLE) -->
+  <div class="modal fade" id="modalExport" tabindex="-1" data-bs-backdrop="static">
+    <div class="modal-dialog modal-dialog-centered mf-export-dialog">
+      <div class="modal-content mf-export-sheet border-secondary-subtle">
+        <div class="modal-header py-2 px-3 border-bottom border-secondary-subtle">
+          <div class="d-flex align-items-center gap-2">
+            <i class="bi bi-arrow-up-circle-fill text-info"></i>
+            <h6 class="modal-title mb-0 fw-bold">Export</h6>
+            <span class="badge rounded-pill mf-60fps-badge">Up to 120 FPS</span>
+          </div>
+          <button id="btnCloseExportX" type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+        </div>
+        <div class="modal-body p-3">
+          <div id="exportConfigPane">
+            <!-- Top Hero Cover + Live Size Summary -->
+            <div class="mf-export-hero d-flex align-items-center gap-2 mb-3">
+              <img id="imgExportPreviewThumb" class="mf-export-cover-thumb" alt="Export Cover Preview" />
+              <div class="min-w-0 flex-grow-1">
+                <input id="inpExportFileName" type="text" class="form-control form-control-sm mf-export-name-input mb-1" value="LUKRIS_Export.mp4" aria-label="Export File Name" />
+                <div id="lblExportEstimate" class="small text-secondary text-truncate">1080×1920 · 30 FPS · 5.0s</div>
+              </div>
+              <div class="text-end flex-shrink-0">
+                <div id="lblExportSizeBadge" class="mf-export-size-pill">~0.0 MB</div>
+                <div class="mf-export-size-sub">Est. MP4</div>
+              </div>
+            </div>
+
+            <!-- Hidden synced value holders -->
+            <input type="hidden" id="selExportRes" value="1080p" />
+            <input type="hidden" id="selExportFps" value="30" />
+            <input type="hidden" id="selExportQuality" value="high" />
+
+            <!-- CapCut Discrete Step Sliders -->
+            <div class="mf-export-sliders-card mb-2">
+              <!-- 1. Resolution -->
+              <div class="mf-export-slider-group">
+                <div class="d-flex justify-content-between align-items-baseline mb-1">
+                  <span class="mf-slider-label">Resolution</span>
+                  <div>
+                    <span id="lblExportResVal" class="mf-slider-val">1080p</span>
+                    <span id="lblExportResDims" class="mf-slider-sub ms-1">1080×1920</span>
+                  </div>
+                </div>
+                <input id="rngExportRes" type="range" min="0" max="3" step="1" value="2" class="mf-capcut-slider" aria-label="Export Resolution" />
+                <div class="mf-slider-ticks" id="ticksExportRes">
+                  <button type="button" class="mf-tick-btn" data-res-idx="0">480p</button>
+                  <button type="button" class="mf-tick-btn" data-res-idx="1">720p</button>
+                  <button type="button" class="mf-tick-btn active" data-res-idx="2">1080p</button>
+                  <button type="button" class="mf-tick-btn" id="optExport4k" data-res-idx="3">2K/4K</button>
+                </div>
+              </div>
+
+              <!-- 2. Frame rate (24 / 25 / 30 / 50 / 60 / 120 fps) -->
+              <div class="mf-export-slider-group">
+                <div class="d-flex justify-content-between align-items-baseline mb-1">
+                  <span class="mf-slider-label">Frame rate</span>
+                  <div>
+                    <span id="lblExportFpsVal" class="mf-slider-val">30fps</span>
+                    <span id="lblExportFpsHint" class="mf-slider-sub ms-1">Standard</span>
+                  </div>
+                </div>
+                <input id="rngExportFps" type="range" min="0" max="5" step="1" value="2" class="mf-capcut-slider" aria-label="Export Frame Rate" />
+                <div class="mf-slider-ticks" id="ticksExportFps">
+                  <button type="button" class="mf-tick-btn" data-fps-idx="0">24</button>
+                  <button type="button" class="mf-tick-btn" data-fps-idx="1">25</button>
+                  <button type="button" class="mf-tick-btn active" data-fps-idx="2">30</button>
+                  <button type="button" class="mf-tick-btn" data-fps-idx="3">50</button>
+                  <button type="button" class="mf-tick-btn" data-fps-idx="4">60</button>
+                  <button type="button" class="mf-tick-btn" data-fps-idx="5">120</button>
+                </div>
+              </div>
+
+              <!-- 3. Code rate (Bitrate / Quality) -->
+              <div class="mf-export-slider-group mb-0">
+                <div class="d-flex justify-content-between align-items-baseline mb-1">
+                  <span class="mf-slider-label">Code rate</span>
+                  <div>
+                    <span id="lblExportBitrateVal" class="mf-slider-val">High</span>
+                    <span id="lblExportMbpsSub" class="mf-slider-sub ms-1">12 Mbps</span>
+                  </div>
+                </div>
+                <input id="rngExportQuality" type="range" min="0" max="3" step="1" value="2" class="mf-capcut-slider" aria-label="Export Code Rate" />
+                <div class="mf-slider-ticks" id="ticksExportQuality">
+                  <button type="button" class="mf-tick-btn" data-qual-idx="0">Low</button>
+                  <button type="button" class="mf-tick-btn" data-qual-idx="1">Rec.</button>
+                  <button type="button" class="mf-tick-btn active" data-qual-idx="2">High</button>
+                  <button type="button" class="mf-tick-btn" data-qual-idx="3">Ultra</button>
+                </div>
+              </div>
+            </div>
+
+            <!-- Options & Switches -->
+            <div class="mf-export-opts-card mb-2">
+              <div class="d-flex align-items-center justify-content-between py-1">
+                <label class="small mb-0" for="chkExportAudio"><i class="bi bi-volume-up me-1 text-warning"></i>Audio Track (AAC Stereo)</label>
+                <div class="form-check form-switch m-0">
+                  <input class="form-check-input" type="checkbox" id="chkExportAudio" checked />
+                </div>
+              </div>
+              <div class="d-flex align-items-center justify-content-between py-1 border-top border-secondary-subtle">
+                <label class="small mb-0" for="chkExportTrimTail"><i class="bi bi-scissors me-1 text-info"></i>Smart Trim Empty Tail</label>
+                <div class="form-check form-switch m-0">
+                  <input class="form-check-input" type="checkbox" id="chkExportTrimTail" checked />
+                </div>
+              </div>
+              <div class="d-flex align-items-center justify-content-between gap-2 pt-2 mt-1 border-top border-secondary-subtle">
+                <div class="min-w-0 flex-grow-1">
+                  <div class="small fw-semibold text-light d-flex align-items-center gap-1">
+                    <i class="bi bi-folder2-open text-info"></i>
+                    <span>Lokasi File Export</span>
+                  </div>
+                  <div id="lblExportLocation" class="text-secondary text-truncate" style="font-size:0.7rem;">Movies/MotionFlow Studio (Default)</div>
+                </div>
+                <div class="d-flex align-items-center gap-1 flex-shrink-0">
+                  <button id="btnPickExportLocation" type="button" class="btn btn-xs btn-outline-info py-1 px-2">Pilih Lokasi...</button>
+                  <button id="btnClearExportLocation" type="button" class="btn btn-xs btn-outline-secondary py-1 px-2 d-none" title="Reset ke folder default">Reset</button>
+                </div>
+              </div>
+            </div>
+            <div id="exportCapsHint" class="mf-export-caps-hint text-secondary"></div>
+          </div>
+
+          <div id="exportProgressPane" class="d-none text-center py-2">
+            <div class="mf-export-progress-cover-wrap mx-auto mb-2">
+              <img id="imgExportProgressThumb" class="mf-export-progress-cover" alt="Rendering Preview" />
+            </div>
+            <div id="lblExportPercent" class="fs-4 fw-bold text-info mb-1">0%</div>
+            <div id="lblExportStatus" class="small fw-semibold mb-2">Exporting video...</div>
+            <div class="progress mf-export-progress mb-2">
+              <div id="barExportProgress" class="progress-bar progress-bar-striped progress-bar-animated bg-info" style="width:0%"></div>
+            </div>
+            <div id="lblExportDetail" class="small text-secondary">Preparing encoder...</div>
+            <div class="small text-secondary opacity-75 mt-2">Keep LUKRIS open while rendering.</div>
+          </div>
+
+          <div id="exportDonePane" class="d-none text-center py-2">
+            <i class="bi bi-check-circle-fill text-success fs-1 d-block mb-2"></i>
+            <div class="fw-bold fs-6 mb-1">Ready to Share</div>
+            <div id="lblExportResultInfo" class="small text-secondary mb-3"></div>
+            <div class="d-flex flex-wrap justify-content-center gap-2">
+              <button id="btnOpenExported" class="btn btn-sm mf-btn-accent px-3 fw-semibold"><i class="bi bi-play-circle me-1"></i>Play Video</button>
+              <button id="btnSaveExportAs" class="btn btn-sm btn-outline-info px-3"><i class="bi bi-folder-symlink me-1"></i>Save As...</button>
+              <button id="btnShareExported" class="btn btn-sm btn-outline-light px-3"><i class="bi bi-share me-1"></i>Share</button>
+            </div>
+          </div>
+        </div>
+        <div class="modal-footer py-2 px-3 border-top border-secondary-subtle">
+          <button id="btnCancelExport" type="button" class="btn btn-sm btn-outline-danger w-100 d-none">Cancel Export</button>
+          <button id="btnStartExport" type="button" class="btn mf-btn-accent fw-bold w-100 py-2">
+            <i class="bi bi-arrow-up-circle-fill me-1"></i><span id="btnStartExportLabel">Export MP4</span>
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- TOAST CONTAINER -->
+  <div class="toast-container position-fixed top-0 start-50 translate-middle-x p-2" style="z-index: 2000;">
+    <div id="studioToast" class="toast align-items-center text-bg-dark border border-info-subtle" role="alert">
+      <div class="d-flex">
+        <div id="studioToastMsg" class="toast-body small"></div>
+        <button type="button" class="btn-close me-2 m-auto" data-bs-dismiss="toast"></button>
+      </div>
+    </div>
+  </div>
+
+  <script src="./vendor/bootstrap.bundle.min.js"></script>
+  <script type="module" src="./js/app.js"></script>
+</body>
+</html>

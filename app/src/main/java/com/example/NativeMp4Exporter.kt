@@ -99,7 +99,7 @@ class NativeMp4Exporter(
         // H.264 requires even dimensions
         this.width = (reqWidth / 2) * 2
         this.height = (reqHeight / 2) * 2
-        this.fps = reqFps.coerceIn(12, 60)
+        this.fps = reqFps.coerceIn(12, 120)
         this.totalFrames = totalFrames.coerceAtLeast(1)
         this.hasAudio = includeAudio
         this.outputName = if (fileName.endsWith(".mp4", ignoreCase = true)) fileName else "$fileName.mp4"
@@ -109,15 +109,25 @@ class NativeMp4Exporter(
         val tempFile = File(exportsDir, "export_${System.currentTimeMillis()}.mp4")
         outFile = tempFile
 
+        val clampedBitrate = bitrateMbps.coerceIn(2, 60) * 1_000_000
+        val vCodec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
         val videoFormat = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-            setInteger(MediaFormat.KEY_BIT_RATE, bitrateMbps.coerceIn(2, 40) * 1_000_000)
+            setInteger(MediaFormat.KEY_BIT_RATE, clampedBitrate)
             setInteger(MediaFormat.KEY_FRAME_RATE, fps)
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
         }
-
-        val vCodec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
-        vCodec.configure(videoFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+        try {
+            vCodec.configure(videoFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+        } catch (e: Exception) {
+            if (fps > 60) {
+                // Some software/emulator H.264 codecs clamp nominal KEY_FRAME_RATE at 60 while muxer honors 120fps PTS timestamps
+                videoFormat.setInteger(MediaFormat.KEY_FRAME_RATE, 60)
+                vCodec.configure(videoFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            } else {
+                throw e
+            }
+        }
         val inputSurface = vCodec.createInputSurface()
         vCodec.start()
         videoEncoder = vCodec

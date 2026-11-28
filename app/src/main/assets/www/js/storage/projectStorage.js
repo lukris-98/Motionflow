@@ -82,6 +82,10 @@ export function createEmptyProject(name = 'Untitled Project', options = {}) {
       themeMode: options.themeMode === 'light' ? 'light' : 'dark'
     },
     coverDataUrl: options.coverDataUrl || null,
+    projectType: options.projectType || 'video',
+    favorite: Boolean(options.favorite),
+    deletedAt: options.deletedAt || null,
+    folder: options.folder || 'My Projects',
     createdAt: Date.now(),
     updatedAt: Date.now()
   };
@@ -156,8 +160,62 @@ export function deserializeProject(jsonString) {
     beatMarkers: Array.isArray(raw.beatMarkers) ? raw.beatMarkers : [],
     mediaRefs: Array.isArray(raw.mediaRefs) ? raw.mediaRefs : [],
     layers: raw.layers,
+    projectType: raw.projectType || 'video',
+    favorite: Boolean(raw.favorite),
+    deletedAt: raw.deletedAt || null,
+    folder: raw.folder || 'My Projects',
     updatedAt: Date.now()
   };
+}
+
+const META_STORAGE_KEY = 'lukris_projects_meta_v1';
+
+function extractProjectMeta(project) {
+  if (!project || !project.id) return null;
+  const fps = Math.max(1, Number(project.fps) || 30);
+  const durationFrames = Math.max(1, Number(project.durationFrames) || fps * 10);
+  const maxLayerEnd = Array.isArray(project.layers)
+    ? project.layers.reduce((m, l) => Math.max(m, Number(l?.endFrame) || 0), 0)
+    : 0;
+  const effectiveFrames = maxLayerEnd > 0 ? maxLayerEnd : durationFrames;
+  return {
+    id: project.id,
+    name: project.name || 'Untitled Project',
+    projectType: project.projectType || 'video',
+    width: Number(project.width) || 1280,
+    height: Number(project.height) || 720,
+    fps,
+    durationFrames: effectiveFrames,
+    durationSec: Math.max(1, Math.round(effectiveFrames / fps)),
+    layerCount: Array.isArray(project.layers) ? project.layers.length : 0,
+    favorite: Boolean(project.favorite),
+    deletedAt: project.deletedAt || null,
+    folder: project.folder || 'My Projects',
+    coverDataUrl: project.coverDataUrl || null,
+    backgroundColor: project.backgroundColor || '#05070B',
+    createdAt: project.createdAt || Date.now(),
+    updatedAt: project.updatedAt || Date.now()
+  };
+}
+
+function syncMetaToLocalStorage(project, deletedId = null) {
+  if (typeof localStorage === 'undefined') return;
+  try {
+    const raw = localStorage.getItem(META_STORAGE_KEY);
+    let list = raw ? JSON.parse(raw) : [];
+    if (!Array.isArray(list)) list = [];
+    if (deletedId) {
+      list = list.filter((p) => p && p.id !== deletedId);
+    } else if (project) {
+      const meta = extractProjectMeta(project);
+      if (meta) {
+        const idx = list.findIndex((p) => p && p.id === meta.id);
+        if (idx >= 0) list[idx] = { ...list[idx], ...meta };
+        else list.unshift(meta);
+      }
+    }
+    localStorage.setItem(META_STORAGE_KEY, JSON.stringify(list));
+  } catch {}
 }
 
 export const ProjectStorage = {
@@ -168,7 +226,10 @@ export const ProjectStorage = {
     return new Promise((resolve, reject) => {
       const tx = db.transaction(STORE_PROJECTS, 'readwrite');
       tx.objectStore(STORE_PROJECTS).put(payload);
-      tx.oncomplete = () => resolve(project);
+      tx.oncomplete = () => {
+        syncMetaToLocalStorage(project, null);
+        resolve(project);
+      };
       tx.onerror = () => reject(tx.error);
     });
   },
@@ -201,7 +262,10 @@ export const ProjectStorage = {
     return new Promise((resolve, reject) => {
       const tx = db.transaction(STORE_PROJECTS, 'readwrite');
       tx.objectStore(STORE_PROJECTS).delete(id);
-      tx.oncomplete = () => resolve();
+      tx.oncomplete = () => {
+        syncMetaToLocalStorage(null, id);
+        resolve();
+      };
       tx.onerror = () => reject(tx.error);
     });
   },

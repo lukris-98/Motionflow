@@ -275,34 +275,69 @@ class MotionFlowApp {
       await this.registerFontFace(f);
     }
 
-    const savedProjects = await ProjectStorage.listProjects();
-    if (savedProjects.length > 0) {
-      this.project = deserializeProject(savedProjects[0]);
-    } else {
-      // Seed one real, editable starter composition in IndexedDB on first launch
-      const starter = createEmptyProject('MotionFlow Demo', { width: 1280, height: 720, fps: 30, durationSec: 6 });
-      const bgShape = TimelineEngine.createShapeLayer(starter, 'rectangle', 0);
-      bgShape.name = 'Accent Card';
-      bgShape.width = 560;
-      bgShape.height = 170;
-      bgShape.endFrame = 150;
-      bgShape.shapeProps.fillColor = '#162038';
-      bgShape.shapeProps.strokeColor = '#00E5FF';
-      bgShape.shapeProps.strokeWidth = 4;
-      bgShape.shapeProps.cornerRadius = 24;
-      KeyframeEngine.applyPreset(bgShape, 'zoomIn', starter.width, starter.height, 24);
+    const urlParams = new URLSearchParams(window.location.search || '');
+    const reqProjectId = urlParams.get('projectId');
+    const reqNewType = urlParams.get('new');
+    const reqTemplate = urlParams.get('template');
+    const reqAiTool = urlParams.get('aiTool');
+    const reqImportMedia = urlParams.get('importMedia');
 
-      const title = TimelineEngine.createTextLayer(starter, 0);
-      title.name = 'MotionFlow Title';
-      title.endFrame = 150;
-      title.textProps.text = 'MOTIONFLOW\nSTUDIO';
-      title.textProps.fontSize = 56;
-      KeyframeEngine.applyPreset(title, 'fadeIn', starter.width, starter.height, 24);
+    let savedProjects = await ProjectStorage.listProjects();
+    try {
+      if (typeof localStorage !== 'undefined' && localStorage.getItem('lukris_purged_dummy_v1') !== '1') {
+        const legacyDummyNames = new Set([
+          'Neon Cyber Reel 2026',
+          'Product Launch Teaser',
+          'Minimalist Poster Keyframe',
+          'LUKRIS Motion Intro',
+          'LUKRIS Demo',
+          'MotionFlow Demo'
+        ]);
+        for (const p of savedProjects) {
+          if (legacyDummyNames.has(p.name)) {
+            await ProjectStorage.deleteProject(p.id);
+          }
+        }
+        savedProjects = savedProjects.filter((p) => !legacyDummyNames.has(p.name));
+        localStorage.removeItem('lukris_seeded_v1');
+        localStorage.setItem('lukris_purged_dummy_v1', '1');
+      }
+    } catch {}
 
-      TimelineEngine.addLayer(starter, bgShape);
-      TimelineEngine.addLayer(starter, title);
-      this.project = starter;
+    let loadedTarget = null;
+    if (reqProjectId) {
+      const found = savedProjects.find((p) => p.id === reqProjectId) || await ProjectStorage.getProject(reqProjectId);
+      if (found) loadedTarget = deserializeProject(found);
+    }
+
+    const activeProjects = savedProjects.filter((p) => !p.deletedAt);
+
+    if (reqNewType) {
+      const reqName = urlParams.get('name') || (reqNewType === 'image' ? 'New Image Design' : reqNewType === 'canvas' ? 'New Canvas' : 'Untitled Project');
+      const reqW = Math.max(120, Number(urlParams.get('width')) || 1280);
+      const reqH = Math.max(120, Number(urlParams.get('height')) || 720);
+      const reqFps = Math.max(12, Number(urlParams.get('fps')) || 30);
+      const reqDur = Math.max(2, Number(urlParams.get('durationSec')) || 10);
+      this.project = createEmptyProject(reqName, {
+        projectType: reqNewType,
+        width: reqW,
+        height: reqH,
+        fps: reqFps,
+        durationSec: reqDur
+      });
       await ProjectStorage.saveProject(this.project);
+    } else if (loadedTarget) {
+      this.project = loadedTarget;
+    } else if (activeProjects.length > 0) {
+      this.project = deserializeProject(activeProjects[0]);
+    } else {
+      // First open: completely empty timeline (zero dummy layers/projects)
+      this.project = createEmptyProject('Untitled Project', {
+        width: 1280,
+        height: 720,
+        fps: 30,
+        durationSec: 10
+      });
     }
 
     if (this.project.layers.length > 0) {
@@ -314,10 +349,29 @@ class MotionFlowApp {
     this.bindOverlayGestures();
     this.bindNativeBridgeCallbacks();
 
-    this.applyThemeMode(this.project?.settings?.themeMode || this._getStoredThemeMode() || 'dark');
+    this.applyThemeMode(this._getStoredThemeMode() || this.project?.settings?.themeMode || 'dark');
     this.setSaveState(true);
     this.updateAllUI();
     this._preloadProjectAudioBuffers();
+
+    if (reqTemplate) {
+      setTimeout(() => {
+        if (typeof this.applyAutoEditTemplate === 'function') {
+          this.applyAutoEditTemplate(reqTemplate);
+        } else {
+          this.openSheet('sheetTemplates');
+        }
+      }, 150);
+    } else if (reqAiTool) {
+      setTimeout(() => {
+        if (reqAiTool === 'bg_remover') this.openSheet('sheetAdjust', null, 'chroma');
+        else if (reqAiTool === 'auto_captions') bootstrap.Modal.getOrCreateInstance(document.getElementById('modalCaptions'))?.show();
+        else if (reqAiTool === 'tts' || reqAiTool === 'voice_enhance') this.openSheet('sheetAudioTools', null, 'voiceover');
+        else this.openSheet('sheetEffects');
+      }, 150);
+    } else if (reqImportMedia === '1') {
+      setTimeout(() => this.openSheet('sheetMedia'), 150);
+    }
   }
 
   async _preloadProjectAudioBuffers() {
@@ -2499,7 +2553,7 @@ class MotionFlowApp {
     const durSec = (effFrames / Math.max(1, this.project.fps || 30)).toFixed(1);
 
     const resLabelMap = { '480p': '480p', '720p': '720p', '1080p': '1080p', '4k': '2K/4K' };
-    const fpsHintMap = { 24: 'Cinema', 25: 'PAL', 30: 'Standard', 50: 'Smooth', 60: 'Ultra Smooth' };
+    const fpsHintMap = { 24: 'Cinema', 25: 'PAL', 30: 'Standard', 50: 'Smooth', 60: 'Ultra Smooth', 120: '120Hz Pro' };
     const qualLabelMap = { low: 'Low', medium: 'Recommended', high: 'High', ultra: 'Ultra (PNG)' };
 
     const resValEl = document.getElementById('lblExportResVal');
@@ -4568,7 +4622,11 @@ class MotionFlowApp {
           this.exitPreviewFullview();
           return true;
         }
-        return false;
+        this.pause();
+        ProjectStorage.saveProject(this.project).finally(() => {
+          window.location.href = './index.html';
+        });
+        return true;
       },
       onVoiceoverState: (state, msg) => {
         const vo = this.voiceoverState;
@@ -4783,6 +4841,11 @@ class MotionFlowApp {
     if (btnGroupChecked) btnGroupChecked.onclick = () => this.groupSelectedLayersAction();
 
     // Top Toolbar
+    document.getElementById('btnGoHome')?.addEventListener('click', async () => {
+      this.pause();
+      try { await ProjectStorage.saveProject(this.project); } catch {}
+      window.location.href = './index.html';
+    });
     document.getElementById('btnProjects').onclick = async () => {
       await this.panels.renderProjectsList();
       bootstrap.Offcanvas.getOrCreateInstance(document.getElementById('sheetProjects')).show();
@@ -5411,7 +5474,7 @@ class MotionFlowApp {
 
     // Export MP4 Sheet (CapCut-Style Discrete Sliders) & Quick Spec Pill
     const RES_STEPS = ['480p', '720p', '1080p', '4k'];
-    const FPS_STEPS = [24, 25, 30, 50, 60];
+    const FPS_STEPS = [24, 25, 30, 50, 60, 120];
     const QUAL_STEPS = ['low', 'medium', 'high', 'ultra'];
 
     const syncResStep = (idx, supports4K = true) => {
@@ -5462,8 +5525,8 @@ class MotionFlowApp {
         btn4k.textContent = cachedSupports4K ? '2K/4K' : '4K (N/A)';
       }
       document.getElementById('exportCapsHint').textContent = cachedSupports4K
-        ? `Hardware H.264 supports up to ${caps.maxWidth}×${caps.maxHeight} · 60 FPS interpolation ready`
-        : `Hardware H.264 max: ${caps.maxWidth}×${caps.maxHeight} · 60 FPS smooth export ready`;
+        ? `Hardware H.264 supports up to ${caps.maxWidth}×${caps.maxHeight} · Up to 120 FPS interpolation ready`
+        : `Hardware H.264 max: ${caps.maxWidth}×${caps.maxHeight} · Up to 120 FPS smooth export ready`;
 
       // Capture current preview frame thumbnail for CapCut-style export cover
       try {
