@@ -2836,4 +2836,210 @@ test('RendererEngine clears stale video preview seek locks and sanitizes non-fin
   assert.equal(mockVid._pendingSeekTime, null);
 });
 
+test('editor.html and app.js remove canvas FPS/ratio & grid HUD and move Track & 2D/3D into toolbar dropdown beside Export', () => {
+  const html = fs.readFileSync('app/src/main/assets/www/editor.html', 'utf8');
+  const appJs = fs.readFileSync('app/src/main/assets/www/js/app.js', 'utf8');
+
+  assert.equal(html.includes('id="hudResFps"'), false);
+  assert.equal(html.includes('id="btnToggleGrid"'), false);
+  assert.equal(html.includes('mf-preview-hud-top'), false);
+
+  assert.equal(appJs.includes('hudResFps'), false);
+  assert.equal(appJs.includes('btnToggleGrid'), false);
+
+  const headerStart = html.indexOf('<header class="mf-toolbar');
+  const headerEnd = html.indexOf('</header>', headerStart);
+  assert.ok(headerStart !== -1 && headerEnd > headerStart, 'Expected <header class="mf-toolbar"> block');
+  const toolbarBlock = html.slice(headerStart, headerEnd);
+
+  const idxTools = toolbarBlock.indexOf('id="btnToolbarToolsDropdown"');
+  const idxTrack = toolbarBlock.indexOf('id="btnOpenTrackerQuick"');
+  const idx2d = toolbarBlock.indexOf('id="btnPreviewMode2D"');
+  const idx3d = toolbarBlock.indexOf('id="btnResetCameraQuick"');
+  const idxExport = toolbarBlock.indexOf('id="btnOpenExport"');
+
+  assert.ok(idxTools > -1 && idxTrack > idxTools && idx2d > idxTrack && idx3d > idx2d, 'Expected Track and 2D/3D inside toolbar dropdown');
+  assert.ok(idxExport > idx3d, 'Expected toolbar dropdown right beside Export button');
+});
+
+test('RendererEngine mid-timeline resilience: seeking/error video fallback, safe texture upload, and memory pressure budget', () => {
+  const makeMock2dCtx = (canvas) => ({ canvas, save() {}, restore() {}, clearRect() {}, fillRect() {} });
+  const makeMockCanvas = (w = 320, h = 568) => {
+    const c = { width: w, height: h, style: {}, getBoundingClientRect: () => ({ width: w, height: h }) };
+    const ctx = makeMock2dCtx(c);
+    c.getContext = (t) => (t === '2d' ? ctx : null);
+    return c;
+  };
+  const renderer = new RendererEngine(makeMockCanvas(), makeMockCanvas());
+  const proj = createEmptyProject('MidTimelineResilience', { width: 1080, height: 1920, fps: 30, durationSec: 6 });
+  const vidLayer = TimelineEngine.createMediaLayer(
+    proj,
+    { id: 'vid_mid', name: 'Mid.mp4', type: 'video', width: 1080, height: 1920, durationMs: 4000 },
+    0,
+    { trackRole: 'main' }
+  );
+  TimelineEngine.addToMainTrack(proj, vidLayer);
+
+  const cachedCanvas = makeMockCanvas(360, 640);
+  cachedCanvas._mfVersion = 7;
+  renderer.videoLastFrameCache.set('vid_mid', { canvas: cachedCanvas, width: 1080, height: 1920 });
+
+  const mockVid = {
+    tagName: 'VIDEO',
+    currentTime: 1.2,
+    duration: 4.0,
+    readyState: 3,
+    networkState: 1,
+    paused: false,
+    seeking: true,
+    ended: false,
+    videoWidth: 1080,
+    videoHeight: 1920,
+    isConnected: true,
+    dataset: { srcUrl: 'mock://mid.mp4' },
+    _hasMediaError: false,
+    _armVfc: () => {},
+    play: () => Promise.resolve(),
+    pause: () => {}
+  };
+  renderer.videoCache.set('vid_mid', mockVid);
+  const mediaMap = new Map([['vid_mid', { id: 'vid_mid', type: 'video', url: 'mock://mid.mp4', durationMs: 4000 }]]);
+
+  // While seeking, prefer cached last frame rather than blank or partially decoded video
+  const seekingDrawable = renderer.resolveLayerDrawable(vidLayer, 36, 30, mediaMap);
+  assert.equal(seekingDrawable?.el, cachedCanvas);
+
+  // When not seeking and healthy, return live video element
+  mockVid.seeking = false;
+  const liveDrawable = renderer.resolveLayerDrawable(vidLayer, 36, 30, mediaMap);
+  assert.equal(liveDrawable?.el, mockVid);
+
+  // When video has an error flag, fall back to last frame cache instead of drawing dead video
+  mockVid._hasMediaError = true;
+  const erroredDrawable = renderer.resolveLayerDrawable(vidLayer, 36, 30, mediaMap);
+  assert.equal(erroredDrawable?.el, cachedCanvas);
+
+  // Memory pressure level 60 should keep at least 2 decoders and retain videoLastFrameCache
+  renderer.handleMemoryPressure(60, proj, 36);
+  assert.ok(renderer.maxVideoDecoders >= 2);
+  assert.equal(renderer.videoLastFrameCache.has('vid_mid'), true);
+
+  // resetVideoPlayTransientState restores decoder budget >= 3 and clears _hasMediaError
+  renderer.resetVideoPlayTransientState();
+  assert.ok(renderer.maxVideoDecoders >= 3);
+  assert.equal(mockVid._hasMediaError, false);
+
+  // getOrCreateTexture should safely handle 0x0 sources and failing drawImage/texImage2D uploads without throwing
+  const texUploads = [];
+  const fakeGl = {
+    TEXTURE0: 0,
+    TEXTURE_2D: 1,
+    TEXTURE_MIN_FILTER: 2,
+    TEXTURE_MAG_FILTER: 3,
+    TEXTURE_WRAP_S: 4,
+    TEXTURE_WRAP_T: 5,
+    LINEAR: 6,
+    CLAMP_TO_EDGE: 7,
+    RGBA: 8,
+    UNSIGNED_BYTE: 9,
+    MAX_TEXTURE_SIZE: 10,
+    activeTexture() {},
+    createTexture() { return { id: 'tex1' }; },
+    bindTexture() {},
+    texParameteri() {},
+    getParameter() { return 2048; },
+    texImage2D(...args) {
+      texUploads.push(args);
+      if (args.length === 6 && args[5]?.tagName === 'VIDEO') {
+        throw new Error('simulated WebGL video upload failure');
+      }
+    }
+  };
+  const compositor = { gl: fakeGl, textures: new Map(), textureMeta: new Map() };
+  const zeroTex = renderer.getOrCreateTexture(compositor, 'zero_key', { videoWidth: 0, videoHeight: 0 });
+  assert.ok(zeroTex, 'Expected valid placeholder texture for 0x0 source');
+  const errTex = renderer.getOrCreateTexture(compositor, 'err_key', mockVid);
+  assert.ok(errTex, 'Expected getOrCreateTexture not to throw on failing upload');
+});
+
+test('Editor Settings & Android NativeGpuPreviewView support Native GPU vs WebView mode switching', () => {
+  const editorHtml = fs.readFileSync(new URL('../src/main/assets/www/editor.html', import.meta.url), 'utf8');
+  const studioCss = fs.readFileSync(new URL('../src/main/assets/www/css/studio.css', import.meta.url), 'utf8');
+  const appSrc = fs.readFileSync(new URL('../src/main/assets/www/js/app.js', import.meta.url), 'utf8');
+  const mainAct = fs.readFileSync(new URL('../src/main/java/com/example/MainActivity.kt', import.meta.url), 'utf8');
+  const nativeView = fs.readFileSync(new URL('../src/main/java/com/example/NativeGpuPreviewView.kt', import.meta.url), 'utf8');
+
+  assert.ok(editorHtml.includes('id="selSettingPlayerEngine"'));
+  assert.ok(editorHtml.includes('id="chkSettingGpuAccel"'));
+  assert.ok(studioCss.includes('html.mf-native-gpu-active'));
+  assert.ok(appSrc.includes('applyPlayerEngineConfig('));
+  assert.ok(appSrc.includes('syncNativePreviewViewport('));
+
+  assert.ok(mainAct.includes('fun setNativePreviewConfig('));
+  assert.ok(mainAct.includes('fun updateNativePreviewViewport('));
+  assert.ok(mainAct.includes('fun renderNativePreviewScene('));
+  assert.ok(mainAct.includes('fun getNativePlayerCapabilities('));
+
+  assert.ok(nativeView.includes('GL_TEXTURE_EXTERNAL_OES'));
+  assert.ok(nativeView.includes('MediaCodec'));
+  assert.ok(nativeView.includes('startCodecWithFallback'));
+  assert.ok(nativeView.includes('GL_RENDERER'));
+});
+
+test('RendererEngine.buildNativeGpuScene offloads contiguous bottom media + masks/blur/grain + prewarm and stops at Text overlay', () => {
+  const makeMockCanvas = (w = 320, h = 568) => {
+    const c = { width: w, height: h, style: {}, getBoundingClientRect: () => ({ width: w, height: h }) };
+    c.getContext = (t) => (t === '2d' ? { canvas: c, save() {}, restore() {}, clearRect() {}, fillRect() {} } : null);
+    return c;
+  };
+  const renderer = new RendererEngine(makeMockCanvas(), makeMockCanvas());
+  renderer.setGpuPreference(true, 'auto');
+  assert.equal(renderer.maxPreviewSide, 960);
+
+  const proj = createEmptyProject('NativeOffloadProj', { width: 1080, height: 1920, fps: 30, durationSec: 8 });
+  const v1 = TimelineEngine.createMediaLayer(proj, { id: 'm_v1', name: 'Clip1.mp4', type: 'video', width: 1080, height: 1920, durationMs: 3000 }, 0, { trackRole: 'main' });
+  v1.fx.blur = 1.5;
+  v1.fx.sharpen = 0.3;
+  v1.fx.grain = 0.2;
+  v1.mask = { type: 'circle', offsetX: 0, offsetY: 0, scaleX: 0.8, scaleY: 0.8, rotation: 15, feather: 0.05, invert: false };
+  const v2 = TimelineEngine.createMediaLayer(proj, { id: 'm_v2', name: 'Clip2.mp4', type: 'video', width: 1080, height: 1920, durationMs: 3000 }, 30, { trackRole: 'main' });
+  TimelineEngine.addToMainTrack(proj, v1);
+  TimelineEngine.addToMainTrack(proj, v2);
+  v1.startFrame = 0; v1.endFrame = 44;
+  v2.startFrame = 45; v2.endFrame = 120;
+
+  const txtOverlay = TimelineEngine.createTextLayer(proj, 0);
+  txtOverlay.startFrame = 0;
+  txtOverlay.endFrame = 120;
+  TimelineEngine.addLayer(proj, txtOverlay);
+  TimelineEngine.normalizeTrackZOrder(proj);
+
+  const mediaMap = new Map([
+    ['m_v1', { id: 'm_v1', type: 'video', fileName: 'clip1.mp4', url: 'https://appassets.androidplatform.net/media/clip1.mp4', width: 1080, height: 1920, durationMs: 3000 }],
+    ['m_v2', { id: 'm_v2', type: 'video', fileName: 'clip2.mp4', url: 'https://appassets.androidplatform.net/media/clip2.mp4', width: 1080, height: 1920, durationMs: 3000 }]
+  ]);
+
+  const offload = renderer.buildNativeGpuScene(proj, 15, mediaMap, true, true, true);
+  assert.equal(offload.offloadBackground, true);
+  assert.equal(offload.offloadedIds.has(v1.id), true, 'Masked/blurred bottom video layer should offload to native GPU');
+  assert.equal(offload.offloadedIds.has(txtOverlay.id), false, 'Top text overlay must stay in WebGL pass');
+  assert.equal(offload.scenePayload.layers.length, 1);
+  assert.equal(offload.scenePayload.layers[0].fileName, 'clip1.mp4');
+  assert.equal(offload.scenePayload.layers[0].maskType, 2);
+  assert.equal(offload.scenePayload.layers[0].blur, 1.5);
+  assert.equal(offload.scenePayload.layers[0].sharpen, 0.3);
+  assert.equal(offload.scenePayload.layers[0].grain, 0.2);
+  assert.equal(offload.scenePayload.prewarm.length, 1, 'Upcoming clip should be included in prewarm list');
+  assert.equal(offload.scenePayload.prewarm[0].fileName, 'clip2.mp4');
+
+  // When offloaded, syncVideoPlayback skips WebView <video> decoding for v1 to prevent double-decoding
+  let createdVids = 0;
+  renderer.getVideoElement = () => { createdVids++; return null; };
+  renderer.setNativeOffloadState(true, offload.offloadedIds);
+  renderer.syncVideoPlayback(proj, 15, mediaMap, true, 1);
+  assert.equal(createdVids, 0, 'WebView must not allocate duplicate <video> decoder for native-offloaded clip');
+});
+
+
+
 

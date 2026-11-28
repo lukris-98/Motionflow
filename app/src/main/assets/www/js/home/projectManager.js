@@ -98,14 +98,21 @@ export class ProjectManager {
     };
   }
 
-  async init() {
+  loadCachedSync() {
     let localMeta = this._readLocalMeta();
     const needsDummyPurge = typeof localStorage === 'undefined' || localStorage.getItem(PURGED_DUMMY_KEY) !== '1';
-
     if (needsDummyPurge) {
       localMeta = localMeta.filter((m) => m && !LEGACY_DUMMY_NAMES.has(m.name));
       this._writeLocalMeta(localMeta);
     }
+    this.projects = localMeta;
+    this._loaded = true;
+    return this.projects;
+  }
+
+  async init() {
+    let localMeta = this.loadCachedSync();
+    const needsDummyPurge = typeof localStorage === 'undefined' || localStorage.getItem(PURGED_DUMMY_KEY) !== '1';
 
     // Reconcile with IndexedDB if available (browser/WebView)
     if (typeof indexedDB !== 'undefined') {

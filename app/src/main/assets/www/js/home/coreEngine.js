@@ -24,6 +24,7 @@ export const DEFAULT_SETTINGS = {
     accentColor: 'cyan'
   },
   performance: {
+    playerEngine: 'native_gpu', // 'native_gpu' | 'webview'
     hardwareAccel: true,
     proxyMode: 'auto',
     lazyThumbnails: true,
@@ -105,6 +106,13 @@ export function formatBytesShort(bytes) {
   return `${(b / Math.pow(k, i)).toFixed(i >= 2 ? 1 : 0)} ${units[i]}`;
 }
 
+function cloneValue(val) {
+  if (typeof structuredClone === 'function') {
+    return structuredClone(val);
+  }
+  return val === undefined ? undefined : JSON.parse(JSON.stringify(val));
+}
+
 export class CoreEngine {
   constructor() {
     this.listeners = new Map();
@@ -125,7 +133,7 @@ export class CoreEngine {
       this.downloads = (this.downloads || []).filter((d) => d && !LEGACY_DUMMY_DOWNLOAD_IDS.has(d.id));
       this._saveJson(DOWNLOADS_KEY, this.downloads);
       if (this.profile?.email === 'creator@lukris.studio') {
-        this.profile = structuredClone(DEFAULT_PROFILE);
+        this.profile = cloneValue(DEFAULT_PROFILE);
         this._saveJson(PROFILE_KEY, this.profile);
       }
       localStorage.setItem(CORE_PURGED_KEY, '1');
@@ -133,17 +141,17 @@ export class CoreEngine {
   }
 
   _loadJson(key, fallback) {
-    if (typeof localStorage === 'undefined') return structuredClone(fallback);
+    if (typeof localStorage === 'undefined') return cloneValue(fallback);
     try {
       const raw = localStorage.getItem(key);
-      if (!raw) return structuredClone(fallback);
+      if (!raw) return cloneValue(fallback);
       const parsed = JSON.parse(raw);
       if (Array.isArray(fallback)) {
-        return Array.isArray(parsed) ? parsed : structuredClone(fallback);
+        return Array.isArray(parsed) ? parsed : cloneValue(fallback);
       }
-      return this._deepMerge(structuredClone(fallback), parsed);
+      return this._deepMerge(cloneValue(fallback), parsed);
     } catch {
-      return structuredClone(fallback);
+      return cloneValue(fallback);
     }
   }
 

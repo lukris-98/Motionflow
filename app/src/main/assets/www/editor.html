@@ -52,6 +52,25 @@
         <i class="bi bi-gear-fill"></i>
       </button>
       <button id="btnQuickExportSpec" class="btn btn-sm btn-dark mf-res-pill" title="Export Resolution &amp; FPS">1080p·30</button>
+      <div class="dropdown flex-shrink-0">
+        <button id="btnToolbarToolsDropdown" type="button" class="btn btn-sm btn-dark mf-tools-dropdown-btn dropdown-toggle" data-bs-toggle="dropdown" data-bs-auto-close="outside" aria-expanded="false" title="Track &amp; Mode 2D/3D" aria-label="Track &amp; Mode 2D/3D">
+          <i class="bi bi-layers-half text-info"></i>
+          <span id="lblToolbarViewMode">2D</span>
+        </button>
+        <div class="dropdown-menu dropdown-menu-end mf-toolbar-dropdown p-2 shadow-lg" aria-labelledby="btnToolbarToolsDropdown">
+          <button id="btnOpenTrackerQuick" type="button" class="dropdown-item mf-dropdown-item rounded d-flex align-items-center justify-content-between gap-2 mb-2" title="Motion &amp; Camera Track" aria-label="Motion Tracker">
+            <span><i class="bi bi-crosshair me-2 text-warning"></i>Track</span>
+            <span id="badgeTrackerState" class="badge bg-warning-subtle text-warning d-none">ON</span>
+          </button>
+          <div class="mf-dropdown-section-label px-1 pb-1">Mode Preview</div>
+          <div class="btn-group btn-group-xs mf-mode-switch w-100" role="group" aria-label="Preview Mode 2D / 3D">
+            <button id="btnPreviewMode2D" type="button" class="btn btn-xs mf-hud-btn active flex-fill" title="Mode Preview Canvas 2D Biasa" aria-label="2D Canvas Mode">2D</button>
+            <button id="btnResetCameraQuick" type="button" class="btn btn-xs mf-hud-btn flex-fill" title="Mode Preview 3D Viewport" aria-label="3D Viewport Mode">
+              <i class="bi bi-badge-3d me-1 text-info"></i>3D
+            </button>
+          </div>
+        </div>
+      </div>
       <button id="btnOpenExport" class="btn btn-sm mf-btn-accent fw-semibold px-2 mf-export-btn">
         <i class="bi bi-film me-1"></i>Export
       </button>
@@ -63,25 +82,6 @@
     <div id="previewStage" class="mf-preview-stage position-relative d-flex align-items-center justify-content-center">
       <canvas id="previewCanvas" class="mf-preview-canvas"></canvas>
       <canvas id="overlayCanvas" class="mf-overlay-canvas"></canvas>
-    </div>
-
-    <!-- Floating Preview HUD -->
-    <div class="mf-preview-hud-top position-absolute top-0 start-0 end-0 d-flex align-items-center justify-content-between gap-1 px-2 pt-1 pointer-none">
-      <span id="hudResFps" class="badge mf-hud-pill min-w-0 text-truncate">1280×720 · 30 FPS</span>
-      <div class="d-flex gap-1 flex-shrink-0 pointer-auto">
-        <button id="btnOpenTrackerQuick" class="btn btn-xs mf-hud-btn" title="Motion &amp; Camera Track" aria-label="Motion Tracker">
-          <i class="bi bi-crosshair me-1 text-warning"></i>Track
-        </button>
-        <button id="btnToggleGrid" class="btn btn-xs mf-hud-btn" title="Toggle Safe Grid" aria-label="Toggle Safe Grid">
-          <i class="bi bi-grid-3x3"></i>
-        </button>
-        <div class="btn-group btn-group-xs mf-mode-switch" role="group" aria-label="Preview Mode 2D / 3D">
-          <button id="btnPreviewMode2D" type="button" class="btn btn-xs mf-hud-btn active" title="Mode Preview Canvas 2D Biasa" aria-label="2D Canvas Mode">2D</button>
-          <button id="btnResetCameraQuick" type="button" class="btn btn-xs mf-hud-btn" title="Mode Preview 3D Viewport" aria-label="3D Viewport Mode">
-            <i class="bi bi-badge-3d me-1 text-info"></i>3D
-          </button>
-        </div>
-      </div>
     </div>
 
     <!-- Blender-Style 3D Viewport Mini-HUD -->
@@ -637,6 +637,22 @@
                 <button type="button" id="btnThemeLight" class="btn btn-dark border-secondary-subtle px-2 py-1" data-theme-opt="light"><i class="bi bi-sun-fill me-1"></i>Light</button>
               </div>
               <input type="hidden" id="selProjectTheme" value="dark" />
+            </div>
+            <div class="d-flex align-items-center justify-content-between gap-2 pt-2 mt-1 border-top border-secondary-subtle">
+              <div class="min-w-0">
+                <label class="small mb-0 fw-semibold" for="selSettingPlayerEngine"><i class="bi bi-gpu-card me-1 text-info"></i>Player Engine Mode</label>
+                <div id="lblSettingEngineStatus" class="text-secondary" style="font-size: 0.7rem;">Native GPU (MediaCodec + GLES) vs WebView</div>
+              </div>
+              <select id="selSettingPlayerEngine" class="form-select form-select-sm w-auto" style="max-width: 195px;">
+                <option value="native_gpu">Native GPU (MediaCodec + GLES)</option>
+                <option value="webview">WebView (HTML5 + WebGL)</option>
+              </select>
+            </div>
+            <div class="d-flex align-items-center justify-content-between py-1 mt-1 border-top border-secondary-subtle">
+              <label class="small mb-0" for="chkSettingGpuAccel"><i class="bi bi-lightning-charge-fill me-1 text-warning"></i>Prioritaskan GPU Hardware (Bukan CPU Saja)</label>
+              <div class="form-check form-switch m-0">
+                <input class="form-check-input" type="checkbox" id="chkSettingGpuAccel" checked />
+              </div>
             </div>
             <div class="d-flex align-items-center justify-content-between gap-2 pt-2 mt-1 border-top border-secondary-subtle">
               <div class="min-w-0">

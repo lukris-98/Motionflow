@@ -350,5 +350,25 @@ test('App launches to Home menu first and Editor requires an explicitly selected
   assert.ok(!topHeaderSrc.includes('lk-header-actions d-flex align-items-center gap-2 ms-auto'));
 });
 
+test('Home Settings & CoreEngine support switching playerEngine between native_gpu and webview with GPU toggle', () => {
+  memStore.clear();
+  const core = new CoreEngine();
+  assert.equal(core.settings.performance.playerEngine, 'native_gpu');
+  assert.equal(core.settings.performance.hardwareAccel, true);
+
+  core.updateSettings({ performance: { playerEngine: 'webview', hardwareAccel: false } });
+  const reloaded = new CoreEngine();
+  assert.equal(reloaded.settings.performance.playerEngine, 'webview');
+  assert.equal(reloaded.settings.performance.hardwareAccel, false);
+
+  const dialogsSrc = fs.readFileSync(path.resolve('app/src/main/assets/www/js/home/components/dialogs/Dialogs.js'), 'utf8');
+  assert.ok(dialogsSrc.includes('id="selHomePlayerEngine"'));
+  assert.ok(dialogsSrc.includes('data-setting="performance.playerEngine"'));
+  assert.ok(dialogsSrc.includes('value="native_gpu"'));
+  assert.ok(dialogsSrc.includes('value="webview"'));
+  assert.ok(dialogsSrc.includes('getNativePlayerCapabilities'));
+});
+
+
 
 

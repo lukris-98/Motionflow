@@ -190,7 +190,7 @@ class MediaStorageHelper(private val context: Context) {
     }
 
     private fun saveScaledThumbnail(src: Bitmap, outFile: File) {
-        val maxDim = 320
+        val maxDim = 240
         val scale = minOf(maxDim.toFloat() / src.width, maxDim.toFloat() / src.height, 1f)
         val targetW = (src.width * scale).toInt().coerceAtLeast(1)
         val targetH = (src.height * scale).toInt().coerceAtLeast(1)
@@ -200,7 +200,7 @@ class MediaStorageHelper(private val context: Context) {
             src
         }
         FileOutputStream(outFile).use { fos ->
-            scaled.compress(Bitmap.CompressFormat.JPEG, 82, fos)
+            scaled.compress(Bitmap.CompressFormat.JPEG, 76, fos)
         }
         if (scaled !== src) scaled.recycle()
     }
@@ -448,8 +448,12 @@ class MediaStorageHelper(private val context: Context) {
         return try {
             val stream = BufferedInputStream(context.assets.open(assetPath), 16 * 1024)
             val mime = guessMimeType(assetPath)
-            val isStaticImmutable = !assetPath.endsWith(".html", ignoreCase = true)
-            val cacheHeader = if (isStaticImmutable) "public, max-age=86400" else "no-cache"
+            val isVendorImmutable = assetPath.startsWith("www/vendor/", ignoreCase = true)
+            val cacheHeader = if (isVendorImmutable) {
+                "public, max-age=86400"
+            } else {
+                "no-cache, no-store, must-revalidate"
+            }
             val headers = mapOf(
                 "Access-Control-Allow-Origin" to "*",
                 "Cache-Control" to cacheHeader
@@ -482,18 +486,37 @@ class MediaStorageHelper(private val context: Context) {
                 start = (totalSize - endRaw).coerceAtLeast(0L)
                 end = totalSize - 1
             } else {
-                start = (startRaw ?: 0L).coerceIn(0L, totalSize - 1)
+                start = (startRaw ?: 0L).coerceAtLeast(0L)
+                if (start >= totalSize) {
+                    val headers = mapOf(
+                        "Accept-Ranges" to "bytes",
+                        "Content-Range" to "bytes */$totalSize",
+                        "Access-Control-Allow-Origin" to "*"
+                    )
+                    return WebResourceResponse(
+                        "text/plain",
+                        "UTF-8",
+                        416,
+                        "Range Not Satisfiable",
+                        headers,
+                        ByteArrayInputStream(ByteArray(0))
+                    )
+                }
                 end = (endRaw ?: (totalSize - 1)).coerceIn(start, totalSize - 1)
             }
             val length = (end - start + 1).coerceAtLeast(0L)
 
             val fis = FileInputStream(file)
             if (start > 0) {
-                var skipped = 0L
-                while (skipped < start) {
-                    val s = fis.skip(start - skipped)
-                    if (s <= 0) break
-                    skipped += s
+                try {
+                    fis.channel.position(start)
+                } catch (_: Exception) {
+                    var skipped = 0L
+                    while (skipped < start) {
+                        val s = fis.skip(start - skipped)
+                        if (s <= 0) break
+                        skipped += s
+                    }
                 }
             }
             val bounded = BoundedInputStream(fis, length)

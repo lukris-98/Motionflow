@@ -35,9 +35,15 @@ export class RendererEngine {
     this.maxPreviewSide = 854;
     this.maxPreviewImageSide = 1280;
     this.maxVideoDecoders = 3;
+    this.preferGpu = true;
+    this.offloadBackground = false;
+    this.fullNativeOffload = false;
+    this.offloadedLayerIds = new Set();
+    this._overlayWasDirty = true;
+    this._lastCanvasArStr = '';
 
-    this.glPreview = this.createWebGLCompositor(this.canvas, false);
-    this.ctx2dFallback = this.glPreview ? null : this.canvas.getContext('2d', { alpha: false });
+    this.glPreview = null;
+    this.ctx2dFallback = null;
     this._fallback2dCanvas = null;
     this.exportCompositors = new WeakMap();
     this.lastOverlayBox = null;
@@ -50,6 +56,481 @@ export class RendererEngine {
     this.viewport3D = { enabled: false, tool: 'move', viewMode: 'camera', axisLock: 'free', sceneCam: null };
     this.pending3DLayerPose = null;
     this.pending3DCamPose = null;
+  }
+
+  ensurePreviewCompositor() {
+    if (this.glPreview && !this.glPreview.contextLost && !this.glPreview.gl?.isContextLost?.()) {
+      return this.glPreview;
+    }
+    this.glPreview = this.createWebGLCompositor(this.canvas, false);
+    if (!this.glPreview && !this.ctx2dFallback) {
+      this.ctx2dFallback = this.canvas.getContext('2d', { alpha: true });
+    }
+    return this.glPreview;
+  }
+
+  disposePreviewCompositor() {
+    const comp = this.glPreview;
+    if (comp) {
+      try {
+        const { gl } = comp;
+        if (gl) {
+          for (const tex of comp.textures?.values?.() || []) {
+            try { gl.deleteTexture(tex); } catch {}
+          }
+          if (comp.adjTex) try { gl.deleteTexture(comp.adjTex); } catch {}
+          if (comp.fxTexA) try { gl.deleteTexture(comp.fxTexA); } catch {}
+          if (comp.fxTexB) try { gl.deleteTexture(comp.fxTexB); } catch {}
+          if (comp.fxFboA) try { gl.deleteFramebuffer(comp.fxFboA); } catch {}
+          if (comp.fxFboB) try { gl.deleteFramebuffer(comp.fxFboB); } catch {}
+          if (comp.posBuf) try { gl.deleteBuffer(comp.posBuf); } catch {}
+          if (comp.fboPosBuf) try { gl.deleteBuffer(comp.fboPosBuf); } catch {}
+          if (comp.prog) try { gl.deleteProgram(comp.prog); } catch {}
+        }
+        comp.textures?.clear?.();
+        comp.textureMeta?.clear?.();
+      } catch {}
+    }
+    this.glPreview = null;
+    this.ctx2dFallback = null;
+  }
+
+  setGpuPreference(preferGpu = true, proxyMode = 'auto') {
+    this.preferGpu = Boolean(preferGpu);
+    if (proxyMode === 'full') {
+      this.maxPreviewSide = 1280;
+      this.maxPreviewImageSide = 1920;
+    } else if (proxyMode === 'half') {
+      this.maxPreviewSide = 640;
+      this.maxPreviewImageSide = 960;
+    } else {
+      this.maxPreviewSide = this.preferGpu ? 960 : 720;
+      this.maxPreviewImageSide = this.preferGpu ? 1440 : 1080;
+    }
+    this.maxVideoDecoders = this.preferGpu ? 3 : 2;
+  }
+
+  setNativeOffloadState(offloadBg = false, offloadedIds = null, fullNative = false) {
+    this.offloadBackground = Boolean(offloadBg);
+    this.fullNativeOffload = Boolean(fullNative);
+    this.offloadedLayerIds = offloadedIds instanceof Set ? offloadedIds : new Set(offloadedIds || []);
+  }
+
+  _encodeDrawableForNative(texKey, el, token, uploadedTokens, textureUploads) {
+    const tokStr = String(token ?? '1');
+    if (uploadedTokens && uploadedTokens.get(texKey) === tokStr) {
+      return;
+    }
+    let dataUrl = '';
+    try {
+      if (typeof el?.toDataURL === 'function') {
+        dataUrl = el.toDataURL('image/png');
+      } else if (typeof document !== 'undefined' && el) {
+        const w = Math.max(2, el.naturalWidth || el.width || 128);
+        const h = Math.max(2, el.naturalHeight || el.height || 128);
+        const c = document.createElement('canvas');
+        c.width = w;
+        c.height = h;
+        c.getContext('2d')?.drawImage(el, 0, 0, w, h);
+        dataUrl = c.toDataURL('image/png');
+      }
+    } catch {}
+    textureUploads.push({ texKey, token: tokStr, dataUrl });
+  }
+
+  buildNativeGpuScene(project, frame, mediaMap, isPlaying = false, isFlat2DPreview = false, allowPending = true, opts = {}) {
+    const fullNative = Boolean(opts?.fullNative);
+    const uploadedTokens = opts?.uploadedTokens instanceof Map ? opts.uploadedTokens : null;
+    const empty = { offloadBackground: false, fullNative: false, offloadedIds: new Set(), scenePayload: null, textureUploads: [] };
+    if (!project || !Array.isArray(project.layers)) return empty;
+    const bgMode = project.backgroundMode || 'color';
+    if (!fullNative && bgMode !== 'color') return empty;
+
+    const fps = Math.max(1, project.fps || 30);
+    const camEnabled = !isFlat2DPreview && (Boolean(project.camera?.enabled) || (allowPending && Boolean(this.viewport3D?.enabled)));
+    const camMotionBlur = camEnabled && this.viewport3D?.viewMode !== 'scene' && Boolean(project.camera?.motionBlur);
+    if (!fullNative && camMotionBlur) {
+      return empty;
+    }
+
+    const fovRad = (45 * Math.PI) / 180;
+    const aspect = project.width / Math.max(1, project.height);
+    const camDist = (project.height / 2) / Math.tan(fovRad / 2);
+    const projMat = isFlat2DPreview
+      ? Mat4.ortho(-project.width / 2, project.width / 2, -project.height / 2, project.height / 2, -5000, 5000)
+      : Mat4.perspective(fovRad, aspect, 10, camDist * 20);
+
+    const buildViewMat = (sampleFrame) => {
+      let vm = Mat4.identity();
+      if (!isFlat2DPreview) {
+        vm = Mat4.translate(vm, 0, 0, -camDist);
+      }
+      if (camEnabled) {
+        const cam = this.resolveEffectiveCamera(project, sampleFrame, isFlat2DPreview, allowPending);
+        vm = Mat4.scale(vm, cam.zoom, cam.zoom, 1);
+        vm = Mat4.rotateZ(vm, (-cam.rotZ * Math.PI) / 180);
+        vm = Mat4.rotateX(vm, (cam.rotX * Math.PI) / 180);
+        vm = Mat4.rotateY(vm, (cam.rotY * Math.PI) / 180);
+        vm = Mat4.translate(vm, -cam.x, cam.y, -cam.z);
+      }
+      return vm;
+    };
+
+    const extractFileName = (item) => {
+      if (!item) return '';
+      if (item.fileName) return String(item.fileName);
+      const u = String(item.url || '');
+      const m = u.match(/\/media\/([^/?#]+)/);
+      return m ? m[1] : '';
+    };
+
+    const layersById = new Map(project.layers.map((l) => [l.id, l]));
+    const offloadedIds = new Set();
+    const nativeLayers = [];
+    const textureUploads = [];
+    const samples = (fullNative && camMotionBlur) ? Math.max(2, Math.min(6, project.camera.motionBlurSamples || 4)) : 1;
+
+    const buildSerializedLayer = (layer, subFrame, masterAlpha, viewMat, allowMotionSubPasses) => {
+      if (!layer.visible || layer.type === 'audio' || layer.type === 'group' || layer.type === 'camera') return null;
+      if (subFrame < layer.startFrame || subFrame > layer.endFrame) return null;
+
+      let parentTf = null;
+      if (layer.parentId) {
+        const parent = layersById.get(layer.parentId);
+        if (parent) {
+          if (!parent.visible || subFrame < parent.startFrame || subFrame > parent.endFrame) return null;
+          parentTf = this.resolveEffectiveTransform(parent, subFrame, allowPending);
+        }
+      }
+
+      const isAdjustment = layer.type === 'adjustment';
+      if (isAdjustment && !fullNative) return 'STOP';
+
+      const mediaItem = mediaMap.get(layer.mediaId);
+      const fileName = extractFileName(mediaItem);
+      const fx = layer.fx || {};
+      const vfxList = TimelineEngine.getActiveVfxList(layer);
+      const hasHsl = Array.isArray(fx.hsl) && fx.hsl.some((ch) => (ch?.[0] || 0) !== 0 || (ch?.[1] || 0) !== 0 || (ch?.[2] || 0) !== 0);
+      const hasOutline = Number(fx.outlineWidth) > 0.05;
+      const hasColorKf = layer.keyframes?.color?.length > 0;
+      const isAutoBg = fx.removeBgMode === 'auto';
+
+      if (!fullNative) {
+        if (layer.type !== 'video' && layer.type !== 'image') return 'STOP';
+        if (!mediaItem || !fileName || mediaItem.isGif) return 'STOP';
+        if (layer.motionBlur?.enabled) return 'STOP';
+        if (isAutoBg || vfxList.length > 0 || hasHsl || hasOutline || hasColorKf) return 'STOP';
+      }
+
+      const computePoseMvpAlpha = (poseFrame, lsAlpha) => {
+        const pTf = poseFrame !== subFrame && layer.parentId && layersById.get(layer.parentId)
+          ? this.resolveEffectiveTransform(layersById.get(layer.parentId), poseFrame, allowPending)
+          : parentTf;
+        const tf = this.resolveEffectiveTransform(layer, poseFrame, allowPending);
+        const trState = this.computeTransitionState(layer, poseFrame, project.width, project.height);
+        let alpha = (isAdjustment ? 1.0 : masterAlpha * lsAlpha) * Math.max(0, Math.min(1, tf.opacity)) * trState.alphaMul;
+        if (pTf) alpha *= Math.max(0, Math.min(1, pTf.opacity));
+        if (!Number.isFinite(alpha)) alpha = 1;
+        return { pTf, tf, trState, alpha };
+      };
+
+      let nativeType = layer.type;
+      let texKey = '';
+      let texW = Math.max(16, Number(layer.width) || Number(mediaItem?.width) || project.width || 1280);
+      let texH = Math.max(16, Number(layer.height) || Number(mediaItem?.height) || project.height || 720);
+      let resolvedFileName = fileName;
+      let resolvedMediaId = mediaItem?.id || '';
+
+      if (isAdjustment) {
+        nativeType = 'adjustment';
+        texW = Math.max(16, project.width || 1280);
+        texH = Math.max(16, project.height || 720);
+      } else if (layer.type === 'text' || layer.type === 'shape') {
+        const drawable = this.resolveProcessedDrawable(layer, subFrame, fps, mediaMap, false);
+        if (!drawable || !drawable.el) return null;
+        nativeType = 'uploaded';
+        texKey = layer.id;
+        texW = Math.max(16, drawable.w || layer.width || 256);
+        texH = Math.max(16, drawable.h || layer.height || 128);
+        this._encodeDrawableForNative(texKey, drawable.el, drawable.token ?? 1, uploadedTokens, textureUploads);
+      } else if (layer.type === 'image') {
+        const isDirectFile = Boolean(mediaItem && !mediaItem.isGif && fileName && !String(mediaItem.url || '').startsWith('data:'));
+        if (!isDirectFile || isAutoBg) {
+          const drawable = this.resolveProcessedDrawable(layer, subFrame, fps, mediaMap, false);
+          if (!drawable || !drawable.el) return null;
+          nativeType = 'uploaded';
+          texKey = drawable.cacheKey || `${layer.id}__img`;
+          texW = Math.max(16, drawable.w || layer.width || 256);
+          texH = Math.max(16, drawable.h || layer.height || 256);
+          this._encodeDrawableForNative(texKey, drawable.el, drawable.token ?? mediaItem?.url ?? 1, uploadedTokens, textureUploads);
+        }
+      } else if (layer.type === 'video') {
+        if (!mediaItem) return null;
+        if (isAutoBg || !fileName) {
+          const drawable = this.resolveProcessedDrawable(layer, subFrame, fps, mediaMap, false);
+          if (!drawable || !drawable.el) return null;
+          nativeType = 'uploaded';
+          texKey = drawable.cacheKey || `${layer.id}__vid`;
+          texW = Math.max(16, drawable.w || layer.width || 256);
+          texH = Math.max(16, drawable.h || layer.height || 256);
+          this._encodeDrawableForNative(texKey, drawable.el, drawable.token ?? Math.round(subFrame), uploadedTokens, textureUploads);
+        }
+      } else {
+        return null;
+      }
+
+      const buildMvp = (pTf, tf, trState) => {
+        if (isAdjustment) return Array.from(Mat4.scale(Mat4.identity(), 2, 2, 1));
+        let model = Mat4.identity();
+        if (pTf) {
+          model = Mat4.translate(model, pTf.x, -pTf.y, isFlat2DPreview ? 0 : (pTf.z || 0));
+          model = Mat4.rotateZ(model, (-pTf.rotation * Math.PI) / 180);
+          if (!isFlat2DPreview) {
+            model = Mat4.rotateX(model, ((pTf.rotX || 0) * Math.PI) / 180);
+            model = Mat4.rotateY(model, ((pTf.rotY || 0) * Math.PI) / 180);
+          }
+          model = Mat4.scale(model, pTf.scaleX, pTf.scaleY, 1);
+        }
+        const flipSX = layer.flipX ? -1 : 1;
+        const flipSY = layer.flipY ? -1 : 1;
+        model = Mat4.translate(model, tf.x + trState.dx, -(tf.y + trState.dy), isFlat2DPreview ? 0 : (tf.z || 0));
+        model = Mat4.rotateZ(model, (-(tf.rotation + (trState.rotDelta || 0)) * Math.PI) / 180);
+        if (!isFlat2DPreview) {
+          model = Mat4.rotateX(model, ((tf.rotX || 0) * Math.PI) / 180);
+          model = Mat4.rotateY(model, ((tf.rotY || 0) * Math.PI) / 180);
+        }
+        model = Mat4.scale(model, tf.scaleX * trState.scaleMul * flipSX, tf.scaleY * trState.scaleMul * flipSY, 1);
+        model = Mat4.translate(model, -tf.anchorX, tf.anchorY, 0);
+        model = Mat4.scale(model, texW, texH, 1);
+        return Array.from(Mat4.multiply(projMat, Mat4.multiply(viewMat, model)));
+      };
+
+      const layerMb = layer.motionBlur || {};
+      const mbStrength = Math.max(0.1, Math.min(1.5, Number(layerMb.strength) || 0.7));
+      const layerMbActive = fullNative && !isAdjustment && allowMotionSubPasses &&
+        Boolean(layerMb.enabled) &&
+        this.hasLayerMotionVelocity(layer, frame, project.width, project.height, allowPending);
+
+      let subPasses = null;
+      if (layerMbActive) {
+        const mbWeights = [0.64, 0.45, 0.34, 0.26, 0.20, 0.15];
+        subPasses = [];
+        for (let ls = 5; ls >= 0; ls--) {
+          const effFrame = Math.max(layer.startFrame, Math.min(layer.endFrame, frame - (ls / 5) * 0.9 * mbStrength));
+          const pose = computePoseMvpAlpha(effFrame, mbWeights[ls]);
+          const tSec = layer.type === 'video' ? this._computeVideoTargetTime(layer, effFrame, fps, null, mediaItem) : 0;
+          subPasses.push({
+            mvp: buildMvp(pose.pTf, pose.tf, pose.trState),
+            alpha: pose.alpha,
+            timeMs: Math.max(0, Math.round(tSec * 1000)),
+            timeSec: (effFrame - layer.startFrame) / fps
+          });
+        }
+      }
+
+      const mainPose = computePoseMvpAlpha(subFrame, 1.0);
+      const mvp = buildMvp(mainPose.pTf, mainPose.tf, mainPose.trState);
+      const adjScale = isAdjustment ? this.getAdjustmentIntensityScale(layer, subFrame) : 1;
+      const keyRgb = this.hexToRgb01(fx.chromaColor || '#00FF00');
+      const outRgb = this.hexToRgb01(fx.outlineColor || '#FFFFFF');
+      const chromaOn = !isAdjustment && !isAutoBg && fx.removeBgMode !== 'none' && (fx.removeBgMode === 'chroma' || Boolean(fx.chromaEnabled));
+      const crop = layer.crop || {};
+      const mask = layer.mask || {};
+      const maskSpec = MASK_PRESETS.find((m) => m.id === mask.type);
+      const maskShaderType = maskSpec ? maskSpec.shaderType : 0;
+      const timeSec = layer.type === 'video' ? this._computeVideoTargetTime(layer, subFrame, fps, null, mediaItem) : 0;
+      const stab = (!isAdjustment && fullNative) ? getStabilizerAtFrame(layer, subFrame, fps) : { dx: 0, dy: 0, rot: 0, cropScale: 1 };
+
+      let hslFlat = null;
+      if (fullNative && hasHsl && Array.isArray(fx.hsl) && fx.hsl.length === 8) {
+        hslFlat = [];
+        for (let cIdx = 0; cIdx < 8; cIdx++) {
+          const ch = fx.hsl[cIdx] || [0, 0, 0];
+          hslFlat.push(Number(ch[0]) || 0, Number(ch[1]) || 0, Number(ch[2]) || 0);
+        }
+      }
+
+      let colorTint = null;
+      if (fullNative && layer.type !== 'text' && layer.type !== 'shape' && hasColorKf) {
+        const tintHex = KeyframeEngine.getColorAtFrame(layer, subFrame, fx.tintColor || '#FFFFFF');
+        const [tr, tg, tb] = this.hexToRgb01(tintHex);
+        colorTint = [tr, tg, tb, 0.45];
+      }
+
+      const serializedVfx = fullNative
+        ? vfxList.map((vItem) => {
+            const spec = VIDEO_EFFECT_PRESETS.find((v) => v.id === vItem.type);
+            return {
+              shaderId: spec ? spec.shaderId : 0,
+              intensity: (vItem.intensity ?? 0.65) * adjScale,
+              timeSec: ((subFrame - layer.startFrame) / fps) * (vItem.speed || 1)
+            };
+          }).filter((v) => v.shaderId > 0 && v.intensity > 0.01)
+        : undefined;
+
+      return {
+        id: layer.id,
+        type: nativeType,
+        mediaId: resolvedMediaId,
+        fileName: resolvedFileName,
+        texKey,
+        timeMs: Math.max(0, Math.round(timeSec * 1000)),
+        timeSec: (subFrame - layer.startFrame) / fps,
+        texW,
+        texH,
+        reversed: Boolean(layer.reversed),
+        mvp,
+        alpha: mainPose.alpha,
+        brightness: ((Number(fx.brightness) || 0) * adjScale) + (mainPose.trState.brightDelta || 0),
+        contrast: 1 + ((fx.contrast ?? 1) - 1) * adjScale,
+        saturation: 1 + ((fx.saturation ?? 1) - 1) * adjScale,
+        temperature: (Number(fx.temperature) || 0) * adjScale,
+        tint: (Number(fx.tint) || 0) * adjScale,
+        exposure: (Number(fx.exposure) || 0) * adjScale,
+        highlights: (Number(fx.highlights) || 0) * adjScale,
+        shadows: (Number(fx.shadows) || 0) * adjScale,
+        fade: (Number(fx.fade) || 0) * adjScale,
+        sharpen: (Number(fx.sharpen) || 0) * adjScale,
+        blur: ((Number(fx.blur) || 0) * adjScale) + (mainPose.trState.blurDelta || 0),
+        vignette: (Number(fx.vignette) || 0) * adjScale,
+        grain: (Number(fx.grain) || 0) * adjScale,
+        chromaOn,
+        chromaR: keyRgb[0],
+        chromaG: keyRgb[1],
+        chromaB: keyRgb[2],
+        chromaSim: fx.chromaSimilarity ?? 0.35,
+        chromaSmooth: fx.chromaSmoothness ?? 0.12,
+        chromaSpill: fx.chromaSpill ?? 0.5,
+        outlineW: isAdjustment ? 0 : (Number(fx.outlineWidth) || 0),
+        outlineRgb: outRgb,
+        maskType: maskShaderType,
+        maskOffsetX: Number(mask.offsetX) || 0,
+        maskOffsetY: Number(mask.offsetY) || 0,
+        maskScaleX: mask.scaleX ?? 0.85,
+        maskScaleY: mask.scaleY ?? 0.85,
+        maskRot: ((Number(mask.rotation) || 0) * Math.PI) / 180,
+        maskFeather: mask.feather ?? 0.05,
+        maskInvert: Boolean(mask.invert),
+        cropL: Number(crop.left) || 0,
+        cropT: Number(crop.top) || 0,
+        cropR: Number(crop.right) || 0,
+        cropB: Number(crop.bottom) || 0,
+        stabDx: stab.dx / Math.max(1, texW),
+        stabDy: stab.dy / Math.max(1, texH),
+        stabRot: stab.rot || 0,
+        stabScale: stab.cropScale || 1,
+        wipeType: mainPose.trState.wipeType || 0,
+        wipeProgress: mainPose.trState.wipeProgress ?? 1,
+        blendMode: layer.blendMode || 'normal',
+        ...(serializedVfx && serializedVfx.length > 0 ? { vfx: serializedVfx } : {}),
+        ...(hslFlat ? { hsl: hslFlat } : {}),
+        ...(colorTint ? { colorTint } : {}),
+        ...(subPasses && subPasses.length > 1 ? { subPasses } : {})
+      };
+    };
+
+    for (let s = samples - 1; s >= 0; s--) {
+      const subFrame = samples === 1 ? frame : frame - (s / samples) * 0.65;
+      const masterAlpha = samples === 1 ? 1.0 : (s === 0 ? 0.85 : 0.22);
+      const viewMat = buildViewMat(subFrame);
+      let stoppedEarly = false;
+      for (let i = project.layers.length - 1; i >= 0; i--) {
+        const layer = project.layers[i];
+        if (layer.type === 'adjustment' && s > 0) continue;
+        const entry = buildSerializedLayer(layer, subFrame, masterAlpha, viewMat, samples === 1);
+        if (entry === 'STOP') {
+          stoppedEarly = true;
+          break;
+        }
+        if (entry) {
+          offloadedIds.add(layer.id);
+          nativeLayers.push(entry);
+        }
+      }
+      if (stoppedEarly) break;
+    }
+
+    let bgLayer = null;
+    if (fullNative && bgMode === 'blur') {
+      const topMedia = [...project.layers].reverse().find(
+        (l) => l.visible && (l.type === 'video' || l.type === 'image') && frame >= l.startFrame && frame <= l.endFrame
+      );
+      if (topMedia) {
+        const bgItem = mediaMap.get(topMedia.mediaId);
+        const bgFn = extractFileName(bgItem);
+        const bw = Math.max(16, Number(bgItem?.width) || Number(topMedia.width) || project.width || 1280);
+        const bh = Math.max(16, Number(bgItem?.height) || Number(topMedia.height) || project.height || 720);
+        const scaleCover = Math.max(project.width / bw, project.height / bh);
+        const sxCover = (bw * scaleCover) / project.width * 2;
+        const syCover = (bh * scaleCover) / project.height * 2;
+        const bgTimeSec = topMedia.type === 'video' ? this._computeVideoTargetTime(topMedia, frame, fps, null, bgItem) : 0;
+        let bgNativeType = topMedia.type;
+        let bgTexKey = '';
+        const needsUpload = !bgItem || bgItem.isGif || !bgFn || String(bgItem.url || '').startsWith('data:');
+        if (needsUpload) {
+          const drawable = this.resolveLayerDrawable(topMedia, frame, fps, mediaMap, false);
+          if (drawable?.el) {
+            bgNativeType = 'uploaded';
+            bgTexKey = `${topMedia.id}__bgblur`;
+            this._encodeDrawableForNative(bgTexKey, drawable.el, drawable.token ?? frame, uploadedTokens, textureUploads);
+          }
+        }
+        if (bgItem && (!needsUpload || bgTexKey)) {
+          bgLayer = {
+            id: '__bg_blur__',
+            type: bgNativeType,
+            mediaId: bgItem.id,
+            fileName: bgFn,
+            texKey: bgTexKey,
+            timeMs: Math.max(0, Math.round(bgTimeSec * 1000)),
+            timeSec: 0,
+            texW: bw,
+            texH: bh,
+            reversed: Boolean(topMedia.reversed),
+            mvp: Array.from(Mat4.scale(Mat4.identity(), sxCover, syCover, 1)),
+            alpha: 1,
+            brightness: -0.14,
+            contrast: 1,
+            saturation: 1,
+            blur: 3.5 + (project.backgroundBlurLevel ?? 2) * 3.0,
+            blendMode: 'normal'
+          };
+        }
+      }
+    }
+
+    // Collect lookahead clips for instant cut transitions
+    const prewarm = [];
+    const lookaheadFrames = Math.round(fps * 1.5);
+    const seenIds = new Set(nativeLayers.filter((l) => l.type === 'video').map((l) => l.mediaId));
+    for (const l of project.layers) {
+      if (l.type !== 'video' || !l.visible || !l.mediaId) continue;
+      if (l.startFrame <= frame || l.startFrame > frame + lookaheadFrames) continue;
+      const item = mediaMap.get(l.mediaId);
+      const fn = extractFileName(item);
+      if (!item || !fn || seenIds.has(item.id)) continue;
+      seenIds.add(item.id);
+      const entrySec = this._computeVideoTargetTime(l, l.startFrame, fps, null, item);
+      prewarm.push({ mediaId: item.id, fileName: fn, entryTimeMs: Math.max(0, Math.round(entrySec * 1000)) });
+      if (prewarm.length >= 2) break;
+    }
+
+    return {
+      offloadBackground: true,
+      fullNative,
+      offloadedIds,
+      textureUploads,
+      scenePayload: {
+        bgMode: fullNative ? bgMode : 'color',
+        bgHex: project.backgroundColor || '#05070B',
+        grad0: project.backgroundGradient?.[0] || '#0F172A',
+        grad1: project.backgroundGradient?.[1] || '#1E1B4B',
+        ...(bgLayer ? { bgLayer } : {}),
+        isPlaying: Boolean(isPlaying),
+        layers: nativeLayers,
+        prewarm
+      }
+    };
   }
 
   setChromaPickerOverlay(state) {
@@ -281,11 +762,15 @@ export class RendererEngine {
     if (project) {
       this.pruneUnusedCaches(project);
     }
-    this.videoLastFrameCache.clear();
-    if (level >= 60) {
+    if (level >= 80) {
+      this.videoLastFrameCache.clear();
       this.rasterCache.clear();
       this.previewImageCache.clear();
       this.maxVideoDecoders = 1;
+    } else if (level >= 60) {
+      this.rasterCache.clear();
+      this.previewImageCache.clear();
+      this.maxVideoDecoders = 2;
     } else if (this.previewImageCache.size > 16) {
       const drop = this.previewImageCache.size - 16;
       let i = 0;
@@ -299,11 +784,11 @@ export class RendererEngine {
 
   createWebGLCompositor(canvas, antialias = true) {
     const gl = canvas.getContext('webgl', {
-      alpha: false,
+      alpha: !antialias,
       preserveDrawingBuffer: true,
       antialias: Boolean(antialias),
       desynchronized: !antialias,
-      powerPreference: 'default'
+      powerPreference: this.preferGpu ? 'high-performance' : 'default'
     });
     if (!gl) return null;
     if (typeof canvas.addEventListener === 'function' && !canvas._mfGlListenersAttached) {
@@ -1017,7 +1502,9 @@ export class RendererEngine {
 
     if (typeof gl.activeTexture === 'function') gl.activeTexture(gl.TEXTURE0);
     let tex = textures.get(key);
+    let isNewTex = false;
     if (!tex) {
+      isNewTex = true;
       tex = gl.createTexture();
       gl.bindTexture(gl.TEXTURE_2D, tex);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
@@ -1048,6 +1535,15 @@ export class RendererEngine {
           return tex;
         }
       }
+    }
+
+    if (sw <= 0 || sh <= 0) {
+      if (isNewTex && typeof Uint8Array !== 'undefined') {
+        try {
+          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([0, 0, 0, 0]));
+        } catch {}
+      }
+      return tex;
     }
 
     try {
@@ -1111,19 +1607,26 @@ export class RendererEngine {
         }
       }
     } catch {
+      let recovered = false;
       if (sw > 0 && sh > 0) {
-        if (!this._safeTexCanvas) this._safeTexCanvas = document.createElement('canvas');
-        const tw = Math.min(1920, sw);
-        const th = Math.min(1920, sh);
-        if (this._safeTexCanvas.width !== tw || this._safeTexCanvas.height !== th) {
-          this._safeTexCanvas.width = tw;
-          this._safeTexCanvas.height = th;
-        }
-        const sctx = this._safeTexCanvas.getContext('2d');
-        sctx.clearRect(0, 0, tw, th);
-        sctx.drawImage(sourceEl, 0, 0, tw, th);
         try {
+          if (!this._safeTexCanvas) this._safeTexCanvas = document.createElement('canvas');
+          const tw = Math.min(1920, sw);
+          const th = Math.min(1920, sh);
+          if (this._safeTexCanvas.width !== tw || this._safeTexCanvas.height !== th) {
+            this._safeTexCanvas.width = tw;
+            this._safeTexCanvas.height = th;
+          }
+          const sctx = this._safeTexCanvas.getContext('2d');
+          sctx.clearRect(0, 0, tw, th);
+          sctx.drawImage(sourceEl, 0, 0, tw, th);
           gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, this._safeTexCanvas);
+          recovered = true;
+        } catch {}
+      }
+      if (!recovered && isNewTex && typeof Uint8Array !== 'undefined') {
+        try {
+          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([0, 0, 0, 0]));
         } catch {}
       }
     }
@@ -1143,12 +1646,18 @@ export class RendererEngine {
   }
 
   syncCanvasDimensions(project) {
-    const { width: prevW, height: prevH } = this.getPreviewCanvasSize(project);
-    if (this.canvas.width !== prevW || this.canvas.height !== prevH) {
-      this.canvas.width = prevW;
-      this.canvas.height = prevH;
+    if (!this.fullNativeOffload) {
+      const { width: prevW, height: prevH } = this.getPreviewCanvasSize(project);
+      if (this.canvas.width !== prevW || this.canvas.height !== prevH) {
+        this.canvas.width = prevW;
+        this.canvas.height = prevH;
+      }
     }
-    this.canvas.style.aspectRatio = `${project.width} / ${project.height}`;
+    const arStr = `${project.width} / ${project.height}`;
+    if (this._lastCanvasArStr !== arStr) {
+      this._lastCanvasArStr = arStr;
+      this.canvas.style.aspectRatio = arStr;
+    }
     const rect = this.canvas.getBoundingClientRect();
     const w = Math.max(100, Math.round(rect.width || 360));
     const h = Math.max(100, Math.round(rect.height || 202));
@@ -1328,6 +1837,9 @@ export class RendererEngine {
     vid._playInFlight = false;
     vid._stallCount = 0;
     vid._forceScratchCopy = false;
+    vid._hasMediaError = false;
+    vid._errorRetryCount = 0;
+    vid._lastFallbackCaptureMs = 0;
     vid._wantsPlaySinceMs = 0;
     vid._lastProgressWallMs = 0;
     vid._lastObservedMediaTime = undefined;
@@ -1451,6 +1963,15 @@ export class RendererEngine {
       notifyReady(true);
     });
     vid.addEventListener('ended', () => notifyReady(true));
+    vid.addEventListener('error', () => {
+      vid._hasMediaError = true;
+      vid._wantsPlay = false;
+      vid._playInFlight = false;
+      vid._playInFlightSinceMs = 0;
+      vid._pendingPlayTargetTime = null;
+      vid._pendingSeekTime = null;
+      this.onMediaFrameReady?.(mediaItem);
+    });
 
     vid.src = urlStr;
     const host = this._ensureHiddenVideoHost();
@@ -1478,6 +1999,7 @@ export class RendererEngine {
   }
 
   resetVideoPlayTransientState() {
+    this.maxVideoDecoders = Math.max(3, this.maxVideoDecoders || 3);
     for (const vid of this.videoCache.values()) {
       vid._pendingSeekTime = null;
       vid._pendingPlayTargetTime = null;
@@ -1485,6 +2007,7 @@ export class RendererEngine {
       vid._playInFlightSinceMs = 0;
       vid._stallCount = 0;
       vid._forceScratchCopy = false;
+      vid._hasMediaError = false;
     }
   }
 
@@ -1520,15 +2043,34 @@ export class RendererEngine {
       }
     };
 
+    const safeSeek = (vid, mediaId, nextTime) => {
+      if (vid.readyState >= 2 && vid.videoWidth > 0 && !vid.seeking) {
+        this.captureVideoFallbackFrame(mediaId, vid);
+      }
+      try { vid.currentTime = nextTime; } catch {}
+    };
+
     if (isPlaying && shuttleRate > 0 && project && Array.isArray(project.layers)) {
       for (const layer of project.layers) {
         if (layer.type !== 'video' || !layer.visible || !layer.mediaId) continue;
+        if (this.offloadedLayerIds?.has(layer.id)) continue;
         if (frame < layer.startFrame || frame > layer.endFrame) continue;
         const mediaItem = mediaMap.get(layer.mediaId);
         if (!mediaItem) continue;
         if (!activeMediaIds.has(mediaItem.id) && activeMediaIds.size >= maxConcurrentDecoders) continue;
-        const vid = this.getVideoElement(mediaItem);
+        let vid = this.getVideoElement(mediaItem);
         if (!vid) continue;
+        if (vid.error || vid._hasMediaError) {
+          if ((vid._errorRetryCount || 0) < 1) {
+            this._releaseVideoDecoder(mediaItem.id, false);
+            vid = this.getVideoElement(mediaItem);
+            if (!vid) continue;
+            vid._errorRetryCount = 1;
+          } else {
+            activeMediaIds.add(mediaItem.id);
+            continue;
+          }
+        }
         activeMediaIds.add(mediaItem.id);
 
         const targetTime = this._computeVideoTargetTime(layer, frame, fps, vid, mediaItem);
@@ -1536,7 +2078,7 @@ export class RendererEngine {
           vid._wantsPlay = false;
           if (!vid.paused) vid.pause();
           if (!vid.seeking && Math.abs(vid.currentTime - targetTime) > 0.03) {
-            try { vid.currentTime = targetTime; } catch {}
+            safeSeek(vid, mediaItem.id, targetTime);
           }
           continue;
         }
@@ -1578,14 +2120,25 @@ export class RendererEngine {
               vid._playInFlight = false;
               vid._playInFlightSinceMs = 0;
             }
-            try { vid.currentTime = targetTime; } catch {}
+            safeSeek(vid, mediaItem.id, targetTime);
           }
           triggerSafePlay(vid);
         } else if (vid.ended && targetTime < (vid.duration || targetTime) - 0.12) {
           vid._lastSyncSeekMs = nowMs;
-          try { vid.currentTime = targetTime; } catch {}
+          safeSeek(vid, mediaItem.id, targetTime);
           triggerSafePlay(vid);
         } else {
+          // Periodically cache last valid video frame so split/resync seeks never flash blank
+          if (
+            vid.readyState >= 2 &&
+            vid.videoWidth > 0 &&
+            !vid.seeking &&
+            nowMs - (vid._lastFallbackCaptureMs || 0) > 480
+          ) {
+            vid._lastFallbackCaptureMs = nowMs;
+            this.captureVideoFallbackFrame(mediaItem.id, vid);
+          }
+
           // Track real frame/media progression to detect WebView SurfaceTexture/decoder stalls
           const mediaAdvanced = vid._lastObservedMediaTime === undefined ||
             Math.abs(vid.currentTime - vid._lastObservedMediaTime) > 0.004;
@@ -1616,10 +2169,10 @@ export class RendererEngine {
           }
 
           if ((vid._stallCount || 0) >= 2) {
-            // Decoder stalled: step-seek cleanly at ~24fps to guarantee live frame progression
-            if (!vid.seeking && Math.abs(vid.currentTime - targetTime) > 0.04 && nowMs - (vid._lastSyncSeekMs || 0) > 40) {
+            // Decoder stalled: step-seek with sufficient decode breathing room (~120ms)
+            if (!vid.seeking && Math.abs(vid.currentTime - targetTime) > 0.04 && nowMs - (vid._lastSyncSeekMs || 0) > 120) {
               vid._lastSyncSeekMs = nowMs;
-              try { vid.currentTime = targetTime; } catch {}
+              safeSeek(vid, mediaItem.id, targetTime);
               if (vid.paused) triggerSafePlay(vid);
             }
           } else if (
@@ -1628,7 +2181,7 @@ export class RendererEngine {
             nowMs - (vid._lastSyncSeekMs || 0) > 700
           ) {
             vid._lastSyncSeekMs = nowMs;
-            try { vid.currentTime = targetTime; } catch {}
+            safeSeek(vid, mediaItem.id, targetTime);
           }
         }
       }
@@ -1638,11 +2191,19 @@ export class RendererEngine {
       for (const layer of project.layers) {
         if (layer.type !== 'video' || !layer.visible || !layer.mediaId) continue;
         if (layer.startFrame <= frame || layer.startFrame > frame + lookaheadFrames) continue;
+        if (
+          this.offloadBackground &&
+          !layer.motionBlur?.enabled &&
+          layer.fx?.removeBgMode !== 'auto' &&
+          (layer.mask?.type || 'none') === 'none'
+        ) {
+          continue;
+        }
         const mediaItem = mediaMap.get(layer.mediaId);
         if (!mediaItem || activeMediaIds.has(mediaItem.id)) continue;
         if (activeMediaIds.size >= maxConcurrentDecoders) break;
         const vid = this.getVideoElement(mediaItem);
-        if (!vid) continue;
+        if (!vid || vid.error || vid._hasMediaError) continue;
         activeMediaIds.add(mediaItem.id);
         vid._wantsPlay = false;
         if (!vid.paused) {
@@ -1650,7 +2211,7 @@ export class RendererEngine {
         }
         const entryTarget = this._computeVideoTargetTime(layer, layer.startFrame, fps, vid, mediaItem);
         if (vid.readyState >= 1 && !vid.seeking && Math.abs(vid.currentTime - entryTarget) > 0.05) {
-          try { vid.currentTime = entryTarget; } catch {}
+          safeSeek(vid, mediaItem.id, entryTarget);
         }
       }
     }
@@ -1683,6 +2244,7 @@ export class RendererEngine {
 
     for (const layer of project.layers) {
       if (layer.type !== 'video' || !layer.visible || !layer.mediaId) continue;
+      if (!awaitSeek && this.offloadedLayerIds?.has(layer.id)) continue;
       if (frame < layer.startFrame || frame > layer.endFrame) continue;
       const mediaItem = mediaMap.get(layer.mediaId);
       if (!mediaItem) continue;
@@ -2000,10 +2562,13 @@ export class RendererEngine {
       const item = mediaMap.get(layer.mediaId);
       if (!item) return null;
       const vid = this.getVideoElement(item);
-      if (vid && vid.readyState >= 2 && vid.videoWidth > 0) {
+      const cachedFrame = this.videoLastFrameCache.get(item.id);
+      if (vid && vid.seeking && cachedFrame && cachedFrame.width > 0) {
+        return { el: cachedFrame.canvas, w: layer.width || cachedFrame.width, h: layer.height || cachedFrame.height, token: cachedFrame.canvas._mfVersion || 1 };
+      }
+      if (vid && vid.readyState >= 2 && vid.videoWidth > 0 && !vid.error && !vid._hasMediaError) {
         return { el: vid, w: layer.width || vid.videoWidth, h: layer.height || vid.videoHeight };
       }
-      const cachedFrame = this.videoLastFrameCache.get(item.id);
       if (cachedFrame && cachedFrame.width > 0) {
         return { el: cachedFrame.canvas, w: layer.width || cachedFrame.width, h: layer.height || cachedFrame.height, token: cachedFrame.canvas._mfVersion || 1 };
       }
@@ -2099,9 +2664,14 @@ export class RendererEngine {
       entry.scratchCanvas.height = ah;
     }
     const sctx = entry.scratchCanvas.getContext('2d', { willReadFrequently: true });
-    sctx.clearRect(0, 0, aw, ah);
-    sctx.drawImage(drawable.el, 0, 0, aw, ah);
-    const imgData = sctx.getImageData(0, 0, aw, ah);
+    let imgData = null;
+    try {
+      sctx.clearRect(0, 0, aw, ah);
+      sctx.drawImage(drawable.el, 0, 0, aw, ah);
+      imgData = sctx.getImageData(0, 0, aw, ah);
+    } catch {
+      return drawable;
+    }
 
     const { alphaMask, dominantBgHex } = computeAutoBgMask(imgData.data, aw, ah, {
       sensitivity: fx.autoBgSensitivity ?? 0.48,
@@ -2156,13 +2726,30 @@ export class RendererEngine {
   }
 
   sampleLayerColorAtOverlayPoint(project, frame, mediaMap, layerId, px, py) {
+    const ow = Math.max(1, this.overlay.clientWidth || this.overlay.width || project.width);
+    const oh = Math.max(1, this.overlay.clientHeight || this.overlay.height || project.height);
+    if (
+      this.fullNativeOffload &&
+      typeof window !== 'undefined' &&
+      window.AndroidBridge?.sampleNativePreviewColor
+    ) {
+      try {
+        const nativeHex = window.AndroidBridge.sampleNativePreviewColor(
+          Math.max(0, Math.min(1, px / ow)),
+          Math.max(0, Math.min(1, py / oh))
+        );
+        if (nativeHex && nativeHex.startsWith('#')) {
+          const [r, g, b] = hexToRgb255(nativeHex);
+          return { r, g, b, hex: nativeHex };
+        }
+      } catch {}
+    }
+
     const layer = project?.layers?.find((l) => l.id === layerId);
     if (!layer) return null;
     const drawable = this.resolveLayerDrawable(layer, frame, project.fps || 30, mediaMap);
     if (!drawable || !drawable.el) return null;
 
-    const ow = Math.max(1, this.overlay.clientWidth || this.overlay.width || project.width);
-    const oh = Math.max(1, this.overlay.clientHeight || this.overlay.height || project.height);
     const ox = px * (this.overlay.width / ow);
     const oy = py * (this.overlay.height / oh);
 
@@ -2250,15 +2837,25 @@ export class RendererEngine {
   renderFrame(project, frame, mediaMap, selectedLayerId = null, targetCanvas = null, targetW = null, targetH = null) {
     if (!targetCanvas) {
       this.syncCanvasDimensions(project);
+      if (this.offloadBackground && this.fullNativeOffload) {
+        try {
+          this.drawOverlay(project, frame, selectedLayerId);
+        } catch (err) {
+          console.warn('Overlay render warning:', err);
+        }
+        return;
+      }
     }
 
-    let compositor = this.glPreview;
+    let compositor = null;
     if (targetCanvas) {
       compositor = this.exportCompositors.get(targetCanvas);
       if (!compositor) {
         compositor = this.createWebGLCompositor(targetCanvas, true);
         if (compositor) this.exportCompositors.set(targetCanvas, compositor);
       }
+    } else {
+      compositor = this.ensurePreviewCompositor();
     }
 
     const w = targetW || (targetCanvas ? project.width : this.canvas.width) || project.width;
@@ -2279,7 +2876,11 @@ export class RendererEngine {
     if (!rendered) {
       let ctx = targetCanvas ? targetCanvas.getContext('2d', { alpha: false }) : this.ctx2dFallback;
       if (ctx) {
-        this.renderCanvas2DFallback(ctx, project, frame, mediaMap, w, h, isFlat2DPreview, allowPending);
+        try {
+          this.renderCanvas2DFallback(ctx, project, frame, mediaMap, w, h, isFlat2DPreview, allowPending);
+        } catch (err) {
+          console.warn('Canvas 2D fallback render warning:', err);
+        }
       } else if (!targetCanvas && this.octx) {
         if (!this._fallback2dCanvas) this._fallback2dCanvas = document.createElement('canvas');
         if (this._fallback2dCanvas.width !== w || this._fallback2dCanvas.height !== h) {
@@ -2288,22 +2889,30 @@ export class RendererEngine {
         }
         ctx = this._fallback2dCanvas.getContext('2d', { alpha: false });
         if (ctx) {
-          this.renderCanvas2DFallback(ctx, project, frame, mediaMap, w, h, isFlat2DPreview, allowPending);
-          if (this.overlay) {
-            this.octx.save();
-            this.octx.setTransform(1, 0, 0, 1, 0, 0);
-            this.octx.clearRect(0, 0, this.overlay.width, this.overlay.height);
-            this.octx.drawImage(this._fallback2dCanvas, 0, 0, this.overlay.width, this.overlay.height);
-            this.octx.restore();
-            this.drawOverlay(project, frame, selectedLayerId, true);
-            return;
+          try {
+            this.renderCanvas2DFallback(ctx, project, frame, mediaMap, w, h, isFlat2DPreview, allowPending);
+            if (this.overlay) {
+              this.octx.save();
+              this.octx.setTransform(1, 0, 0, 1, 0, 0);
+              this.octx.clearRect(0, 0, this.overlay.width, this.overlay.height);
+              this.octx.drawImage(this._fallback2dCanvas, 0, 0, this.overlay.width, this.overlay.height);
+              this.octx.restore();
+              this.drawOverlay(project, frame, selectedLayerId, true);
+              return;
+            }
+          } catch (err) {
+            console.warn('Overlay 2D fallback render warning:', err);
           }
         }
       }
     }
 
     if (!targetCanvas) {
-      this.drawOverlay(project, frame, selectedLayerId);
+      try {
+        this.drawOverlay(project, frame, selectedLayerId);
+      } catch (err) {
+        console.warn('Overlay render warning:', err);
+      }
     }
   }
 
@@ -2535,36 +3144,42 @@ export class RendererEngine {
     this.bindCompositorQuadBuffer(compositor, compositor.posBuf);
     gl.viewport(0, 0, outW, outH);
 
-    const [bgR, bgG, bgB] = this.hexToRgb01(project.backgroundColor);
-    gl.clearColor(bgR, bgG, bgB, 1.0);
-    gl.clear(gl.COLOR_BUFFER_BIT);
+    const isTransparentNativePass = Boolean(allowPending && this.offloadBackground);
+    if (isTransparentNativePass) {
+      gl.clearColor(0.0, 0.0, 0.0, 0.0);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+    } else {
+      const [bgR, bgG, bgB] = this.hexToRgb01(project.backgroundColor);
+      gl.clearColor(bgR, bgG, bgB, 1.0);
+      gl.clear(gl.COLOR_BUFFER_BIT);
 
-    // Draw Canvas Gradient or Canvas Blurred Video/Image Background if active
-    const bgMode = project.backgroundMode || 'color';
-    if (bgMode === 'gradient') {
-      const gradC = this.getGradientBgCanvas(project.backgroundGradient?.[0], project.backgroundGradient?.[1]);
-      this.getOrCreateTexture(compositor, '__bg_grad', gradC, this.bgGradientCache?.key || 'grad');
-      this._resetDefaultShaderUniforms(compositor);
-      gl.uniformMatrix4fv(uMvp, false, Mat4.scale(Mat4.identity(), 2, 2, 1));
-      gl.uniform2f(uTexel, 1 / 16, 1 / 128);
-      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-    } else if (bgMode === 'blur') {
-      const bgLayer = [...project.layers].reverse().find(
-        (l) => l.visible && (l.type === 'video' || l.type === 'image') && frame >= l.startFrame && frame <= l.endFrame
-      );
-      if (bgLayer) {
-        const bgDrawable = this.resolveLayerDrawable(bgLayer, frame, project.fps || 30, mediaMap, !allowPending);
-        if (bgDrawable) {
-          this.getOrCreateTexture(compositor, bgLayer.mediaId || bgLayer.id, bgDrawable.el, bgDrawable.token ?? null);
-          this._resetDefaultShaderUniforms(compositor);
-          const scaleCover = Math.max(project.width / Math.max(1, bgDrawable.w), project.height / Math.max(1, bgDrawable.h));
-          const sxCover = (bgDrawable.w * scaleCover) / project.width * 2;
-          const syCover = (bgDrawable.h * scaleCover) / project.height * 2;
-          gl.uniformMatrix4fv(uMvp, false, Mat4.scale(Mat4.identity(), sxCover, syCover, 1));
-          gl.uniform2f(uTexel, 1 / Math.max(1, bgDrawable.w), 1 / Math.max(1, bgDrawable.h));
-          gl.uniform1f(uBlur, 3.5 + (project.backgroundBlurLevel ?? 2) * 3.0);
-          gl.uniform1f(uBright, -0.14);
-          gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+      // Draw Canvas Gradient or Canvas Blurred Video/Image Background if active
+      const bgMode = project.backgroundMode || 'color';
+      if (bgMode === 'gradient') {
+        const gradC = this.getGradientBgCanvas(project.backgroundGradient?.[0], project.backgroundGradient?.[1]);
+        this.getOrCreateTexture(compositor, '__bg_grad', gradC, this.bgGradientCache?.key || 'grad');
+        this._resetDefaultShaderUniforms(compositor);
+        gl.uniformMatrix4fv(uMvp, false, Mat4.scale(Mat4.identity(), 2, 2, 1));
+        gl.uniform2f(uTexel, 1 / 16, 1 / 128);
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+      } else if (bgMode === 'blur') {
+        const bgLayer = [...project.layers].reverse().find(
+          (l) => l.visible && (l.type === 'video' || l.type === 'image') && frame >= l.startFrame && frame <= l.endFrame
+        );
+        if (bgLayer) {
+          const bgDrawable = this.resolveLayerDrawable(bgLayer, frame, project.fps || 30, mediaMap, !allowPending);
+          if (bgDrawable) {
+            this.getOrCreateTexture(compositor, bgLayer.mediaId || bgLayer.id, bgDrawable.el, bgDrawable.token ?? null);
+            this._resetDefaultShaderUniforms(compositor);
+            const scaleCover = Math.max(project.width / Math.max(1, bgDrawable.w), project.height / Math.max(1, bgDrawable.h));
+            const sxCover = (bgDrawable.w * scaleCover) / project.width * 2;
+            const syCover = (bgDrawable.h * scaleCover) / project.height * 2;
+            gl.uniformMatrix4fv(uMvp, false, Mat4.scale(Mat4.identity(), sxCover, syCover, 1));
+            gl.uniform2f(uTexel, 1 / Math.max(1, bgDrawable.w), 1 / Math.max(1, bgDrawable.h));
+            gl.uniform1f(uBlur, 3.5 + (project.backgroundBlurLevel ?? 2) * 3.0);
+            gl.uniform1f(uBright, -0.14);
+            gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+          }
         }
       }
     }
@@ -2603,6 +3218,7 @@ export class RendererEngine {
       for (let i = project.layers.length - 1; i >= 0; i--) {
         const layer = project.layers[i];
         if (!layer.visible || layer.type === 'audio' || layer.type === 'group' || layer.type === 'camera') continue;
+        if (allowPending && this.offloadedLayerIds.has(layer.id)) continue;
         if (subFrame < layer.startFrame || subFrame > layer.endFrame) continue;
 
         let parentTf = null;
@@ -2625,6 +3241,7 @@ export class RendererEngine {
         const mbWeights = [0.64, 0.45, 0.34, 0.26, 0.20, 0.15];
 
         for (let ls = layerSamples - 1; ls >= 0; ls--) {
+          try {
           const effFrame = layerSamples > 1
             ? Math.max(layer.startFrame, Math.min(layer.endFrame, frame - (ls / (layerSamples - 1)) * 0.9 * mbStrength))
             : (layerMbActive && samples > 1 && s > 0
@@ -2642,7 +3259,7 @@ export class RendererEngine {
           const lsAlpha = layerSamples > 1 ? mbWeights[ls] : 1.0;
           let alpha = (isAdjustment ? 1.0 : masterAlpha * lsAlpha) * Math.max(0, Math.min(1, tf.opacity)) * trState.alphaMul;
           if (layerParentTf) alpha *= Math.max(0, Math.min(1, layerParentTf.opacity));
-          if (alpha <= 0.002) continue;
+          if (!Number.isFinite(alpha) || alpha <= 0.002) continue;
 
           let mvp;
           let texelW;
@@ -2847,6 +3464,15 @@ export class RendererEngine {
         if (isAdjustment) {
           this.bindCompositorQuadBuffer(compositor, compositor.posBuf);
         }
+          } catch (layerErr) {
+            console.warn('WebGL layer render skipped:', layer?.id, layerErr);
+            try {
+              gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+              gl.viewport(0, 0, outW, outH);
+              gl.enable(gl.BLEND);
+              this.bindCompositorQuadBuffer(compositor, compositor.posBuf);
+            } catch {}
+          }
         }
       }
     }
@@ -2855,15 +3481,19 @@ export class RendererEngine {
 
   renderCanvas2DFallback(ctx, project, frame, mediaMap, w, h, isFlat2DPreview = false, allowPending = false) {
     ctx.save();
-    if (project.backgroundMode === 'gradient') {
-      const g = ctx.createLinearGradient(0, 0, w, h);
-      g.addColorStop(0, project.backgroundGradient?.[0] || '#0F172A');
-      g.addColorStop(1, project.backgroundGradient?.[1] || '#1E1B4B');
-      ctx.fillStyle = g;
+    if (allowPending && this.offloadBackground) {
+      ctx.clearRect(0, 0, w, h);
     } else {
-      ctx.fillStyle = project.backgroundColor || '#05070B';
+      if (project.backgroundMode === 'gradient') {
+        const g = ctx.createLinearGradient(0, 0, w, h);
+        g.addColorStop(0, project.backgroundGradient?.[0] || '#0F172A');
+        g.addColorStop(1, project.backgroundGradient?.[1] || '#1E1B4B');
+        ctx.fillStyle = g;
+      } else {
+        ctx.fillStyle = project.backgroundColor || '#05070B';
+      }
+      ctx.fillRect(0, 0, w, h);
     }
-    ctx.fillRect(0, 0, w, h);
     ctx.scale(w / project.width, h / project.height);
 
     const cam = this.resolveEffectiveCamera(project, frame, isFlat2DPreview, allowPending);
@@ -2871,6 +3501,7 @@ export class RendererEngine {
     for (let i = project.layers.length - 1; i >= 0; i--) {
       const layer = project.layers[i];
       if (!layer.visible || layer.type === 'audio' || layer.type === 'group' || layer.type === 'camera') continue;
+      if (allowPending && this.offloadedLayerIds.has(layer.id)) continue;
       if (frame < layer.startFrame || frame > layer.endFrame) continue;
 
       let parentTf = null;
@@ -2985,6 +3616,8 @@ export class RendererEngine {
       const mbWeights = [0.66, 0.44, 0.32, 0.24, 0.18];
 
       for (let ls = layerSamples - 1; ls >= 0; ls--) {
+        ctx.save();
+        try {
         const effFrame = layerSamples > 1
           ? Math.max(layer.startFrame, Math.min(layer.endFrame, frame - (ls / (layerSamples - 1)) * 0.9 * mbStrength))
           : frame;
@@ -2993,15 +3626,14 @@ export class RendererEngine {
           : parentTf;
 
         const drawable = this.resolveProcessedDrawable(layer, effFrame, project.fps || 30, mediaMap, !allowPending);
-        if (!drawable) continue;
+        if (!drawable || !drawable.el) continue;
         const tf = this.resolveEffectiveTransform(layer, effFrame, allowPending);
         const trState = this.computeTransitionState(layer, effFrame, project.width, project.height);
         const lsAlpha = layerSamples > 1 ? mbWeights[ls] : 1.0;
         let alpha = lsAlpha * Math.max(0, Math.min(1, tf.opacity)) * trState.alphaMul;
         if (layerParentTf) alpha *= Math.max(0, Math.min(1, layerParentTf.opacity));
-        if (alpha <= 0.002) continue;
+        if (!Number.isFinite(alpha) || alpha <= 0.002) continue;
 
-        ctx.save();
         const blendMap = { add: 'lighter', screen: 'screen', multiply: 'multiply' };
         ctx.globalCompositeOperation = blendMap[layer.blendMode] || 'source-over';
         ctx.translate(project.width / 2, project.height / 2);
@@ -3109,7 +3741,11 @@ export class RendererEngine {
         } else {
           ctx.drawImage(drawable.el, -drawable.w / 2, -drawable.h / 2, drawable.w, drawable.h);
         }
-        ctx.restore();
+        } catch (layer2dErr) {
+          console.warn('Canvas 2D layer skipped:', layer?.id, layer2dErr);
+        } finally {
+          ctx.restore();
+        }
       }
     }
     ctx.restore();
@@ -3325,16 +3961,23 @@ export class RendererEngine {
     const octx = this.octx;
     const ow = this.overlay.width;
     const oh = this.overlay.height;
-    if (!preserveBackground) {
+    const is3DMode = Boolean(this.viewport3D?.enabled);
+    const hasGrid = Boolean(project.settings?.showGrid);
+    const hasTracker = Boolean(this.trackerOverlay?.active);
+    const hasChroma = Boolean(this.chromaPickerOverlay?.active);
+    const willPotentiallyDraw = hasGrid || is3DMode || hasTracker || hasChroma || Boolean(selectedLayerId);
+
+    if (!preserveBackground && (this._overlayWasDirty || willPotentiallyDraw)) {
       octx.clearRect(0, 0, ow, oh);
     }
+    this._overlayWasDirty = willPotentiallyDraw || preserveBackground;
     this.lastOverlayBox = null;
     this.lastTrackerBox = null;
     this.lastGizmoHandles = null;
     this.lastTriadHandles = null;
     this.renderedLayerQuads = [];
 
-    if (project.settings?.showGrid) {
+    if (hasGrid) {
       octx.save();
       octx.strokeStyle = 'rgba(255, 255, 255, 0.14)';
       octx.lineWidth = 1;
@@ -3988,6 +4631,14 @@ export class RendererEngine {
 
   capturePreviewThumbnailDataUrl(maxW = 128, maxH = 96) {
     try {
+      if (
+        this.fullNativeOffload &&
+        typeof window !== 'undefined' &&
+        window.AndroidBridge?.captureNativePreviewSnapshot
+      ) {
+        const nativeSnap = window.AndroidBridge.captureNativePreviewSnapshot(maxW, maxH);
+        if (nativeSnap) return nativeSnap;
+      }
       const src = this.canvas;
       if (!src || !src.width || !src.height) return null;
       const scale = Math.min(maxW / src.width, maxH / src.height, 1);

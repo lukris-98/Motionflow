@@ -55,6 +55,12 @@ class MotionFlowApp {
     this.isPreviewFullview = false;
     this._fullviewResizeTimers = [];
     this._liveAutoRecRefreshTimer = null;
+    this.isNativeGpuPreviewActive = false;
+    this._nativeSceneOffloadActive = false;
+    this._nativeFullOffload = false;
+    this._nativeTexTokens = new Map();
+    this._lastNativeViewportSig = '';
+    this._previewResizeObserver = null;
     this.exportLocation = { uri: '', displayName: '', webHandle: null };
 
     this.history = new HistoryManager(25);
@@ -348,6 +354,12 @@ class MotionFlowApp {
     this.bindNativeBridgeCallbacks();
 
     this.applyThemeMode(this._getStoredThemeMode() || this.project?.settings?.themeMode || 'dark');
+    if (typeof ResizeObserver === 'function' && this.renderer?.canvas && !this._previewResizeObserver) {
+      this._previewResizeObserver = new ResizeObserver(() => {
+        this.syncNativePreviewViewport();
+      });
+      this._previewResizeObserver.observe(this.renderer.canvas);
+    }
     this.setSaveState(true);
     this.updateAllUI();
     this._preloadProjectAudioBuffers();
@@ -555,6 +567,95 @@ class MotionFlowApp {
     }
   }
 
+  _loadGlobalPerfSettings() {
+    const fallback = { playerEngine: 'native_gpu', hardwareAccel: true, proxyMode: 'auto' };
+    try {
+      const raw = JSON.parse(localStorage.getItem('lukris_settings_v1') || '{}');
+      const perf = raw?.performance || {};
+      return {
+        playerEngine: perf.playerEngine === 'webview' ? 'webview' : 'native_gpu',
+        hardwareAccel: perf.hardwareAccel !== false,
+        proxyMode: perf.proxyMode || 'auto'
+      };
+    } catch {
+      return fallback;
+    }
+  }
+
+  _saveGlobalPerfSettings(perfPatch = {}) {
+    try {
+      const raw = JSON.parse(localStorage.getItem('lukris_settings_v1') || '{}');
+      const base = (raw && typeof raw === 'object') ? raw : {};
+      base.performance = {
+        playerEngine: 'native_gpu',
+        hardwareAccel: true,
+        proxyMode: 'auto',
+        lazyThumbnails: true,
+        maxCacheMb: 512,
+        ...(base.performance || {}),
+        ...perfPatch
+      };
+      localStorage.setItem('lukris_settings_v1', JSON.stringify(base));
+    } catch {}
+  }
+
+  syncNativePreviewViewport(force = false) {
+    if (!this.isNativeGpuPreviewActive || !window.AndroidBridge?.updateNativePreviewViewport) return;
+    const canvasEl = this.renderer?.canvas || document.getElementById('previewCanvas');
+    if (!canvasEl) return;
+    const vw = window.innerWidth || document.documentElement.clientWidth || 0;
+    const vh = window.innerHeight || document.documentElement.clientHeight || 0;
+    const rect = canvasEl.getBoundingClientRect();
+    const visible = vw > 0 && vh > 0 && rect.width > 4 && rect.height > 4 && this._nativeSceneOffloadActive !== false;
+    const nx = visible ? Math.max(0, rect.left / vw) : 0;
+    const ny = visible ? Math.max(0, rect.top / vh) : 0;
+    const nw = visible ? Math.max(0, Math.min(1 - nx, rect.width / vw)) : 0;
+    const nh = visible ? Math.max(0, Math.min(1 - ny, rect.height / vh)) : 0;
+    const sig = `${nx.toFixed(4)}|${ny.toFixed(4)}|${nw.toFixed(4)}|${nh.toFixed(4)}|${visible ? 1 : 0}`;
+    if (!force && sig === this._lastNativeViewportSig) return;
+    this._lastNativeViewportSig = sig;
+    try {
+      window.AndroidBridge.updateNativePreviewViewport(nx, ny, nw, nh, visible);
+    } catch {}
+  }
+
+  applyPlayerEngineConfig() {
+    const perf = this._loadGlobalPerfSettings();
+    this.renderer?.setGpuPreference?.(perf.hardwareAccel, perf.proxyMode);
+    const bridgeAvailable = Boolean(
+      typeof window !== 'undefined' &&
+      window.AndroidBridge?.setNativePreviewConfig &&
+      window.AndroidBridge?.renderNativePreviewScene
+    );
+    const nativeGpuEnabled = perf.playerEngine === 'native_gpu' && bridgeAvailable;
+    const fullNativeCapable = nativeGpuEnabled && Boolean(window.AndroidBridge?.uploadNativeTexture);
+    this.isNativeGpuPreviewActive = nativeGpuEnabled;
+    if (typeof document !== 'undefined') {
+      document.documentElement.classList.toggle('mf-native-gpu-active', nativeGpuEnabled);
+      document.documentElement.classList.toggle('mf-native-gpu-full', fullNativeCapable);
+    }
+    const theme = this._getStoredThemeMode() || this.project?.settings?.themeMode || 'dark';
+    const backdropHex = theme === 'light' ? '#F1F5F9' : '#0B0E14';
+    try {
+      window.AndroidBridge?.setNativePreviewConfig?.(nativeGpuEnabled, Boolean(perf.hardwareAccel), backdropHex);
+    } catch {}
+    if (!nativeGpuEnabled) {
+      this._nativeSceneOffloadActive = false;
+      this._nativeFullOffload = false;
+      this._nativeTexTokens.clear();
+      this.renderer?.setNativeOffloadState?.(false, new Set(), false);
+      this._lastNativeViewportSig = '';
+      try { window.AndroidBridge?.pauseNativePreviewDecoders?.(); } catch {}
+      try { window.AndroidBridge?.updateNativePreviewViewport?.(0, 0, 0, 0, false); } catch {}
+    } else {
+      if (fullNativeCapable) {
+        this.renderer?.disposePreviewCompositor?.();
+      }
+      this.syncNativePreviewViewport(true);
+    }
+    return perf;
+  }
+
   applyThemeMode(mode) {
     const theme = mode === 'light' ? 'light' : 'dark';
     const isLight = theme === 'light';
@@ -565,6 +666,7 @@ class MotionFlowApp {
       document.body?.classList.toggle('mf-theme-light', isLight);
     }
     this._syncThemeButtonsUI(theme);
+    this.applyPlayerEngineConfig();
     this.timelineView?.redrawRulerOnly();
   }
 
@@ -615,12 +717,14 @@ class MotionFlowApp {
   }
 
   updateAllUI() {
-    document.getElementById('lblProjectName').textContent = this.project.name;
-    document.getElementById('hudResFps').textContent = `${this.project.width}×${this.project.height} · ${this.project.fps} FPS`;
+    const lblName = document.getElementById('lblProjectName');
+    if (lblName) lblName.textContent = this.project.name;
     this.updateSnapButtonState();
     document.getElementById('btnToggleRipple')?.classList.toggle('active', this.project.settings?.rippleMode !== false);
-    document.getElementById('btnToggleGrid').classList.toggle('active', Boolean(this.project.settings?.showGrid));
-    document.getElementById('btnOpenTrackerQuick')?.classList.toggle('tracking-active', Boolean(this.trackerState.active));
+    const trackOn = Boolean(this.trackerState.active);
+    document.getElementById('btnOpenTrackerQuick')?.classList.toggle('tracking-active', trackOn);
+    document.getElementById('btnToolbarToolsDropdown')?.classList.toggle('tracking-active', trackOn);
+    document.getElementById('badgeTrackerState')?.classList.toggle('d-none', !trackOn);
     const btnCompactAll = document.getElementById('btnCompactAllTracks');
     if (btnCompactAll) {
       const hasAnyLayers = this.project.layers.length > 0;
@@ -774,6 +878,7 @@ class MotionFlowApp {
     }
     this._fullviewResizeTimers = [0, 180, 360].map((ms) => setTimeout(() => {
       this.renderer?.syncCanvasDimensions(this.project);
+      this.syncNativePreviewViewport(true);
       this.renderPreview();
     }, ms));
   }
@@ -842,6 +947,7 @@ class MotionFlowApp {
       syncRaf = requestAnimationFrame(() => {
         syncRaf = 0;
         this.renderer?.syncCanvasDimensions(this.project);
+        this.syncNativePreviewViewport(true);
         this.renderPreview();
         this.timelineView?._syncOverlayLineHeights?.();
         this.timelineView?.redrawRulerOnly?.();
@@ -1102,16 +1208,58 @@ class MotionFlowApp {
   }
 
   renderPreview() {
-    if (this._templatePreview?.active && this._templatePreview.previewProject) {
-      this.renderer.renderFrame(
-        this._templatePreview.previewProject,
-        this._templatePreview.previewFrame,
-        this.mediaMap,
-        this.selectedLayerId
-      );
-      return;
+    try {
+      const isTpl = Boolean(this._templatePreview?.active && this._templatePreview.previewProject);
+      const activeProject = isTpl ? this._templatePreview.previewProject : this.project;
+      const activeFrame = isTpl ? this._templatePreview.previewFrame : this.currentFrame;
+      const isNativePlaying = this.isPlaying && !isTpl;
+
+      if (this.isNativeGpuPreviewActive && window.AndroidBridge?.renderNativePreviewScene) {
+        const isFlat2DPreview = !this.viewport3D?.enabled &&
+          !this.renderer.hasAny3DContentAtFrame(activeProject, activeFrame, true);
+        const canUploadTextures = Boolean(window.AndroidBridge?.uploadNativeTexture);
+        const offload = this.renderer.buildNativeGpuScene(
+          activeProject,
+          activeFrame,
+          this.mediaMap,
+          isNativePlaying,
+          isFlat2DPreview,
+          true,
+          { fullNative: canUploadTextures, uploadedTokens: this._nativeTexTokens }
+        );
+        if (canUploadTextures && Array.isArray(offload.textureUploads) && offload.textureUploads.length > 0) {
+          for (const up of offload.textureUploads) {
+            if (up?.texKey && up?.dataUrl) {
+              try {
+                window.AndroidBridge.uploadNativeTexture(up.texKey, String(up.token || '1'), up.dataUrl);
+                this._nativeTexTokens.set(up.texKey, String(up.token || '1'));
+              } catch {}
+            }
+          }
+        }
+        this._nativeSceneOffloadActive = Boolean(offload.offloadBackground && offload.scenePayload);
+        this._nativeFullOffload = Boolean(offload.fullNative && this._nativeSceneOffloadActive);
+        this.renderer.setNativeOffloadState(this._nativeSceneOffloadActive, offload.offloadedIds, this._nativeFullOffload);
+        if (this._nativeFullOffload) {
+          this.renderer.disposePreviewCompositor();
+        }
+        if (typeof document !== 'undefined') {
+          document.documentElement.classList.toggle('mf-native-gpu-full', this._nativeFullOffload);
+        }
+        this.syncNativePreviewViewport();
+        if (this._nativeSceneOffloadActive) {
+          window.AndroidBridge.renderNativePreviewScene(JSON.stringify(offload.scenePayload));
+        }
+      } else {
+        this._nativeSceneOffloadActive = false;
+        this._nativeFullOffload = false;
+        this.renderer.setNativeOffloadState(false, new Set(), false);
+      }
+
+      this.renderer.renderFrame(activeProject, activeFrame, this.mediaMap, this.selectedLayerId);
+    } catch (err) {
+      console.warn('Preview render recovery:', err);
     }
-    this.renderer.renderFrame(this.project, this.currentFrame, this.mediaMap, this.selectedLayerId);
   }
 
   stopTemplateLivePreview(opts = {}) {
@@ -1292,7 +1440,7 @@ class MotionFlowApp {
           lastSeekFrame = curF;
           this.renderer.seekVideosForFrame(previewProject, curF, this.mediaMap, false).catch(() => {});
         }
-        this.renderer.renderFrame(previewProject, curF, this.mediaMap, this.selectedLayerId);
+        this.renderPreview();
       } catch (err) {
         console.warn('Template preview step recovery:', err);
       }
@@ -1303,7 +1451,7 @@ class MotionFlowApp {
 
     try {
       this.renderer.seekVideosForFrame(previewProject, winStart, this.mediaMap, false).catch(() => {});
-      this.renderer.renderFrame(previewProject, winStart, this.mediaMap, this.selectedLayerId);
+      this.renderPreview();
     } catch (err) {
       console.warn('Template preview initial render recovery:', err);
     }
@@ -1447,7 +1595,8 @@ class MotionFlowApp {
         ticking = true;
         try {
           if (!Number.isFinite(this.currentFrame)) this.currentFrame = 0;
-          const advance = Math.floor(elapsed / frameIntervalMs) * this.shuttleRate;
+          const rawSteps = Math.max(1, Math.floor(elapsed / frameIntervalMs));
+          const advance = Math.min(rawSteps, 6) * this.shuttleRate;
           this.lastTickMs = now - (elapsed % frameIntervalMs);
           this.currentFrame += advance;
           const loopMaxF = this.getPlayheadMaxFrame();
@@ -2095,6 +2244,9 @@ class MotionFlowApp {
     const on = Boolean(this.viewport3D?.enabled);
     document.getElementById('btnPreviewMode2D')?.classList.toggle('active', !on);
     document.getElementById('btnResetCameraQuick')?.classList.toggle('active', on);
+    const modeLabel = document.getElementById('lblToolbarViewMode');
+    if (modeLabel) modeLabel.textContent = on ? '3D' : '2D';
+    document.getElementById('btnToolbarToolsDropdown')?.classList.toggle('is-3d', on);
     const hud = document.getElementById('hud3DViewport');
     if (hud) {
       hud.classList.toggle('d-none', !on);
@@ -3050,7 +3202,9 @@ class MotionFlowApp {
 
   async captureCoverFrame() {
     this.pause();
-    await this.renderer.seekVideosForFrame(this.project, this.currentFrame, this.mediaMap, true);
+    if (!(this.isNativeGpuPreviewActive && this._nativeFullOffload)) {
+      await this.renderer.seekVideosForFrame(this.project, this.currentFrame, this.mediaMap, true);
+    }
     this.renderPreview();
     const snap = this.renderer.capturePreviewThumbnailDataUrl(256, 192);
     if (!snap) return this.showToast('Unable to capture cover frame');
@@ -3759,7 +3913,10 @@ class MotionFlowApp {
 
   syncTrackerOverlay() {
     this.renderer.setTrackerOverlay(this.trackerState.active ? this.trackerState : null);
-    document.getElementById('btnOpenTrackerQuick')?.classList.toggle('tracking-active', Boolean(this.trackerState.active));
+    const trackOn = Boolean(this.trackerState.active);
+    document.getElementById('btnOpenTrackerQuick')?.classList.toggle('tracking-active', trackOn);
+    document.getElementById('btnToolbarToolsDropdown')?.classList.toggle('tracking-active', trackOn);
+    document.getElementById('badgeTrackerState')?.classList.toggle('d-none', !trackOn);
     if (this.trackerState.active) {
       this.updateTrackerSampleSwatch();
     }
@@ -4107,6 +4264,19 @@ class MotionFlowApp {
     this.renderer?.pruneUnusedCaches?.(this.project);
     this.audioEngine?.pruneUnusedCaches?.(this.project);
     this.timelineView?.pruneFilmstripCache?.(this.project);
+    if (this.project?.layers) {
+      const keepKeys = [];
+      for (const l of this.project.layers) {
+        keepKeys.push(l.id, `${l.id}__img`, `${l.id}__vid`, `${l.id}__autobg`, `${l.id}__bgblur`);
+      }
+      const keepSet = new Set(keepKeys);
+      for (const k of [...this._nativeTexTokens.keys()]) {
+        if (!keepSet.has(k)) this._nativeTexTokens.delete(k);
+      }
+      try {
+        window.AndroidBridge?.pruneNativeTextures?.(JSON.stringify(keepKeys));
+      } catch {}
+    }
   }
 
   async refreshMediaStorageStats() {
@@ -5047,12 +5217,15 @@ class MotionFlowApp {
       if (document.hidden) {
         this.pause();
         this.stopTemplateLivePreview({ skipRender: true });
+        try { window.AndroidBridge?.pauseNativePreviewDecoders?.(); } catch {}
         this.handleMemoryTrim(40);
       }
     });
     window.addEventListener('pagehide', () => {
       this.pause();
       this.stopTemplateLivePreview({ skipRender: true });
+      try { window.AndroidBridge?.pauseNativePreviewDecoders?.(); } catch {}
+      try { window.AndroidBridge?.setNativePreviewConfig?.(false, false, '#0B0E14'); } catch {}
       if (this._mediaRafId) {
         cancelAnimationFrame(this._mediaRafId);
         this._mediaRafId = null;
@@ -5067,6 +5240,8 @@ class MotionFlowApp {
     // Top Toolbar
     document.getElementById('btnGoHome')?.addEventListener('click', async () => {
       this.pause();
+      try { window.AndroidBridge?.pauseNativePreviewDecoders?.(); } catch {}
+      try { window.AndroidBridge?.setNativePreviewConfig?.(false, false, '#0B0E14'); } catch {}
       try { await ProjectStorage.saveProject(this.project); } catch {}
       window.location.href = './index.html';
     });
@@ -5139,6 +5314,27 @@ class MotionFlowApp {
       if (rippleChk) rippleChk.checked = this.project.settings?.rippleMode !== false;
       const cmChk = document.getElementById('chkSettingAutoColorMatch');
       if (cmChk) cmChk.checked = this.project.settings?.autoColorMatch !== false;
+      const perf = this._loadGlobalPerfSettings();
+      const selEngine = document.getElementById('selSettingPlayerEngine');
+      if (selEngine) selEngine.value = perf.playerEngine;
+      const chkGpu = document.getElementById('chkSettingGpuAccel');
+      if (chkGpu) chkGpu.checked = perf.hardwareAccel !== false;
+      const lblStatus = document.getElementById('lblSettingEngineStatus');
+      if (lblStatus) {
+        let statusText = 'WebView HTML5 + WebGL Mode';
+        try {
+          if (window.AndroidBridge?.getNativePlayerCapabilities) {
+            const cap = JSON.parse(window.AndroidBridge.getNativePlayerCapabilities() || '{}');
+            if (cap.hardwareCodecAvailable) {
+              const gpuLabel = cap.gpuRenderer ? `${cap.gpuRenderer} · ` : '';
+              statusText = `GPU Ready (Zero-WebGL · ${gpuLabel}${cap.hwVideoDecoders || 1} HW codec)`;
+            } else {
+              statusText = 'Fallback Codec · Pilih WebView atau Native';
+            }
+          }
+        } catch {}
+        lblStatus.textContent = statusText;
+      }
       const curTheme = this.project.settings?.themeMode || this._getStoredThemeMode();
       pendingThemeBeforeSettings = curTheme;
       this._syncThemeButtonsUI(curTheme);
@@ -5159,8 +5355,16 @@ class MotionFlowApp {
       const rippleMode = document.getElementById('chkSettingRipple')?.checked !== false;
       const autoColorMatch = document.getElementById('chkSettingAutoColorMatch')?.checked !== false;
       const themeMode = document.getElementById('selProjectTheme')?.value === 'light' ? 'light' : 'dark';
+      const prevPerf = this._loadGlobalPerfSettings();
+      const nextEngine = document.getElementById('selSettingPlayerEngine')?.value === 'webview' ? 'webview' : 'native_gpu';
+      const nextGpu = document.getElementById('chkSettingGpuAccel')?.checked !== false;
+      const engineChanged = prevPerf.playerEngine !== nextEngine || prevPerf.hardwareAccel !== nextGpu;
+      this._saveGlobalPerfSettings({ playerEngine: nextEngine, hardwareAccel: nextGpu });
       pendingThemeBeforeSettings = null;
       this.applyThemeMode(themeMode);
+      if (engineChanged) {
+        this.renderer.seekVideosForFrame(this.project, this.currentFrame, this.mediaMap, false).catch(() => {});
+      }
       this.mutateProject(() => {
         this.project.name = name;
         this.project.width = w;
@@ -5177,26 +5381,34 @@ class MotionFlowApp {
         }
         this.currentFrame = Math.min(this.currentFrame, this.getPlayheadMaxFrame());
       });
+      if (engineChanged) {
+        this.showToast(`Player Engine: ${nextEngine === 'native_gpu' ? (nextGpu ? 'Native GPU' : 'Native CPU') : 'WebView WebGL'}`);
+      }
       bootstrap.Modal.getInstance(modalSettingsEl)?.hide();
     };
 
-    // HUD toggles
-    document.getElementById('btnOpenTrackerQuick').onclick = () => {
-      this.openTrackerUI();
+    // Toolbar Track & 2D/3D dropdown toggles
+    const hideToolbarToolsDropdown = () => {
+      const ddBtn = document.getElementById('btnToolbarToolsDropdown');
+      if (ddBtn && typeof bootstrap !== 'undefined' && bootstrap.Dropdown) {
+        bootstrap.Dropdown.getInstance(ddBtn)?.hide();
+      }
     };
+    document.getElementById('btnOpenTrackerQuick')?.addEventListener('click', () => {
+      hideToolbarToolsDropdown();
+      this.openTrackerUI();
+    });
     document.getElementById('btnChromaPickerDone')?.addEventListener('click', () => {
       this.stopChromaColorPicker(true);
     });
-    document.getElementById('btnToggleGrid').onclick = () => {
-      this.project.settings.showGrid = !this.project.settings.showGrid;
-      this.onTimelineMutated();
-    };
     document.getElementById('btnPreviewMode2D')?.addEventListener('click', () => {
+      hideToolbarToolsDropdown();
       this.setViewport3DEnabled(false);
     });
-    document.getElementById('btnResetCameraQuick').onclick = () => {
+    document.getElementById('btnResetCameraQuick')?.addEventListener('click', () => {
+      hideToolbarToolsDropdown();
       this.setViewport3DEnabled(true);
-    };
+    });
     document.getElementById('btn3DToolMove').onclick = () => this.setViewport3DTool('move');
     document.getElementById('btn3DToolRotate').onclick = () => this.setViewport3DTool('rotate');
     document.getElementById('btn3DToolScale').onclick = () => this.setViewport3DTool('scale');
@@ -5335,6 +5547,7 @@ class MotionFlowApp {
       this._clampPreviewSplitHeight?.();
       this.timelineView.redrawRulerOnly();
       this.renderer?.syncCanvasDimensions(this.project);
+      this.syncNativePreviewViewport(true);
       this.renderPreview();
     });
 
@@ -5763,11 +5976,13 @@ class MotionFlowApp {
       // Capture current preview frame thumbnail for CapCut-style export cover
       try {
         this.renderPreview();
-        const thumbUrl = this.previewCanvas.toDataURL('image/jpeg', 0.8);
+        const thumbUrl = this.renderer?.capturePreviewThumbnailDataUrl(256, 192);
         const heroImg = document.getElementById('imgExportPreviewThumb');
         const progImg = document.getElementById('imgExportProgressThumb');
-        if (heroImg) heroImg.src = thumbUrl;
-        if (progImg) progImg.src = thumbUrl;
+        if (thumbUrl) {
+          if (heroImg) heroImg.src = thumbUrl;
+          if (progImg) progImg.src = thumbUrl;
+        }
       } catch {}
 
       const ep = this.project.exportPrefs || {};

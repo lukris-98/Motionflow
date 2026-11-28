@@ -53,6 +53,7 @@ import androidx.core.content.FileProvider
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import android.widget.FrameLayout
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -76,6 +77,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var storageHelper: MediaStorageHelper
     private lateinit var mp4Exporter: NativeMp4Exporter
     private var webView: WebView? = null
+    private var nativeGpuPreview: NativeGpuPreviewView? = null
     private var pendingJsonToExport: String? = null
     private var selectedExportUri: Uri? = null
     private var selectedExportDisplayName: String = ""
@@ -86,6 +88,7 @@ class MainActivity : ComponentActivity() {
     @Volatile
     private var ttsReady: Boolean = false
     private var isFullviewMode by mutableStateOf(false)
+    private var rootBackdropColor by mutableStateOf(ComposeColor(0xFF0B0E14))
 
     private val requestMicPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -254,7 +257,7 @@ class MainActivity : ComponentActivity() {
         setContent {
             val baseModifier = Modifier
                 .fillMaxSize()
-                .background(ComposeColor(0xFF0B0E14))
+                .background(rootBackdropColor)
             val rootModifier = if (isFullviewMode) {
                 baseModifier
             } else {
@@ -264,10 +267,23 @@ class MainActivity : ComponentActivity() {
                 AndroidView(
                     modifier = Modifier.fillMaxSize(),
                     factory = { ctx ->
-                        WebView(ctx).apply {
+                        val container = FrameLayout(ctx).apply {
                             layoutParams = ViewGroup.LayoutParams(
                                 ViewGroup.LayoutParams.MATCH_PARENT,
                                 ViewGroup.LayoutParams.MATCH_PARENT
+                            )
+                        }
+
+                        val gpuView = NativeGpuPreviewView(ctx, storageHelper.mediaDir).apply {
+                            layoutParams = FrameLayout.LayoutParams(0, 0)
+                        }
+                        nativeGpuPreview = gpuView
+                        container.addView(gpuView)
+
+                        val wv = WebView(ctx).apply {
+                            layoutParams = FrameLayout.LayoutParams(
+                                FrameLayout.LayoutParams.MATCH_PARENT,
+                                FrameLayout.LayoutParams.MATCH_PARENT
                             )
                             setBackgroundColor(Color.parseColor("#0B0E14"))
                             setLayerType(View.LAYER_TYPE_HARDWARE, null)
@@ -278,7 +294,7 @@ class MainActivity : ComponentActivity() {
                                 javaScriptEnabled = true
                                 domStorageEnabled = true
                                 databaseEnabled = true
-                                cacheMode = WebSettings.LOAD_DEFAULT
+                                cacheMode = WebSettings.LOAD_NO_CACHE
                                 mediaPlaybackRequiresUserGesture = false
                                 allowFileAccess = false
                                 allowContentAccess = false
@@ -288,6 +304,7 @@ class MainActivity : ComponentActivity() {
                                 loadWithOverviewMode = true
                                 mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
                             }
+                            clearStaleWebCacheIfUpdated(ctx, this)
                             addJavascriptInterface(MotionFlowBridge(), "AndroidBridge")
 
                             webViewClient = object : WebViewClient() {
@@ -317,9 +334,33 @@ class MainActivity : ComponentActivity() {
                             webView = this
                             loadUrl(MediaStorageHelper.BASE_URL)
                         }
+                        container.addView(wv)
+                        container
                     }
                 )
             }
+        }
+    }
+
+    private fun clearStaleWebCacheIfUpdated(context: android.content.Context, view: WebView) {
+        try {
+            val pkgInfo = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                context.packageManager.getPackageInfo(
+                    context.packageName,
+                    PackageManager.PackageInfoFlags.of(0)
+                )
+            } else {
+                @Suppress("DEPRECATION")
+                context.packageManager.getPackageInfo(context.packageName, 0)
+            }
+            val stamp = "${pkgInfo.lastUpdateTime}_${pkgInfo.longVersionCode}"
+            val prefs = context.getSharedPreferences("lukris_webview_meta", MODE_PRIVATE)
+            if (prefs.getString("apk_stamp", null) != stamp) {
+                view.clearCache(true)
+                prefs.edit().putString("apk_stamp", stamp).apply()
+            }
+        } catch (_: Exception) {
+            try { view.clearCache(false) } catch (_: Exception) {}
         }
     }
 
@@ -553,12 +594,19 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onStop() {
+        super.onStop()
+        nativeGpuPreview?.pauseAndReleaseDecoders()
+    }
+
     override fun onDestroy() {
         isRecordingVoiceover.set(false)
         voiceoverJob?.cancel()
         try { textToSpeech?.stop(); textToSpeech?.shutdown() } catch (_: Exception) {}
         textToSpeech = null
         ioScope.cancel()
+        nativeGpuPreview?.release()
+        nativeGpuPreview = null
         webView?.let { wv ->
             (wv.parent as? ViewGroup)?.removeView(wv)
             wv.stopLoading()
@@ -868,6 +916,73 @@ class MainActivity : ComponentActivity() {
                     controller.show(WindowInsetsCompat.Type.systemBars())
                 }
             }
+        }
+
+        @JavascriptInterface
+        fun setNativePreviewConfig(enabled: Boolean, preferGpu: Boolean, backdropHex: String) {
+            runOnUiThread {
+                val parsed = try {
+                    Color.parseColor(backdropHex.ifBlank { "#0B0E14" })
+                } catch (_: Exception) {
+                    Color.parseColor("#0B0E14")
+                }
+                rootBackdropColor = ComposeColor(parsed)
+                webView?.setBackgroundColor(if (enabled) Color.TRANSPARENT else parsed)
+                nativeGpuPreview?.setEngineConfig(enabled, preferGpu)
+            }
+        }
+
+        @JavascriptInterface
+        fun updateNativePreviewViewport(normX: Float, normY: Float, normW: Float, normH: Float, visible: Boolean) {
+            nativeGpuPreview?.updateViewportRect(normX, normY, normW, normH, visible)
+        }
+
+        @JavascriptInterface
+        fun renderNativePreviewScene(sceneJson: String) {
+            nativeGpuPreview?.renderScene(sceneJson)
+        }
+
+        @JavascriptInterface
+        fun uploadNativeTexture(texKey: String, token: String, dataUrlOrBase64: String) {
+            nativeGpuPreview?.uploadTexture(texKey, token, dataUrlOrBase64)
+        }
+
+        @JavascriptInterface
+        fun hasNativeTexture(texKey: String, token: String): Boolean {
+            return nativeGpuPreview?.hasTexture(texKey, token) ?: false
+        }
+
+        @JavascriptInterface
+        fun pruneNativeTextures(activeKeysJson: String) {
+            val activeSet = HashSet<String>()
+            try {
+                val arr = JSONArray(activeKeysJson)
+                for (i in 0 until arr.length()) {
+                    val key = arr.optString(i, "")
+                    if (key.isNotBlank()) activeSet.add(key)
+                }
+            } catch (_: Exception) {}
+            nativeGpuPreview?.pruneTextures(activeSet)
+        }
+
+        @JavascriptInterface
+        fun captureNativePreviewSnapshot(maxW: Int, maxH: Int): String {
+            return nativeGpuPreview?.captureSnapshotBase64(maxW, maxH) ?: ""
+        }
+
+        @JavascriptInterface
+        fun sampleNativePreviewColor(normX: Float, normY: Float): String {
+            return nativeGpuPreview?.sampleColorHexAt(normX, normY) ?: ""
+        }
+
+        @JavascriptInterface
+        fun pauseNativePreviewDecoders() {
+            nativeGpuPreview?.pauseAndReleaseDecoders()
+        }
+
+        @JavascriptInterface
+        fun getNativePlayerCapabilities(): String {
+            return nativeGpuPreview?.getCapabilitiesJson()?.toString() ?: "{}"
         }
     }
 }

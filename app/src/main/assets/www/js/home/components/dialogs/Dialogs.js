@@ -230,16 +230,37 @@ export class HomeDialogs {
         </div>
       `;
     } else if (activeTab === 'performance') {
+      const curEngine = s.performance.playerEngine === 'webview' ? 'webview' : 'native_gpu';
+      let nativeCapText = 'Browser WebGL High-Performance';
+      try {
+        if (window.AndroidBridge?.getNativePlayerCapabilities) {
+          const cap = JSON.parse(window.AndroidBridge.getNativePlayerCapabilities() || '{}');
+          if (cap.hardwareCodecAvailable) {
+            const gpuLabel = cap.gpuRenderer ? `${cap.gpuRenderer} · ` : '';
+            nativeCapText = `GPU Hardware Ready (${gpuLabel}${cap.hwVideoDecoders || 1} codec · ${cap.glesVersion || 'OpenGL ES'})`;
+          }
+        }
+      } catch {}
       paneHtml = `
         <h6 class="fw-semibold mb-3">Performance &amp; Engine Isolation</h6>
         <div class="lk-info-box mb-3">
-          <div class="small fw-semibold text-info"><i class="bi bi-shield-check me-2"></i>Home Engine Guard Active</div>
-          <div class="lk-muted-xs mt-1">Video Engine, Audio Engine, and Rendering Engine are unloaded on the Home screen and load dynamically only when opening a project.</div>
+          <div class="small fw-semibold text-info"><i class="bi bi-gpu-card me-2"></i>Player Engine &amp; Hardware Status</div>
+          <div class="lk-muted-xs mt-1">${escapeHtml(nativeCapText)} · Video/Rendering engine stays unloaded on Home screen.</div>
+        </div>
+        <div class="lk-setting-row">
+          <div class="me-2">
+            <div class="small fw-semibold">Timeline Player Mode</div>
+            <div class="lk-muted-xs">Switch between Native GPU (pengganti FFmpeg CPU) or WebView HTML5 player</div>
+          </div>
+          <select id="selHomePlayerEngine" class="form-select form-select-sm lk-input w-auto" data-setting="performance.playerEngine">
+            <option value="native_gpu" ${curEngine === 'native_gpu' ? 'selected' : ''}>Native GPU (MediaCodec + GLES)</option>
+            <option value="webview" ${curEngine === 'webview' ? 'selected' : ''}>WebView (HTML5 + WebGL)</option>
+          </select>
         </div>
         <div class="lk-setting-row">
           <div>
-            <div class="small fw-semibold">Hardware Acceleration (WebGL / MediaCodec)</div>
-            <div class="lk-muted-xs">Use GPU compositing during editor playback &amp; export</div>
+            <div class="small fw-semibold">Hardware GPU Acceleration</div>
+            <div class="lk-muted-xs">Prioritize GPU Surface &amp; GL shaders instead of CPU decoding</div>
           </div>
           <div class="form-check form-switch m-0">
             <input class="form-check-input" type="checkbox" data-setting="performance.hardwareAccel" ${s.performance.hardwareAccel ? 'checked' : ''} />

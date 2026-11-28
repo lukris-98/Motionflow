@@ -51,8 +51,7 @@ export class LukrisHomeApp {
   }
 
   async init() {
-    await this.projectManager.init();
-    await this.assetManager.refreshDynamicCounts();
+    this.projectManager.loadCachedSync();
     try {
       const reqPage = new URLSearchParams(window.location.search || '').get('page');
       if (reqPage === 'credits') this.state.activeRoute = 'credits';
@@ -62,14 +61,31 @@ export class LukrisHomeApp {
     this._bindNativeBridge();
     this._bindKeyboardShortcuts();
 
+    // Render Main Menu immediately so WebView never blocks on IndexedDB
     this.refreshChrome();
     await this.refreshCurrentPage();
 
+    try {
+      await Promise.all([
+        this.projectManager.init(),
+        this.assetManager.refreshDynamicCounts()
+      ]);
+      this.refreshChrome();
+      await this.refreshCurrentPage();
+    } catch (e) {
+      console.warn('Home background sync warning:', e);
+    }
+
     window.addEventListener('pageshow', async (evt) => {
       if (evt.persisted) {
-        await this.projectManager.init();
+        this.projectManager.loadCachedSync();
         this.refreshChrome();
         await this.refreshCurrentPage();
+        try {
+          await this.projectManager.init();
+          this.refreshChrome();
+          await this.refreshCurrentPage();
+        } catch {}
       }
     });
   }
@@ -641,7 +657,23 @@ export class LukrisHomeApp {
   }
 }
 
-window.addEventListener('DOMContentLoaded', () => {
-  const app = new LukrisHomeApp();
-  app.init();
-});
+let _lukrisBooted = false;
+function bootLukrisHome() {
+  if (_lukrisBooted) return;
+  _lukrisBooted = true;
+  try {
+    const app = new LukrisHomeApp();
+    window.__lukrisHome = app;
+    app.init().catch((err) => {
+      console.error('LukrisHomeApp init failed:', err);
+    });
+  } catch (err) {
+    console.error('LukrisHomeApp bootstrap failed:', err);
+  }
+}
+
+if (typeof document !== 'undefined' && document.readyState !== 'loading') {
+  bootLukrisHome();
+} else {
+  window.addEventListener('DOMContentLoaded', bootLukrisHome);
+}

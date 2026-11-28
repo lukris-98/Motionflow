@@ -8,21 +8,49 @@ const STORE_FONTS = 'fonts';
 
 function openDB() {
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, DB_VERSION);
-    req.onupgradeneeded = (e) => {
-      const db = e.target.result;
-      if (!db.objectStoreNames.contains(STORE_PROJECTS)) {
-        db.createObjectStore(STORE_PROJECTS, { keyPath: 'id' });
+    if (typeof indexedDB === 'undefined') {
+      reject(new Error('IndexedDB unavailable'));
+      return;
+    }
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        reject(new Error('IndexedDB open timed out'));
       }
-      if (!db.objectStoreNames.contains(STORE_MEDIA)) {
-        db.createObjectStore(STORE_MEDIA, { keyPath: 'id' });
-      }
-      if (!db.objectStoreNames.contains(STORE_FONTS)) {
-        db.createObjectStore(STORE_FONTS, { keyPath: 'id' });
-      }
+    }, 3000);
+    const finish = (fn, arg) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      fn(arg);
     };
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
+    try {
+      const req = indexedDB.open(DB_NAME, DB_VERSION);
+      req.onupgradeneeded = (e) => {
+        const db = e.target.result;
+        if (!db.objectStoreNames.contains(STORE_PROJECTS)) {
+          db.createObjectStore(STORE_PROJECTS, { keyPath: 'id' });
+        }
+        if (!db.objectStoreNames.contains(STORE_MEDIA)) {
+          db.createObjectStore(STORE_MEDIA, { keyPath: 'id' });
+        }
+        if (!db.objectStoreNames.contains(STORE_FONTS)) {
+          db.createObjectStore(STORE_FONTS, { keyPath: 'id' });
+        }
+      };
+      req.onsuccess = () => {
+        const db = req.result;
+        db.onversionchange = () => {
+          try { db.close(); } catch {}
+        };
+        finish(resolve, db);
+      };
+      req.onerror = () => finish(reject, req.error || new Error('IndexedDB error'));
+      req.onblocked = () => finish(reject, new Error('IndexedDB blocked'));
+    } catch (err) {
+      finish(reject, err);
+    }
   });
 }
 
