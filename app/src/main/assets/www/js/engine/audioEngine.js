@@ -61,6 +61,43 @@ export class AudioEngine {
     this.pendingLoads = new Map(); // mediaId -> Promise<AudioBuffer|null>
     this.activeSources = [];
     this._playToken = 0;
+    this.maxCachedBuffers = 10;
+  }
+
+  _touchBufferLru(mediaId) {
+    if (!mediaId || !this.buffers.has(mediaId)) return;
+    const val = this.buffers.get(mediaId);
+    this.buffers.delete(mediaId);
+    this.buffers.set(mediaId, val);
+    while (this.buffers.size > this.maxCachedBuffers) {
+      const oldestKey = this.buffers.keys().next().value;
+      if (!oldestKey || oldestKey === mediaId) break;
+      this.buffers.delete(oldestKey);
+      this.reversedBuffers.delete(oldestKey);
+    }
+  }
+
+  pruneUnusedCaches(project) {
+    if (!project || !Array.isArray(project.layers)) return;
+    const activeMediaIds = new Set();
+    for (const l of project.layers) {
+      if (l?.mediaId) activeMediaIds.add(l.mediaId);
+    }
+    for (const mid of [...this.buffers.keys()]) {
+      if (!activeMediaIds.has(mid)) {
+        this.buffers.delete(mid);
+      }
+    }
+    for (const mid of [...this.reversedBuffers.keys()]) {
+      if (!activeMediaIds.has(mid)) {
+        this.reversedBuffers.delete(mid);
+      }
+    }
+    for (const mid of [...this.peaks.keys()]) {
+      if (!activeMediaIds.has(mid) && this.peaks.size > 24) {
+        this.peaks.delete(mid);
+      }
+    }
   }
 
   getReversedBuffer(mediaId, origBuf) {
@@ -95,7 +132,10 @@ export class AudioEngine {
 
   async loadBuffer(mediaItem) {
     if (!mediaItem || !mediaItem.url) return null;
-    if (this.buffers.has(mediaItem.id)) return this.buffers.get(mediaItem.id);
+    if (this.buffers.has(mediaItem.id)) {
+      this._touchBufferLru(mediaItem.id);
+      return this.buffers.get(mediaItem.id);
+    }
     if (this.failedIds.has(mediaItem.id)) return null;
     if (this.pendingLoads.has(mediaItem.id)) return this.pendingLoads.get(mediaItem.id);
 
@@ -106,6 +146,7 @@ export class AudioEngine {
         const arr = await resp.arrayBuffer();
         const decoded = await ctx.decodeAudioData(arr.slice(0));
         this.buffers.set(mediaItem.id, decoded);
+        this._touchBufferLru(mediaItem.id);
         this.peaks.set(mediaItem.id, this.computePeaks(decoded, 96));
         return decoded;
       } catch {

@@ -589,6 +589,30 @@ class MainActivity : ComponentActivity() {
         }
 
         @JavascriptInterface
+        fun getStorageStatsJson(): String {
+            return try {
+                storageHelper.getStorageStatsJson().toString()
+            } catch (_: Exception) {
+                "{}"
+            }
+        }
+
+        @JavascriptInterface
+        fun cleanupUnusedNativeFiles(usedFileNamesJson: String): String {
+            return try {
+                val arr = JSONArray(usedFileNamesJson)
+                val keepSet = HashSet<String>(arr.length())
+                for (i in 0 until arr.length()) {
+                    val name = arr.optString(i, "").trim()
+                    if (name.isNotEmpty()) keepSet.add(File(name).name)
+                }
+                storageHelper.cleanupUnusedFiles(keepSet).toString()
+            } catch (_: Exception) {
+                "{\"deletedCount\":0,\"freedBytes\":0}"
+            }
+        }
+
+        @JavascriptInterface
         fun startVoiceover() {
             runOnUiThread {
                 val granted = ContextCompat.checkSelfPermission(

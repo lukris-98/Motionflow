@@ -223,6 +223,72 @@ class MediaStorageHelper(private val context: Context) {
         File(mediaDir, "thumb_${id}.jpg").delete()
     }
 
+    fun getStorageStatsJson(): JSONObject {
+        var mediaCount = 0
+        var mediaBytes = 0L
+        mediaDir.listFiles()?.forEach { f ->
+            if (f.isFile) {
+                if (!f.name.startsWith("thumb_")) mediaCount++
+                mediaBytes += f.length()
+            }
+        }
+        var exportCount = 0
+        var exportBytes = 0L
+        exportsDir.listFiles()?.forEach { f ->
+            if (f.isFile) {
+                exportCount++
+                exportBytes += f.length()
+            }
+        }
+        return JSONObject().apply {
+            put("mediaCount", mediaCount)
+            put("mediaBytes", mediaBytes)
+            put("exportCount", exportCount)
+            put("exportBytes", exportBytes)
+            put("totalBytes", mediaBytes + exportBytes)
+        }
+    }
+
+    fun cleanupUnusedFiles(usedFileNames: Set<String>): JSONObject {
+        val keptIds = usedFileNames.mapTo(HashSet()) { File(it).name.substringBeforeLast('.') }
+        var deletedCount = 0
+        var freedBytes = 0L
+
+        mediaDir.listFiles()?.forEach { f ->
+            if (!f.isFile) return@forEach
+            val name = f.name
+            val keep = if (name.startsWith("thumb_") && name.endsWith(".jpg")) {
+                val thumbId = name.removePrefix("thumb_").removeSuffix(".jpg")
+                keptIds.contains(thumbId)
+            } else {
+                usedFileNames.contains(name)
+            }
+            if (!keep) {
+                val len = f.length()
+                if (f.delete()) {
+                    deletedCount++
+                    freedBytes += len
+                }
+            }
+        }
+
+        val now = System.currentTimeMillis()
+        exportsDir.listFiles()?.forEach { f ->
+            if (f.isFile && (now - f.lastModified() > 120_000L)) {
+                val len = f.length()
+                if (f.delete()) {
+                    deletedCount++
+                    freedBytes += len
+                }
+            }
+        }
+
+        return JSONObject().apply {
+            put("deletedCount", deletedCount)
+            put("freedBytes", freedBytes)
+        }
+    }
+
     fun importFontUri(uri: Uri): JSONObject? {
         val resolver = context.contentResolver
         var displayName = "CustomFont_${System.currentTimeMillis()}.ttf"
@@ -260,7 +326,7 @@ class MediaStorageHelper(private val context: Context) {
             val fileName = path.removePrefix("media/").substringBefore('?')
             val file = File(mediaDir, File(fileName).name)
             if (file.exists() && file.isFile) {
-                return serveFileWithRange(file, request.requestHeaders)
+                return serveFileWithRange(file, request.requestHeaders, "public, max-age=3600")
             }
             return notFoundResponse()
         }
@@ -269,7 +335,7 @@ class MediaStorageHelper(private val context: Context) {
             val fileName = path.removePrefix("userfonts/").substringBefore('?')
             val file = File(fontsDir, File(fileName).name)
             if (file.exists() && file.isFile) {
-                return serveFileWithRange(file, request.requestHeaders)
+                return serveFileWithRange(file, request.requestHeaders, "public, max-age=3600")
             }
             return notFoundResponse()
         }
@@ -278,7 +344,7 @@ class MediaStorageHelper(private val context: Context) {
             val fileName = path.removePrefix("exports/").substringBefore('?')
             val file = File(exportsDir, File(fileName).name)
             if (file.exists() && file.isFile) {
-                return serveFileWithRange(file, request.requestHeaders)
+                return serveFileWithRange(file, request.requestHeaders, "no-cache")
             }
             return notFoundResponse()
         }
@@ -316,7 +382,11 @@ class MediaStorageHelper(private val context: Context) {
         }
     }
 
-    private fun serveFileWithRange(file: File, requestHeaders: Map<String, String>): WebResourceResponse {
+    private fun serveFileWithRange(
+        file: File,
+        requestHeaders: Map<String, String>,
+        cacheControl: String = "public, max-age=3600"
+    ): WebResourceResponse {
         val totalSize = file.length()
         val mime = guessMimeType(file.name)
         val rangeHeader = requestHeaders.entries
@@ -353,6 +423,7 @@ class MediaStorageHelper(private val context: Context) {
                 "Accept-Ranges" to "bytes",
                 "Content-Range" to "bytes $start-$end/$totalSize",
                 "Content-Length" to length.toString(),
+                "Cache-Control" to cacheControl,
                 "Access-Control-Allow-Origin" to "*"
             )
             return WebResourceResponse(mime, null, 206, "Partial Content", headers, bounded)
@@ -361,6 +432,7 @@ class MediaStorageHelper(private val context: Context) {
         val headers = mapOf(
             "Accept-Ranges" to "bytes",
             "Content-Length" to totalSize.toString(),
+            "Cache-Control" to cacheControl,
             "Access-Control-Allow-Origin" to "*"
         )
         return WebResourceResponse(mime, null, 200, "OK", headers, FileInputStream(file))

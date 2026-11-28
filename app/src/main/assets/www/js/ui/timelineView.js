@@ -306,17 +306,17 @@ export function shouldActivateClipHold({
   dx = 0,
   elapsedMs = 0
 } = {}) {
+  const dist = Number(distPx) || 0;
+  const t = Number(elapsedMs) || 0;
   if (mode === 'left' || mode === 'right') {
-    return elapsedMs >= 110 || Math.abs(dx) >= 4;
+    const holdDelay = pointerType !== 'touch' ? 140 : 160;
+    return t >= holdDelay && dist <= 14;
   }
   if (mode === 'move') {
-    if (pointerType !== 'touch') {
-      return elapsedMs >= 110 || distPx >= 4;
-    }
-    if (wasSelected) {
-      return elapsedMs >= 110 || distPx >= 6;
-    }
-    return elapsedMs >= 140 || distPx >= 10;
+    const holdDelay = pointerType !== 'touch'
+      ? 140
+      : (wasSelected ? 160 : 190);
+    return t >= holdDelay && dist <= 12;
   }
   return false;
 }
@@ -598,6 +598,32 @@ export class TimelineView {
     }
   }
 
+  _setFilmstripCached(mediaId, tiles) {
+    if (!mediaId) return;
+    if (this.filmstripCache.has(mediaId)) {
+      this.filmstripCache.delete(mediaId);
+    }
+    this.filmstripCache.set(mediaId, tiles);
+    while (this.filmstripCache.size > 24) {
+      const oldestKey = this.filmstripCache.keys().next().value;
+      if (!oldestKey || oldestKey === mediaId) break;
+      this.filmstripCache.delete(oldestKey);
+    }
+  }
+
+  pruneFilmstripCache(project) {
+    if (!project || !Array.isArray(project.layers)) return;
+    const activeMediaIds = new Set();
+    for (const l of project.layers) {
+      if (l?.mediaId) activeMediaIds.add(l.mediaId);
+    }
+    for (const mid of [...this.filmstripCache.keys()]) {
+      if (!activeMediaIds.has(mid)) {
+        this.filmstripCache.delete(mid);
+      }
+    }
+  }
+
   _ensureFilmstripTile(mediaItem) {
     if (!mediaItem || !mediaItem.url) return null;
     const cached = this.filmstripCache.get(mediaItem.id);
@@ -609,13 +635,14 @@ export class TimelineView {
       this.filmstripCache.set(mediaItem.id, 'loading');
       const img = new Image();
       img.crossOrigin = 'anonymous';
+      img.decoding = 'async';
       img.onload = () => {
         const tile = document.createElement('canvas');
         tile.width = 56;
         tile.height = 34;
         const ctx = tile.getContext('2d');
         ctx.drawImage(img, 0, 0, tile.width, tile.height);
-        this.filmstripCache.set(mediaItem.id, [tile]);
+        this._setFilmstripCached(mediaItem.id, [tile]);
         this.cb.onPinchZoom?.();
       };
       img.onerror = () => this.filmstripCache.delete(mediaItem.id);
@@ -633,7 +660,7 @@ export class TimelineView {
 
   _pumpFilmstripQueue() {
     if (this._filmstripBusy || this._filmstripQueue.length === 0) return;
-    if (this.cb.isPlaying?.()) {
+    if (this.cb.isPlaying?.() || this._isClipGestureActive || this.isScrubbing) {
       setTimeout(() => this._pumpFilmstripQueue(), 350);
       return;
     }
@@ -650,7 +677,7 @@ export class TimelineView {
     this._filmstripBusy = true;
     const finishItem = () => {
       this._filmstripBusy = false;
-      setTimeout(() => this._pumpFilmstripQueue(), 60);
+      setTimeout(() => this._pumpFilmstripQueue(), 80);
     };
 
     const vid = document.createElement('video');
@@ -684,7 +711,7 @@ export class TimelineView {
           tile.getContext('2d').drawImage(vid, 0, 0, tile.width, tile.height);
           tiles.push(tile);
         }
-        this.filmstripCache.set(mediaItem.id, tiles);
+        this._setFilmstripCached(mediaItem.id, tiles);
         this.cb.onPinchZoom?.();
       } catch {
         this.filmstripCache.delete(mediaItem.id);
@@ -3027,9 +3054,9 @@ export class TimelineView {
   }
 
   bindClipGestures(clip, leftTrim, rightTrim, project, layer, waveEntry = null, filmEntry = null, laneEl = null, mainCtx = null) {
-    const MOVE_HOLD_DELAY_MS = 140;
-    const MOVE_SELECTED_HOLD_MS = 110;
-    const TRIM_HOLD_DELAY_MS = 110;
+    const MOVE_HOLD_DELAY_MS = 190;
+    const MOVE_SELECTED_HOLD_MS = 160;
+    const TRIM_HOLD_DELAY_MS = 160;
     const TAP_MOVE_TOL_PX = 10;
 
     let mode = null;
@@ -3288,10 +3315,14 @@ export class TimelineView {
         return;
       }
 
-      // 2D Drag & Drop target detection across lanes when moving vertically >= 24px
+      // 2D Drag & Drop target detection across lanes when moving out of current lane or >= 14px vertically
       const lanes = mode === 'move' ? [...this.lanesList.querySelectorAll('.mf-track-lane')] : [];
+      const originRect = laneEl?.getBoundingClientRect?.() || null;
+      const crossedLaneVertically = Boolean(
+        originRect && (clientY < originRect.top - 2 || clientY > originRect.bottom + 2)
+      );
       let hoveredLane = null;
-      if (mode === 'move' && Math.abs(dy) >= 24 && lanes.length > 0) {
+      if (mode === 'move' && (crossedLaneVertically || Math.abs(dy) >= 14) && lanes.length > 0) {
         for (const ln of lanes) {
           const r = ln.getBoundingClientRect();
           if (clientY >= r.top && clientY <= r.bottom) {
@@ -3460,10 +3491,16 @@ export class TimelineView {
         if (layer.trackRole !== 'main' && hoveredLane && hoveredLane !== laneEl && hoveredLane.dataset.laneType === 'single' && hoveredLane.dataset.zone === ownZone) {
           const targetIdx = Number(hoveredLane.dataset.layerIndex);
           if (Number.isInteger(targetIdx)) {
+            const zoneLanes = lanes.filter((ln) => ln.dataset.laneType === 'single' && ln.dataset.zone === ownZone);
+            const zoneRank = zoneLanes.indexOf(hoveredLane) + 1;
             hoveredLane.classList.add('drop-target');
             clip.classList.add('mf-clip-dragging-reorder');
             clip.style.transform = `translateY(${dy}px) scale(1.03)`;
-            pendingDrop = { targetLayerIndex: targetIdx, targetStartFrame: layer.startFrame };
+            pendingDrop = {
+              targetLayerIndex: targetIdx,
+              targetStartFrame: layer.startFrame,
+              zoneRank: zoneRank > 0 ? zoneRank : targetIdx + 1
+            };
           }
         }
       } else if (mode === 'left' || mode === 'right') {
@@ -3540,7 +3577,9 @@ export class TimelineView {
         );
       } else {
         const deltaMoveF = layer.startFrame - origStart;
-        const dropLabel = pendingDrop ? ' · Drop' : '';
+        const dropLabel = pendingDrop
+          ? (pendingDrop.zoneRank === 1 ? ' · Pindah ke Track 1 (Teratas)' : ` · Pindah ke Track #${pendingDrop.zoneRank}`)
+          : '';
         this._showTooltip(
           `${finePrefix}${formatSignedDurationDelta(deltaMoveF, fps)} · ${formatDurationShort(layer.startFrame, fps)}–${formatDurationShort(layer.endFrame, fps)}${dropLabel}${snapTag}`,
           clip,
@@ -3617,7 +3656,7 @@ export class TimelineView {
     };
 
     const onWinTouchMove = (e) => {
-      if (!mode || activePointerId === null) return;
+      if (!mode || activePointerId === null || !holdActivated) return;
       if (!e.touches || e.touches.length <= 1) {
         if (e.cancelable) e.preventDefault();
       }
@@ -3654,18 +3693,25 @@ export class TimelineView {
         holdTimer = null;
       }
       holdActivated = true;
+      startX = lastClientX;
+      startY = lastClientY;
+      startScrollLeft = this.scrollEl?.scrollLeft || 0;
+      startScrollTop = this.scrollEl?.scrollTop || 0;
       this._isClipGestureActive = true;
       this._isClipHoldLocked = true;
       this.scrollEl?.classList.add('is-clip-dragging');
       clip.classList.add('is-hold-active');
       if (mode === 'left') leftTrim.classList.add('is-hold-active');
       else if (mode === 'right') rightTrim.classList.add('is-hold-active');
+      if (captureEl && activePointerId !== null) {
+        try { captureEl.setPointerCapture(activePointerId); } catch {}
+      }
       try { navigator.vibrate?.(18); } catch {}
       this._startEdgeAutoScroll(edgeAutoScrollTick);
       const tipAnchor = mode === 'left' ? leftTrim : mode === 'right' ? rightTrim : clip;
       const tipMsg = mode === 'move'
-        ? 'Tahan aktif · Geser pindah item'
-        : 'Tahan aktif · Geser perpanjang/potong';
+        ? 'Tahan aktif · Geser kanan/kiri atau pindah track'
+        : 'Tahan aktif · Geser untuk perpanjang/perpendek';
       this._showTooltip(tipMsg, tipAnchor, 'drag');
     };
 
@@ -3698,7 +3744,7 @@ export class TimelineView {
       }
 
       if (layer.locked) return;
-      // Strict zone rule: top-left/top-right corners trim/extend, clip middle moves persistently until release
+      // Strict hold rule: left/right ends trim ONLY on hold; middle drags left/right/tracks ONLY on hold.
       mode = hitMode;
       downPointerType = e.pointerType || 'touch';
       downTimeMs = performance.now();
@@ -3752,10 +3798,8 @@ export class TimelineView {
         origMainSnapshot = null;
       }
       pushedUndo = false;
-      this._isClipGestureActive = true;
+      this._isClipGestureActive = false;
       this._isClipHoldLocked = false;
-      this.scrollEl?.classList.add('is-clip-dragging');
-      try { captureEl.setPointerCapture(e.pointerId); } catch {}
       this._activeDragReapply = reapplyCurrentDrag;
       this._activeClipAbort = () => {
         detachWindowListeners();
@@ -3778,11 +3822,17 @@ export class TimelineView {
       attachWindowListeners();
 
       const delayMs = hitMode === 'move'
-        ? (wasAlreadySelected ? MOVE_SELECTED_HOLD_MS : MOVE_HOLD_DELAY_MS)
-        : TRIM_HOLD_DELAY_MS;
+        ? (downPointerType !== 'touch' ? 140 : (wasAlreadySelected ? MOVE_SELECTED_HOLD_MS : MOVE_HOLD_DELAY_MS))
+        : (downPointerType !== 'touch' ? 140 : TRIM_HOLD_DELAY_MS);
       holdTimer = setTimeout(() => {
         if (mode !== hitMode || holdActivated || this._isPinching) return;
-        activateHold();
+        const preMove = Math.hypot(lastClientX - startX, lastClientY - startY);
+        const maxDrift = hitMode === 'move' ? 12 : 14;
+        if (preMove <= maxDrift) {
+          activateHold();
+        } else {
+          this._activeClipAbort?.();
+        }
       }, delayMs);
     };
 
@@ -3794,10 +3844,17 @@ export class TimelineView {
       }
 
       if (!holdActivated) {
+        lastClientX = e.clientX;
+        lastClientY = e.clientY;
         const dx = e.clientX - startX;
         const dy = e.clientY - startY;
         const distPx = Math.hypot(dx, dy);
         const elapsedMs = performance.now() - downTimeMs;
+        if (distPx > TAP_MOVE_TOL_PX) {
+          // User swiped instead of holding: abort pending hold so native timeline scroll runs smoothly
+          this._activeClipAbort?.();
+          return;
+        }
         if (shouldActivateClipHold({
           mode,
           pointerType: downPointerType,
@@ -3919,21 +3976,14 @@ export class TimelineView {
       mode = null;
     };
 
-    const preventNativeTouchOnHandle = (e) => {
-      if (e.touches && e.touches.length === 1) {
+    const preventNativeTouchMoveWhileHeld = (e) => {
+      if (mode && holdActivated && (!e.touches || e.touches.length <= 1) && e.cancelable) {
         e.preventDefault();
       }
     };
-    const preventNativeTouchMoveOnClip = (e) => {
-      if (mode && (!e.touches || e.touches.length <= 1) && e.cancelable) {
-        e.preventDefault();
-      }
-    };
-    leftTrim.addEventListener('touchstart', preventNativeTouchOnHandle, { passive: false });
-    rightTrim.addEventListener('touchstart', preventNativeTouchOnHandle, { passive: false });
-    leftTrim.addEventListener('touchmove', preventNativeTouchOnHandle, { passive: false });
-    rightTrim.addEventListener('touchmove', preventNativeTouchOnHandle, { passive: false });
-    clip.addEventListener('touchmove', preventNativeTouchMoveOnClip, { passive: false });
+    leftTrim.addEventListener('touchmove', preventNativeTouchMoveWhileHeld, { passive: false });
+    rightTrim.addEventListener('touchmove', preventNativeTouchMoveWhileHeld, { passive: false });
+    clip.addEventListener('touchmove', preventNativeTouchMoveWhileHeld, { passive: false });
     clip.addEventListener('dragstart', (e) => e.preventDefault());
 
     clip.addEventListener('contextmenu', (e) => e.preventDefault());

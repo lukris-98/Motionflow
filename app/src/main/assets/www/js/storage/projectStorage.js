@@ -269,8 +269,23 @@ export class HistoryManager {
     this.redoStack = [];
   }
 
+  _serializeLightweight(project) {
+    if (!project || typeof project !== 'object') return JSON.stringify(project);
+    if (!project.coverDataUrl) return JSON.stringify(project);
+    const { coverDataUrl: _omit, ...rest } = project;
+    return JSON.stringify(rest);
+  }
+
+  _restoreSnapshot(rawJson, currentProject) {
+    const restored = JSON.parse(rawJson);
+    if (restored && typeof restored === 'object' && restored.coverDataUrl === undefined && currentProject?.coverDataUrl) {
+      restored.coverDataUrl = currentProject.coverDataUrl;
+    }
+    return restored;
+  }
+
   pushSnapshot(project) {
-    this.undoStack.push(JSON.stringify(project));
+    this.undoStack.push(this._serializeLightweight(project));
     if (this.undoStack.length > this.limit) {
       this.undoStack.shift();
     }
@@ -287,13 +302,13 @@ export class HistoryManager {
 
   undo(currentProject) {
     if (!this.canUndo()) return null;
-    this.redoStack.push(JSON.stringify(currentProject));
-    return JSON.parse(this.undoStack.pop());
+    this.redoStack.push(this._serializeLightweight(currentProject));
+    return this._restoreSnapshot(this.undoStack.pop(), currentProject);
   }
 
   redo(currentProject) {
     if (!this.canRedo()) return null;
-    this.undoStack.push(JSON.stringify(currentProject));
-    return JSON.parse(this.redoStack.pop());
+    this.undoStack.push(this._serializeLightweight(currentProject));
+    return this._restoreSnapshot(this.redoStack.pop(), currentProject);
   }
 }

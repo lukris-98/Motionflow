@@ -15,6 +15,165 @@ export function extractGrayscale(rgba, width, height) {
 }
 
 /**
+ * Converts RGB [0..255] to HSV where h in [0, 360), s in [0, 1], v in [0, 1].
+ */
+export function rgbToHsv(r, g, b) {
+  const rn = r / 255;
+  const gn = g / 255;
+  const bn = b / 255;
+  const cmax = Math.max(rn, gn, bn);
+  const cmin = Math.min(rn, gn, bn);
+  const delta = cmax - cmin;
+  let h = 0;
+  if (delta > 1e-5) {
+    if (cmax === rn) h = 60 * (((gn - bn) / delta) % 6);
+    else if (cmax === gn) h = 60 * ((bn - rn) / delta + 2);
+    else h = 60 * ((rn - gn) / delta + 4);
+    if (h < 0) h += 360;
+  }
+  const s = cmax > 1e-5 ? delta / cmax : 0;
+  return { h, s, v: cmax };
+}
+
+function rgbToHex255(r, g, b) {
+  const toH = (v) => clamp(Math.round(v), 0, 255).toString(16).padStart(2, '0');
+  return `#${toH(r)}${toH(g)}${toH(b)}`.toUpperCase();
+}
+
+function hueDiffDeg(a, b) {
+  const d = Math.abs(a - b) % 360;
+  return d > 180 ? 360 - d : d;
+}
+
+/**
+ * Extracts a center-weighted chromatic color signature from an RGBA patch around (cx, cy).
+ * Used to distinguish a uniquely colored detail (e.g. a yellow mark) on repetitive backgrounds (white fence slats).
+ */
+export function extractColorSignature(rgba, width, height, cx, cy, radius = 10) {
+  if (!rgba || width < 2 || height < 2) {
+    return { valid: false, hue: 0, sat: 0, val: 0, chromaRatio: 0, hueTol: 36, satMin: 0.15, hex: '#FFFFFF', chromaContrast: 0 };
+  }
+  const r = Math.max(2, Math.round(radius));
+  let sumSin = 0;
+  let sumCos = 0;
+  let chromaW = 0;
+  let totalW = 0;
+  let sumS = 0;
+  let sumV = 0;
+  let sumR = 0;
+  let sumG = 0;
+  let sumB = 0;
+  let cSumR = 0;
+  let cSumG = 0;
+  let cSumB = 0;
+
+  for (let dy = -r; dy <= r; dy++) {
+    const py = clamp(Math.round(cy + dy), 0, height - 1);
+    for (let dx = -r; dx <= r; dx++) {
+      const px = clamp(Math.round(cx + dx), 0, width - 1);
+      const dist = Math.hypot(dx, dy) / Math.max(1, r);
+      if (dist > 1.08) continue;
+      const spatialW = Math.max(0.15, 1.0 - dist * 0.65);
+      const i = (py * width + px) * 4;
+      const pr = rgba[i];
+      const pg = rgba[i + 1];
+      const pb = rgba[i + 2];
+      const hsv = rgbToHsv(pr, pg, pb);
+      totalW += spatialW;
+      sumR += pr * spatialW;
+      sumG += pg * spatialW;
+      sumB += pb * spatialW;
+
+      if (hsv.s >= 0.22 && hsv.v >= 0.20) {
+        const cw = spatialW * hsv.s * hsv.s * (0.2 + 0.8 * hsv.v);
+        const radH = (hsv.h * Math.PI) / 180;
+        sumSin += Math.sin(radH) * cw;
+        sumCos += Math.cos(radH) * cw;
+        sumS += hsv.s * cw;
+        sumV += hsv.v * cw;
+        cSumR += pr * cw;
+        cSumG += pg * cw;
+        cSumB += pb * cw;
+        chromaW += cw;
+      }
+    }
+  }
+
+  const chromaRatio = totalW > 0 ? chromaW / totalW : 0;
+  if (chromaW <= 1e-4 || chromaRatio < 0.03) {
+    const hex = totalW > 0 ? rgbToHex255(sumR / totalW, sumG / totalW, sumB / totalW) : '#FFFFFF';
+    return { valid: false, hue: 0, sat: 0, val: 0, chromaRatio, hueTol: 36, satMin: 0.18, hex, chromaContrast: 0 };
+  }
+
+  let meanHue = (Math.atan2(sumSin, sumCos) * 180) / Math.PI;
+  if (meanHue < 0) meanHue += 360;
+  const meanSat = sumS / chromaW;
+  const meanVal = sumV / chromaW;
+  const hex = rgbToHex255(cSumR / chromaW, cSumG / chromaW, cSumB / chromaW);
+
+  // Measure how concentrated the distinctive chroma is relative to neutral/dark pixels in patch
+  const chromaContrast = clamp(chromaRatio * meanSat * 3.8, 0, 1);
+
+  return {
+    valid: chromaRatio >= 0.03 && meanSat >= 0.28 && meanVal >= 0.22,
+    hue: Number(meanHue.toFixed(1)),
+    sat: Number(meanSat.toFixed(3)),
+    val: Number(meanVal.toFixed(3)),
+    chromaRatio: Number(chromaRatio.toFixed(3)),
+    hueTol: clamp(32 + (1 - meanSat) * 16, 26, 46),
+    satMin: Math.max(0.18, meanSat * 0.45),
+    hex,
+    chromaContrast: Number(chromaContrast.toFixed(3))
+  };
+}
+
+/**
+ * Evaluates how well a candidate RGBA patch at (candX, candY) matches a target color signature [0..1].
+ * Center pixels receive higher weight so background surrounding the mark cannot drown out small distinctive marks.
+ */
+export function evalColorAffinityAt(sig, rgba, fw, fh, candX, candY, radius = 8, relScale = 1.0) {
+  if (!sig?.valid || !rgba) return 0;
+  const r = Math.max(2, Math.round(radius));
+  const step = r >= 10 ? 2 : 1;
+  let matchSum = 0;
+  let weightSum = 0;
+  let peakMatch = 0;
+
+  for (let dy = -r; dy <= r; dy += step) {
+    const py = Math.round(candY + dy * relScale);
+    if (py < 0 || py >= fh) continue;
+    for (let dx = -r; dx <= r; dx += step) {
+      const px = Math.round(candX + dx * relScale);
+      if (px < 0 || px >= fw) continue;
+      const dist = Math.hypot(dx, dy) / Math.max(1, r);
+      if (dist > 1.1) continue;
+      const w = Math.max(0.2, 1.0 - dist * 0.65);
+      const i = (py * fw + px) * 4;
+      const hsv = rgbToHsv(rgba[i], rgba[i + 1], rgba[i + 2]);
+      let pixAffinity = 0;
+      if (hsv.s >= sig.satMin && hsv.v >= 0.08) {
+        const hd = hueDiffDeg(hsv.h, sig.hue);
+        if (hd <= sig.hueTol) {
+          const hScore = 1 - hd / sig.hueTol;
+          const sScore = clamp(hsv.s / Math.max(0.2, sig.sat), 0.35, 1.0);
+          pixAffinity = hScore * sScore;
+        }
+      }
+      matchSum += pixAffinity * w;
+      weightSum += w;
+      if (pixAffinity > peakMatch) peakMatch = pixAffinity;
+    }
+  }
+
+  if (weightSum <= 1e-5) return 0;
+  const meanAffinity = matchSum / weightSum;
+  // Compare against expected chromaRatio so small marks (e.g. 15% of patch) still score ~1.0 when present
+  const expectedFill = clamp(sig.chromaRatio * 0.85, 0.06, 0.75);
+  const coverageScore = clamp(meanAffinity / expectedFill, 0, 1);
+  return clamp(coverageScore * 0.78 + peakMatch * 0.22, 0, 1);
+}
+
+/**
  * Bilinear grayscale sample at floating-point pixel coordinates.
  */
 export function sampleGrayBilinear(gray, width, height, x, y) {
@@ -131,12 +290,36 @@ export function evalZNCCAt(tpl, frameGray, fw, fh, candX, candY, relScale = 1.0)
 }
 
 /**
- * Coarse-to-fine ZNCC tracker step with parabolic sub-pixel refinement & optional scale search.
+ * Coarse-to-fine ZNCC + optional Color-Lock Hybrid matcher with parabolic sub-pixel refinement & scale search.
  */
-export function matchTemplateCoarseToFine(tpl, frameGray, fw, fh, predX, predY, searchRadius = 22, trackScale = false) {
+export function matchTemplateCoarseToFine(
+  tpl,
+  frameGray,
+  fw,
+  fh,
+  predX,
+  predY,
+  searchRadius = 22,
+  trackScale = false,
+  colorOpts = null
+) {
+  const useColor = Boolean(colorOpts?.rgba && colorOpts?.chromaProfile?.valid);
+  const cw = useColor ? clamp(colorOpts.colorWeight ?? 0.45, 0.1, 0.85) : 0;
+
+  const evalCombined = (x, y, sc = 1.0) => {
+    const z = evalZNCCAt(tpl, frameGray, fw, fh, x, y, sc);
+    if (!useColor) return { total: z, zncc: z, color: 0 };
+    const col = evalColorAffinityAt(colorOpts.chromaProfile, colorOpts.rgba, fw, fh, x, y, tpl.radius, sc);
+    const colSigned = col * 2 - 1;
+    // If luminance template is weak (isoluminant color mark), lean harder on color signature
+    const effW = tpl.stdNorm < 5 ? Math.max(cw, 0.72) : cw;
+    const total = z * (1 - effW) + colSigned * effW;
+    return { total, zncc: z, color: col };
+  };
+
   let bestX = predX;
   let bestY = predY;
-  let bestScore = -1;
+  let bestEval = { total: -2, zncc: -1, color: 0 };
 
   const minX = Math.max(2, Math.floor(predX - searchRadius));
   const maxX = Math.min(fw - 3, Math.ceil(predX + searchRadius));
@@ -145,9 +328,9 @@ export function matchTemplateCoarseToFine(tpl, frameGray, fw, fh, predX, predY, 
 
   for (let y = minY; y <= maxY; y += 2) {
     for (let x = minX; x <= maxX; x += 2) {
-      const s = evalZNCCAt(tpl, frameGray, fw, fh, x, y, 1.0);
-      if (s > bestScore) {
-        bestScore = s;
+      const ev = evalCombined(x, y, 1.0);
+      if (ev.total > bestEval.total) {
+        bestEval = ev;
         bestX = x;
         bestY = y;
       }
@@ -161,57 +344,66 @@ export function matchTemplateCoarseToFine(tpl, frameGray, fw, fh, predX, predY, 
 
   let fineX = Math.round(bestX);
   let fineY = Math.round(bestY);
-  let fineScore = bestScore;
+  let fineEval = bestEval;
 
   for (let y = fMinY; y <= fMaxY; y++) {
     for (let x = fMinX; x <= fMaxX; x++) {
-      const s = evalZNCCAt(tpl, frameGray, fw, fh, x, y, 1.0);
-      if (s > fineScore) {
-        fineScore = s;
+      const ev = evalCombined(x, y, 1.0);
+      if (ev.total > fineEval.total) {
+        fineEval = ev;
         fineX = x;
         fineY = y;
       }
     }
   }
 
-  const sL = evalZNCCAt(tpl, frameGray, fw, fh, fineX - 1, fineY, 1.0);
-  const sR = evalZNCCAt(tpl, frameGray, fw, fh, fineX + 1, fineY, 1.0);
-  const sU = evalZNCCAt(tpl, frameGray, fw, fh, fineX, fineY - 1, 1.0);
-  const sD = evalZNCCAt(tpl, frameGray, fw, fh, fineX, fineY + 1, 1.0);
+  const sL = evalCombined(fineX - 1, fineY, 1.0).total;
+  const sR = evalCombined(fineX + 1, fineY, 1.0).total;
+  const sU = evalCombined(fineX, fineY - 1, 1.0).total;
+  const sD = evalCombined(fineX, fineY + 1, 1.0).total;
 
-  const denomX = 2 * (sL - 2 * fineScore + sR);
-  const denomY = 2 * (sU - 2 * fineScore + sD);
+  const denomX = 2 * (sL - 2 * fineEval.total + sR);
+  const denomY = 2 * (sU - 2 * fineEval.total + sD);
   const subX = Math.abs(denomX) > 1e-4 ? clamp((sL - sR) / denomX, -0.5, 0.5) : 0;
   const subY = Math.abs(denomY) > 1e-4 ? clamp((sU - sD) / denomY, -0.5, 0.5) : 0;
   const finalX = fineX + subX;
   const finalY = fineY + subY;
 
   let bestScale = 1.0;
-  if (trackScale && fineScore >= 0.42) {
-    let bestScaleScore = fineScore;
+  let finalScore = useColor
+    ? clamp(fineEval.zncc * (1 - cw * 0.65) + fineEval.color * (cw * 0.65), -1, 1)
+    : fineEval.zncc;
+
+  if (trackScale && finalScore >= 0.42) {
+    let bestScaleEval = fineEval;
     const scaleCandidates = [0.94, 0.965, 0.985, 1.0, 1.015, 1.035, 1.06, 1.09];
     for (const sc of scaleCandidates) {
-      const s = evalZNCCAt(tpl, frameGray, fw, fh, finalX, finalY, sc);
-      if (s > bestScaleScore + 0.0015) {
-        bestScaleScore = s;
+      const ev = evalCombined(finalX, finalY, sc);
+      if (ev.total > bestScaleEval.total + 0.0015) {
+        bestScaleEval = ev;
         bestScale = sc;
       }
     }
-    // Fine sub-scale parabolic refinement for smooth approach zoom
-    const sMinus = evalZNCCAt(tpl, frameGray, fw, fh, finalX, finalY, bestScale - 0.01);
-    const sPlus = evalZNCCAt(tpl, frameGray, fw, fh, finalX, finalY, bestScale + 0.01);
-    const sDenom = 2 * (sMinus - 2 * bestScaleScore + sPlus);
+    const sMinus = evalCombined(finalX, finalY, bestScale - 0.01).total;
+    const sPlus = evalCombined(finalX, finalY, bestScale + 0.01).total;
+    const sDenom = 2 * (sMinus - 2 * bestScaleEval.total + sPlus);
     if (Math.abs(sDenom) > 1e-4) {
       const subSc = clamp((sMinus - sPlus) / sDenom, -0.5, 0.5) * 0.01;
       bestScale = clamp(bestScale + subSc, 0.92, 1.12);
     }
-    fineScore = Math.max(fineScore, bestScaleScore);
+    const scaledScore = useColor
+      ? clamp(bestScaleEval.zncc * (1 - cw * 0.65) + bestScaleEval.color * (cw * 0.65), -1, 1)
+      : bestScaleEval.zncc;
+    finalScore = Math.max(finalScore, scaledScore);
+    fineEval = bestScaleEval;
   }
 
   return {
     x: finalX,
     y: finalY,
-    score: fineScore,
+    score: finalScore,
+    znccScore: fineEval.zncc,
+    colorScore: fineEval.color,
     relScale: bestScale
   };
 }
@@ -310,11 +502,11 @@ export class TrackerEngine {
     searchRadiusProj = 95,
     trackScale = true,
     trackTilt3D = true,
+    colorLock = 'auto', // 'auto' | 'on' | 'off'
     minConfidence = 0.50,
+    maxCoastFrames = 8,
     onFrameTracked
   }) {
-    this.cancelled = false;
-
     const analysisScale = Math.min(0.45, 320 / Math.max(project.width, project.height));
     const aw = Math.max(120, Math.round(project.width * analysisScale));
     const ah = Math.max(90, Math.round(project.height * analysisScale));
@@ -323,20 +515,7 @@ export class TrackerEngine {
     canvas.height = ah;
     const ctx = canvas.getContext('2d', { willReadFrequently: true });
 
-    const fovRad = (45 * Math.PI) / 180;
-    const camDist = (project.height / 2) / Math.tan(fovRad / 2);
-
-    const toAnalysisX = (px) => (project.width / 2 + px) * analysisScale;
-    const toAnalysisY = (py) => (project.height / 2 + py) * analysisScale;
-    const toProjX = (ax) => ax / analysisScale - project.width / 2;
-    const toProjY = (ay) => ay / analysisScale - project.height / 2;
-
-    const patchR = clamp(Math.round(patchRadiusProj * analysisScale), 6, 20);
-    const searchR = clamp(Math.round(searchRadiusProj * analysisScale), 12, 48);
-    const satOffset = Math.max(8, Math.round(patchR * 0.8));
-    const satPatchR = Math.max(5, Math.round(patchR * 0.65));
-
-    const captureGrayAtFrame = async (f) => {
+    const captureFrame = async (f) => {
       await this.renderer.seekVideosForFrame(project, f, mediaMap, true);
       ctx.fillStyle = '#000000';
       ctx.fillRect(0, 0, aw, ah);
@@ -355,27 +534,119 @@ export class TrackerEngine {
       ctx.restore();
 
       const img = ctx.getImageData(0, 0, aw, ah);
-      return extractGrayscale(img.data, aw, ah);
+      return {
+        rgba: img.data,
+        gray: extractGrayscale(img.data, aw, ah)
+      };
     };
 
     const startF = clamp(Math.round(anchorFrame), videoLayer.startFrame, videoLayer.endFrame);
-    const anchorGray = await captureGrayAtFrame(startF);
-    if (!anchorGray) {
+    return this.trackFrameSequence({
+      sourceLayerId: videoLayer.id,
+      width: aw,
+      height: ah,
+      projWidth: project.width,
+      projHeight: project.height,
+      analysisScale,
+      startFrame: startF,
+      minFrame: videoLayer.startFrame,
+      maxFrame: videoLayer.endFrame,
+      direction,
+      targetX,
+      targetY,
+      patchRadius: clamp(Math.round(patchRadiusProj * analysisScale), 6, 20),
+      searchRadius: clamp(Math.round(searchRadiusProj * analysisScale), 12, 48),
+      trackScale,
+      trackTilt3D,
+      colorLock,
+      minConfidence,
+      maxCoastFrames,
+      captureFrame,
+      onFrameTracked,
+      yieldEvery: 2
+    });
+  }
+
+  /**
+   * Core frame-buffer 3D + HSV Color-Lock + Occlusion-Coasting tracker.
+   * Separated from DOM Canvas rasterization so both UI playback and headless tests share exact tracker logic.
+   */
+  async trackFrameSequence({
+    sourceLayerId = null,
+    width,
+    height,
+    projWidth = width,
+    projHeight = height,
+    analysisScale = 1,
+    startFrame,
+    minFrame,
+    maxFrame,
+    direction = 'forward',
+    targetX = 0,
+    targetY = 0,
+    patchRadius = 10,
+    searchRadius = 24,
+    trackScale = true,
+    trackTilt3D = true,
+    colorLock = 'auto',
+    minConfidence = 0.50,
+    maxCoastFrames = 8,
+    captureFrame,
+    onFrameTracked,
+    yieldEvery = 0
+  }) {
+    this.cancelled = false;
+
+    const aw = width;
+    const ah = height;
+    const fovRad = (45 * Math.PI) / 180;
+    const camDist = (projHeight / 2) / Math.tan(fovRad / 2);
+
+    const toAnalysisX = (px) => (projWidth / 2 + px) * analysisScale;
+    const toAnalysisY = (py) => (projHeight / 2 + py) * analysisScale;
+    const toProjX = (ax) => ax / analysisScale - projWidth / 2;
+    const toProjY = (ay) => ay / analysisScale - projHeight / 2;
+
+    const patchR = clamp(Math.round(patchRadius), 4, 24);
+    const searchR = clamp(Math.round(searchRadius), 8, 64);
+    const satOffset = Math.max(8, Math.round(patchR * 0.8));
+    const satPatchR = Math.max(5, Math.round(patchR * 0.65));
+
+    const startF = clamp(Math.round(startFrame), minFrame, maxFrame);
+    const anchorBuf = await captureFrame(startF);
+    if (!anchorBuf?.gray) {
       throw new Error('Video frame not ready for tracking. Wait for video preview to load.');
     }
 
     const ax0 = toAnalysisX(targetX);
     const ay0 = toAnalysisY(targetY);
-    const anchorTpl = extractTemplatePatch(anchorGray, aw, ah, ax0, ay0, patchR);
-    if (anchorTpl.stdNorm < 5) {
-      throw new Error('Target area lacks contrast/detail. Aim at a distinct landmark (sign, line, corner).');
+    const anchorTpl = extractTemplatePatch(anchorBuf.gray, aw, ah, ax0, ay0, patchR);
+    const anchorColorSig = anchorBuf.rgba
+      ? extractColorSignature(anchorBuf.rgba, aw, ah, ax0, ay0, patchR)
+      : { valid: false, hex: '#FFFFFF', chromaContrast: 0 };
+
+    const useColorLock =
+      colorLock === 'on'
+        ? Boolean(anchorColorSig.valid)
+        : colorLock === 'off'
+          ? false
+          : Boolean(anchorColorSig.valid);
+
+    if (anchorTpl.stdNorm < 5 && !(useColorLock && anchorColorSig.valid)) {
+      throw new Error('Target area lacks contrast/detail. Aim at a distinct landmark (sign, line, corner, or colored mark).');
     }
 
+    const baseColorWeight = useColorLock
+      ? (colorLock === 'on'
+        ? clamp(0.42 + anchorColorSig.chromaContrast * 0.30, 0.42, 0.72)
+        : clamp(0.32 + anchorColorSig.chromaContrast * 0.30, 0.32, 0.62))
+      : 0;
+
     const anchorSatR = trackTilt3D && ax0 + satOffset < aw - 4
-      ? extractTemplatePatch(anchorGray, aw, ah, ax0 + satOffset, ay0, satPatchR)
+      ? extractTemplatePatch(anchorBuf.gray, aw, ah, ax0 + satOffset, ay0, satPatchR)
       : null;
     const anchorSatB = trackTilt3D && ay0 + satOffset < ah - 4
-      ? extractTemplatePatch(anchorGray, aw, ah, ax0, ay0 + satOffset, satPatchR)
+      ? extractTemplatePatch(anchorBuf.gray, aw, ah, ax0, ay0 + satOffset, satPatchR)
       : null;
 
     const pointMap = new Map();
@@ -388,16 +659,19 @@ export class TrackerEngine {
       rotation: 0,
       rotX: 0,
       rotY: 0,
-      score: 1.0
+      score: 1.0,
+      colorScore: useColorLock ? 1.0 : 0,
+      coasting: false
     });
 
     const totalSteps =
       direction === 'forward'
-        ? Math.max(1, videoLayer.endFrame - startF)
+        ? Math.max(1, maxFrame - startF)
         : direction === 'backward'
-          ? Math.max(1, startF - videoLayer.startFrame)
-          : Math.max(1, videoLayer.endFrame - videoLayer.startFrame);
+          ? Math.max(1, startF - minFrame)
+          : Math.max(1, maxFrame - minFrame);
     let completedSteps = 0;
+    let coastedFrames = 0;
 
     const runSweep = async (stepDir) => {
       let curTpl = anchorTpl;
@@ -413,26 +687,30 @@ export class TrackerEngine {
       let prevStepScale = 1.0;
       let vx = 0;
       let vy = 0;
-      let lowConfStreak = 0;
+      let coastStreak = 0;
       let framesSinceRefresh = 0;
 
-      const limitFrame = stepDir > 0 ? videoLayer.endFrame : videoLayer.startFrame;
+      const limitFrame = stepDir > 0 ? maxFrame : minFrame;
       for (let f = startF + stepDir; stepDir > 0 ? f <= limitFrame : f >= limitFrame; f += stepDir) {
         if (this.cancelled) break;
 
-        const gray = await captureGrayAtFrame(f);
-        if (!gray) break;
+        const frameBuf = await captureFrame(f);
+        if (!frameBuf?.gray) break;
+        const { gray, rgba } = frameBuf;
 
         // Expansion-aware prediction for approaching/receding walking camera footage
         const radialBoost = prevStepScale > 1.004 ? 1.08 : 1.0;
         const predAx = clamp(curAx + vx * radialBoost, 2, aw - 3);
         const predAy = clamp(curAy + vy * radialBoost, 2, ah - 3);
         const effSearchR = clamp(
-          Math.round(searchR + Math.hypot(vx, vy) * 1.45),
+          Math.round(searchR + Math.hypot(vx, vy) * (1.45 + coastStreak * 0.28) + coastStreak * 2),
           searchR,
-          Math.max(searchR, Math.round(aw * 0.28))
+          Math.max(searchR, Math.round(aw * 0.34))
         );
-        const match = matchTemplateCoarseToFine(curTpl, gray, aw, ah, predAx, predAy, effSearchR, trackScale);
+        const colorOpts = useColorLock && rgba
+          ? { rgba, chromaProfile: anchorColorSig, colorWeight: baseColorWeight }
+          : null;
+        const match = matchTemplateCoarseToFine(curTpl, gray, aw, ah, predAx, predAy, effSearchR, trackScale, colorOpts);
 
         const edgeMargin = 4;
         const hitEdge =
@@ -440,19 +718,52 @@ export class TrackerEngine {
           match.x >= aw - edgeMargin ||
           match.y <= edgeMargin ||
           match.y >= ah - edgeMargin;
+        const nearEdge =
+          predAx <= aw * 0.08 || predAx >= aw * 0.92 || predAy <= ah * 0.08 || predAy >= ah * 0.92;
 
-        if (match.score < minConfidence) {
-          lowConfStreak++;
-        } else {
-          lowConfStreak = 0;
-        }
+        const isLowConf = match.score < minConfidence || (useColorLock && anchorColorSig.chromaContrast >= 0.25 && (match.colorScore || 0) < 0.12 && match.znccScore < 0.85);
 
-        if (lowConfStreak >= 2 || (hitEdge && match.score < 0.72)) {
+        if (isLowConf) {
+          // Occlusion Coast Mode: predict position/depth briefly without corrupting frozen template & color lock
+          const canCoast = !nearEdge && coastStreak < maxCoastFrames && (pointMap.size >= 2 || maxCoastFrames > 0);
+          if (canCoast) {
+            coastStreak++;
+            coastedFrames++;
+            curAx = predAx;
+            curAy = predAy;
+            curScale = clamp(curScale * prevStepScale, 0.35, 4.5);
+            const depthZ = camDist * (1 - 1 / curScale);
+            const coastPt = {
+              frame: f,
+              x: Number(toProjX(curAx).toFixed(1)),
+              y: Number(toProjY(curAy).toFixed(1)),
+              z: Number(depthZ.toFixed(1)),
+              scale: Number(curScale.toFixed(3)),
+              rotation: orientState.rotation,
+              rotX: orientState.rotX,
+              rotY: orientState.rotY,
+              score: Number(Math.max(0, match.score).toFixed(2)),
+              colorScore: Number((match.colorScore || 0).toFixed(2)),
+              coasting: true
+            };
+            pointMap.set(f, coastPt);
+            completedSteps++;
+            if (onFrameTracked) {
+              const pct = Math.min(99, Math.round((completedSteps / totalSteps) * 100));
+              onFrameTracked(pct, coastPt, pointMap.size);
+            }
+            if (yieldEvery > 0 && completedSteps % yieldEvery === 0) {
+              await new Promise((r) => setTimeout(r, 0));
+            }
+            continue;
+          }
+
+          // Permanent loss or edge exit -> extrapolate brief pass-by exit if moving toward frame border
           const speed = Math.hypot(vx, vy);
-          if (speed >= 1.0 && (hitEdge || predAx < aw * 0.16 || predAx > aw * 0.84 || predAy < ah * 0.16 || predAy > ah * 0.84)) {
+          if (speed >= 1.0 && (hitEdge || nearEdge || predAx < aw * 0.16 || predAx > aw * 0.84 || predAy < ah * 0.16 || predAy > ah * 0.84)) {
             for (let ex = 0; ex < 2; ex++) {
               const exFrame = f + ex * stepDir;
-              if (exFrame > videoLayer.endFrame || exFrame < videoLayer.startFrame) break;
+              if (exFrame > maxFrame || exFrame < minFrame) break;
               const accel = 1 + 0.08 * (ex + 1);
               const exAx = curAx + vx * (ex + 1) * accel;
               const exAy = curAy + vy * (ex + 1) * accel;
@@ -467,7 +778,7 @@ export class TrackerEngine {
                 rotation: orientState.rotation,
                 rotX: orientState.rotX,
                 rotY: orientState.rotY,
-                score: Number(match.score.toFixed(2)),
+                score: Number(Math.max(0, match.score).toFixed(2)),
                 extrapolated: true
               });
             }
@@ -475,8 +786,13 @@ export class TrackerEngine {
           break;
         }
 
-        vx = vx * 0.35 + (match.x - curAx) * 0.65;
-        vy = vy * 0.35 + (match.y - curAy) * 0.65;
+        const wasCoasting = coastStreak > 0;
+        coastStreak = 0;
+
+        // Re-acquiring after coasting uses faster velocity blend; steady lock smooths footstep jitter
+        const velBlend = wasCoasting ? 0.85 : 0.65;
+        vx = vx * (1 - velBlend) + (match.x - curAx) * velBlend;
+        vy = vy * (1 - velBlend) + (match.y - curAy) * velBlend;
         curAx = match.x;
         curAy = match.y;
         const rawStepScale = clamp(match.relScale || 1.0, 0.93, 1.09);
@@ -511,7 +827,8 @@ export class TrackerEngine {
         const depthZ = camDist * (1 - 1 / curScale);
 
         framesSinceRefresh++;
-        if (match.score >= 0.80 && framesSinceRefresh >= 2) {
+        const colorConsistent = !useColorLock || (match.colorScore || 0) >= 0.45;
+        if (match.score >= 0.80 && colorConsistent && framesSinceRefresh >= 2) {
           const refreshed = extractTemplatePatch(gray, aw, ah, curAx, curAy, patchR);
           if (refreshed.stdNorm >= 5) {
             curTpl = refreshed;
@@ -528,7 +845,9 @@ export class TrackerEngine {
           rotation: orientState.rotation,
           rotX: orientState.rotX,
           rotY: orientState.rotY,
-          score: Number(match.score.toFixed(2))
+          score: Number(match.score.toFixed(2)),
+          colorScore: Number((match.colorScore || 0).toFixed(2)),
+          coasting: false
         };
         pointMap.set(f, pt);
 
@@ -540,7 +859,7 @@ export class TrackerEngine {
 
         if (hitEdge) break;
 
-        if (completedSteps % 2 === 0) {
+        if (yieldEvery > 0 && completedSteps % yieldEvery === 0) {
           await new Promise((r) => setTimeout(r, 0));
         }
       }
@@ -561,11 +880,14 @@ export class TrackerEngine {
         : 0;
 
     return {
-      sourceLayerId: videoLayer.id,
+      sourceLayerId,
       anchorFrame: startF,
       startFrame: points[0]?.frame ?? startF,
       endFrame: points[points.length - 1]?.frame ?? startF,
       avgConfidence: Number(avgScore.toFixed(2)),
+      colorLockUsed: useColorLock,
+      colorSignature: anchorColorSig.valid ? { hex: anchorColorSig.hex, hue: anchorColorSig.hue, sat: anchorColorSig.sat } : null,
+      coastedFrames,
       points
     };
   }

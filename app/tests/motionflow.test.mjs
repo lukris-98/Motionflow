@@ -15,11 +15,13 @@ import { AudioEngine, detectBeatsFromPcm } from '../src/main/assets/www/js/engin
 import fs from 'node:fs';
 import { parseSrtOrLyrics, FILTER_PRESETS, VIDEO_EFFECT_PRESETS, TRANSITION_PRESETS, TRANSITION_CATEGORIES, ANIMATION_CATALOG, getAnimationCatalogForLayerType } from '../src/main/assets/www/js/engine/capcutCatalog.js';
 import { ExportEngine } from '../src/main/assets/www/js/export/exportEngine.js';
-import { createEmptyProject, deserializeProject, serializeProject } from '../src/main/assets/www/js/storage/projectStorage.js';
+import { HistoryManager, createEmptyProject, deserializeProject, serializeProject } from '../src/main/assets/www/js/storage/projectStorage.js';
 import { RendererEngine } from '../src/main/assets/www/js/engine/rendererEngine.js';
 import {
   extractGrayscale,
   extractTemplatePatch,
+  extractColorSignature,
+  evalColorAffinityAt,
   matchTemplateCoarseToFine,
   smoothTrackedPoints,
   TrackerEngine
@@ -2056,25 +2058,27 @@ test('Animation catalog separates Text animations from shared Video/Image per-it
   }
 });
 
-test('Persistent timeline item drag activation never drops into scroll-hijack and trims stay responsive', () => {
-  // Quick taps stay tap-to-select until threshold or hold timer fires
+test('Strict click-and-hold timeline item activation requires holding before trim or drag so quick swipes scroll cleanly', () => {
+  // Quick swipes or immediate drags WITHOUT holding must NEVER trigger move or trim
   assert.equal(shouldActivateClipHold({ mode: 'move', pointerType: 'touch', wasSelected: false, distPx: 5, elapsedMs: 40 }), false);
-  assert.equal(shouldActivateClipHold({ mode: 'move', pointerType: 'touch', wasSelected: true, distPx: 4, elapsedMs: 40 }), false);
+  assert.equal(shouldActivateClipHold({ mode: 'move', pointerType: 'touch', wasSelected: true, distPx: 7, elapsedMs: 35 }), false);
+  assert.equal(shouldActivateClipHold({ mode: 'move', pointerType: 'touch', wasSelected: false, distPx: 14, elapsedMs: 45 }), false);
+  assert.equal(shouldActivateClipHold({ mode: 'move', pointerType: 'mouse', wasSelected: false, distPx: 4, elapsedMs: 20 }), false);
+  assert.equal(shouldActivateClipHold({ mode: 'left', pointerType: 'touch', distPx: 4, dx: -4, elapsedMs: 25 }), false);
+  assert.equal(shouldActivateClipHold({ mode: 'right', pointerType: 'touch', distPx: 6, dx: 6, elapsedMs: 90 }), false);
 
-  // Moving an already-selected or unselected item on touch immediately locks into drag without cancelling to scroll
-  assert.equal(shouldActivateClipHold({ mode: 'move', pointerType: 'touch', wasSelected: true, distPx: 7, elapsedMs: 35 }), true);
-  assert.equal(shouldActivateClipHold({ mode: 'move', pointerType: 'touch', wasSelected: false, distPx: 14, elapsedMs: 45 }), true);
+  // Moving too far before hold timer completes cancels hold activation
+  assert.equal(shouldActivateClipHold({ mode: 'move', pointerType: 'touch', wasSelected: true, distPx: 15, elapsedMs: 200 }), false);
+  assert.equal(shouldActivateClipHold({ mode: 'left', pointerType: 'touch', distPx: 18, elapsedMs: 200 }), false);
 
-  // Long-press still activates hold even with zero pointer drift
-  assert.equal(shouldActivateClipHold({ mode: 'move', pointerType: 'touch', wasSelected: true, distPx: 0, elapsedMs: 115 }), true);
-  assert.equal(shouldActivateClipHold({ mode: 'move', pointerType: 'touch', wasSelected: false, distPx: 0, elapsedMs: 145 }), true);
+  // Holding on the middle activates item move/track-reorder drag
+  assert.equal(shouldActivateClipHold({ mode: 'move', pointerType: 'touch', wasSelected: true, distPx: 2, elapsedMs: 165 }), true);
+  assert.equal(shouldActivateClipHold({ mode: 'move', pointerType: 'touch', wasSelected: false, distPx: 0, elapsedMs: 195 }), true);
+  assert.equal(shouldActivateClipHold({ mode: 'move', pointerType: 'mouse', wasSelected: false, distPx: 2, elapsedMs: 145 }), true);
 
-  // Mouse/pen drag activates crisply on minimal displacement
-  assert.equal(shouldActivateClipHold({ mode: 'move', pointerType: 'mouse', wasSelected: false, distPx: 4, elapsedMs: 20 }), true);
-
-  // Left/right corner trim handles activate reliably on drag or brief hold
-  assert.equal(shouldActivateClipHold({ mode: 'left', pointerType: 'touch', distPx: 4, dx: -4, elapsedMs: 25 }), true);
-  assert.equal(shouldActivateClipHold({ mode: 'right', pointerType: 'touch', distPx: 0, dx: 0, elapsedMs: 115 }), true);
+  // Holding on left/right ends activates extend/trim
+  assert.equal(shouldActivateClipHold({ mode: 'left', pointerType: 'touch', distPx: 2, dx: -1, elapsedMs: 165 }), true);
+  assert.equal(shouldActivateClipHold({ mode: 'right', pointerType: 'touch', distPx: 0, dx: 0, elapsedMs: 165 }), true);
 
   // Vertical edge auto-scroll math works symmetrically with horizontal edge auto-scroll
   assert.equal(computeEdgeAutoScrollDelta(200, 120, 360, 0, 26, 12), 0);
@@ -2191,6 +2195,327 @@ test('KeyframeEngine clamps short-clip In/Out preset durations cleanly without k
   assert.equal(clip2.presetOutId, 'fadeOut');
   assert.equal(lockedClip.presetOutId || null, null);
 });
+
+test('Overlay tracks sit above Main Track and Track 2 overlay item can drop cleanly onto Track 1 (topmost)', () => {
+  const proj = createEmptyProject('ZoneAndReorderProj', { fps: 30, width: 1280, height: 720 });
+  assert.deepEqual(proj.settings.zoneOrder, ['overlay', 'main', 'audio'], 'Default zone order places Overlay above Main Track');
+
+  const mainClip = TimelineEngine.createMediaLayer(proj, { id: 'm_main', type: 'video', name: 'Main Clip', durationMs: 3000 }, 0, { trackRole: 'main' });
+  TimelineEngine.addToMainTrack(proj, mainClip);
+
+  const track1Overlay = TimelineEngine.createMediaLayer(proj, { id: 'm_ov1', type: 'image', name: 'Overlay Track 1', durationMs: 2000 }, 0, { trackRole: 'overlay' });
+  const track2Overlay = TimelineEngine.createTextLayer(proj, 15);
+  track2Overlay.name = 'Overlay Track 2';
+  // Insert Track 1 and Track 2 overlays
+  proj.layers.push(track1Overlay, track2Overlay);
+  TimelineEngine.normalizeTrackZOrder(proj);
+
+  // Overlays stay ahead of Main Track (indices 0..1 above Main Track at index 2)
+  assert.equal(proj.layers[0].id, track1Overlay.id);
+  assert.equal(proj.layers[1].id, track2Overlay.id);
+  assert.equal(proj.layers[2].id, mainClip.id);
+
+  // Drop Track 2 (index 1) onto Track 1 (targetLayerIndex = 0) and shift horizontally to frame 30
+  const dropped = TimelineEngine.dropLayerInTimeline(proj, track2Overlay.id, {
+    targetLayerIndex: 0,
+    targetStartFrame: 30
+  });
+  assert.equal(dropped, true);
+  assert.equal(proj.layers[0].id, track2Overlay.id, 'Track 2 should now be Track 1 (topmost overlay)');
+  assert.equal(proj.layers[1].id, track1Overlay.id);
+  assert.equal(proj.layers[2].id, mainClip.id, 'Main Track stays below Overlays');
+  assert.equal(track2Overlay.startFrame, 30);
+});
+
+test('Low-end device optimizations: HistoryManager strips coverDataUrl, RendererEngine caps preview & prunes caches, AudioEngine keeps peaks', () => {
+  const proj = createEmptyProject('PotatoPerfProj', { fps: 30, width: 1920, height: 1080, coverDataUrl: 'data:image/jpeg;base64,' + 'A'.repeat(2048) });
+  const hist = new HistoryManager(10);
+  hist.pushSnapshot(proj);
+  assert.ok(!hist.undoStack[0].includes('AAAA'), 'Undo snapshot should exclude heavy coverDataUrl string');
+  proj.name = 'Modified Name';
+  const undone = hist.undo(proj);
+  assert.equal(undone.name, 'PotatoPerfProj');
+  assert.equal(undone.coverDataUrl, proj.coverDataUrl, 'Cover should be preserved across undo');
+
+  // Lightweight RendererEngine preview cap + decoder budget + cache pruning check
+  const fakeCanvas = {
+    width: 0,
+    height: 0,
+    style: {},
+    getContext: (type) => (type === '2d' ? { clearRect: () => {} } : null),
+    getBoundingClientRect: () => ({ width: 360, height: 202 })
+  };
+  const renderer = new RendererEngine(fakeCanvas, fakeCanvas);
+  const previewDims = renderer.getPreviewCanvasSize(proj);
+  assert.ok(Math.max(previewDims.width, previewDims.height) <= 854, 'Preview canvas side capped for smooth low-end GPU');
+  assert.equal(Math.round((previewDims.width / previewDims.height) * 100), Math.round((16 / 9) * 100), 'Aspect ratio preserved');
+
+  // Verify pruneUnusedCaches clears stale image, previewImage, and video fallback entries
+  renderer.imageCache.set('dead_media', { dataset: {} });
+  renderer.previewImageCache.set('dead_media', { url: 'x', canvas: {} });
+  renderer.videoLastFrameCache.set('dead_media', { canvas: {}, width: 100, height: 100 });
+  renderer.pruneUnusedCaches(proj);
+  assert.equal(renderer.imageCache.has('dead_media'), false);
+  assert.equal(renderer.previewImageCache.has('dead_media'), false);
+  assert.equal(renderer.videoLastFrameCache.has('dead_media'), false);
+
+  // AudioEngine pruneUnusedCaches frees stale PCM buffers while keeping lightweight peaks
+  const audio = new AudioEngine();
+  audio.buffers.set('dead_aud', { duration: 5 });
+  audio.reversedBuffers.set('dead_aud', { duration: 5 });
+  audio.peaks.set('dead_aud', [0.2, 0.8]);
+  audio.pruneUnusedCaches(proj);
+  assert.equal(audio.buffers.has('dead_aud'), false);
+  assert.equal(audio.reversedBuffers.has('dead_aud'), false);
+  assert.equal(audio.peaks.has('dead_aud'), true);
+});
+
+// Helper: draws repetitive vertical white fence slats + optional yellow landmark + optional occluder
+function renderFenceSceneRgba(w, h, { slatShiftX = 0, yellowSlatIdx = 2, occludeRect = null } = {}) {
+  const rgba = new Uint8ClampedArray(w * h * 4);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const i = (y * w + x) * 4;
+      // Dark textured background behind fence
+      rgba[i] = 35; rgba[i + 1] = 48; rgba[i + 2] = 40; rgba[i + 3] = 255;
+    }
+  }
+  const spacing = 26;
+  for (let s = 0; s < 5; s++) {
+    const cx = Math.round(20 + s * spacing + slatShiftX);
+    for (let y = 18; y <= 82; y++) {
+      for (let dx = -5; dx <= 5; dx++) {
+        const px = cx + dx;
+        if (px < 0 || px >= w) continue;
+        const i = (y * w + px) * 4;
+        const isBevel = Math.abs(dx) === 5;
+        let r = isBevel ? 200 : 238;
+        let g = isBevel ? 202 : 240;
+        let b = isBevel ? 205 : 244;
+        // Small distinctive yellow paint mark ONLY on yellowSlatIdx (luminance similar to white!)
+        if (s === yellowSlatIdx && Math.abs(dx) <= 3 && y >= 45 && y <= 55) {
+          r = 250; g = 218; b = 22;
+        }
+        rgba[i] = r; rgba[i + 1] = g; rgba[i + 2] = b; rgba[i + 3] = 255;
+      }
+    }
+  }
+  if (occludeRect) {
+    for (let y = occludeRect.y0; y <= occludeRect.y1; y++) {
+      if (y < 0 || y >= h) continue;
+      for (let x = occludeRect.x0; x <= occludeRect.x1; x++) {
+        if (x < 0 || x >= w) continue;
+        const i = (y * w + x) * 4;
+        rgba[i] = 34; rgba[i + 1] = 36; rgba[i + 2] = 42; rgba[i + 3] = 255;
+      }
+    }
+  }
+  return { rgba, gray: extractGrayscale(rgba, w, h) };
+}
+
+test('HSV Color-Lock locks onto yellow-marked white fence slat among identical white neighbors and handles isoluminant marks', async () => {
+  const w = 160;
+  const h = 100;
+  const f0 = renderFenceSceneRgba(w, h, { slatShiftX: 0, yellowSlatIdx: 2 });
+  const targetX0 = 20 + 2 * 26; // slat 2 = x: 72
+  const targetY0 = 50;
+
+  const sig = extractColorSignature(f0.rgba, w, h, targetX0, targetY0, 9);
+  assert.equal(sig.valid, true, 'Should detect yellow paint mark on white fence');
+  assert.ok(sig.hue >= 35 && sig.hue <= 65, `Expected yellow hue ~50deg, got ${sig.hue}`);
+
+  // Frame 1 shifts whole fence by +2px, AND we intentionally bias prediction halfway toward white neighbor slat 3 (+14px)
+  const f1 = renderFenceSceneRgba(w, h, { slatShiftX: 2, yellowSlatIdx: 2 });
+  const tpl = extractTemplatePatch(f0.gray, w, h, targetX0, targetY0, 9);
+  const biasedPredX = targetX0 + 14; // nearer to wrong white slat (98) than yellow slat (74)!
+
+  const lockedMatch = matchTemplateCoarseToFine(
+    tpl, f1.gray, w, h, biasedPredX, targetY0, 20, false,
+    { rgba: f1.rgba, chromaProfile: sig, colorWeight: 0.55 }
+  );
+  assert.ok(Math.abs(lockedMatch.x - (targetX0 + 2)) <= 1.6, `Color-Lock must select yellow slat (~74), got ${lockedMatch.x}`);
+  assert.ok(lockedMatch.colorScore >= 0.7, `Expected strong color score, got ${lockedMatch.colorScore}`);
+  assert.ok(evalColorAffinityAt(sig, f1.rgba, w, h, targetX0 + 2 + 26, targetY0, 9) < 0.15, 'Plain white neighbor slat has near-zero yellow affinity');
+
+  // Isoluminant mark check: flat gray background + colored circle with IDENTICAL luminance (stdNorm < 5)
+  const isoW = 80, isoH = 60;
+  const isoTrack = new TrackerEngine(null);
+  const resIso = await isoTrack.trackFrameSequence({
+    width: isoW,
+    height: isoH,
+    startFrame: 0,
+    minFrame: 0,
+    maxFrame: 3,
+    direction: 'forward',
+    targetX: 0,
+    targetY: 0,
+    patchRadius: 6,
+    searchRadius: 14,
+    trackScale: false,
+    trackTilt3D: false,
+    colorLock: 'on',
+    captureFrame: async (f) => {
+      const rgba = new Uint8ClampedArray(isoW * isoH * 4);
+      const cx = 40 + f * 3;
+      const cy = 30;
+      for (let y = 0; y < isoH; y++) {
+        for (let x = 0; x < isoW; x++) {
+          const i = (y * isoW + x) * 4;
+          const inside = Math.hypot(x - cx, y - cy) <= 5;
+          // Luma ~= 140 everywhere, but cyan vs gray chromatic difference
+          rgba[i] = inside ? 50 : 140;
+          rgba[i + 1] = inside ? 190 : 140;
+          rgba[i + 2] = inside ? 190 : 140;
+          rgba[i + 3] = 255;
+        }
+      }
+      return { rgba, gray: extractGrayscale(rgba, isoW, isoH) };
+    }
+  });
+  assert.equal(resIso.points.length, 4);
+  assert.equal(resIso.colorLockUsed, true);
+  assert.ok(resIso.points[3].x >= 7, `Isoluminant target tracked to x~9, got ${resIso.points[3].x}`);
+});
+
+test('Occlusion Coast Mode predicts smoothly when walker blocks fence and re-acquires cleanly after uncovered', async () => {
+  const w = 160;
+  const h = 100;
+  const tracker = new TrackerEngine(null);
+
+  // Yellow slat (index 1) starts at x = 20 + 26 = 46 (proj x = -34) and moves +3px/frame across frames 0..10
+  // Frames 4, 5, 6 are completely occluded by a foreground walker block covering x: 15..145, y: 10..90
+  const res = await tracker.trackFrameSequence({
+    sourceLayerId: 'vid_walk',
+    width: w,
+    height: h,
+    projWidth: w,
+    projHeight: h,
+    analysisScale: 1,
+    startFrame: 0,
+    minFrame: 0,
+    maxFrame: 10,
+    direction: 'forward',
+    targetX: 20 + 1 * 26 - w / 2, // slat 1 = x:46 -> proj -34
+    targetY: 0,
+    patchRadius: 8,
+    searchRadius: 20,
+    trackScale: false,
+    trackTilt3D: false,
+    colorLock: 'auto',
+    minConfidence: 0.55,
+    maxCoastFrames: 6,
+    captureFrame: async (f) => {
+      const shift = f * 3;
+      const isOccluded = f >= 4 && f <= 6;
+      return renderFenceSceneRgba(w, h, {
+        slatShiftX: shift, // slat 1 starts at x=46 (f=0), reaches x=76 (f=10)
+        yellowSlatIdx: 1,
+        occludeRect: isOccluded ? { x0: 15, x1: 145, y0: 10, y1: 90 } : null
+      });
+    }
+  });
+
+  assert.equal(res.points.length, 11, 'All 11 frames tracked + coasted without aborting mid-occlusion');
+  assert.equal(res.coastedFrames, 3, 'Frames 4..6 should register as coasted');
+  assert.equal(res.points[4].coasting, true);
+  assert.equal(res.points[5].coasting, true);
+  assert.equal(res.points[6].coasting, true);
+  assert.equal(res.points[7].coasting, false, 'Frame 7 should re-acquire lock immediately after walker clears');
+  assert.ok(res.points[10].score >= 0.72, `Re-acquired confidence should remain high, got ${res.points[10].score}`);
+  const expectedFinalProjX = (46 + 10 * 3) - w / 2; // 76 - 80 = -4
+  assert.ok(Math.abs(res.points[10].x - expectedFinalProjX) <= 2.5, `Expected final projX ~${expectedFinalProjX}, got ${res.points[10].x}`);
+});
+
+test('Roadside walking Pass-By Fade with True 3D Depth (Z) grows depth, fades out cleanly, and keeps text decoupled', () => {
+  const proj = createEmptyProject('RoadsidePassByProj', { fps: 30, width: 1280, height: 720 });
+  const vid = TimelineEngine.createMediaLayer(proj, { id: 'm_walk', type: 'video', name: 'Walk.mp4', durationMs: 4000 }, 0, { trackRole: 'main' });
+  TimelineEngine.addToMainTrack(proj, vid);
+
+  const track = {
+    sourceLayerId: vid.id,
+    anchorFrame: 0,
+    startFrame: 0,
+    endFrame: 45,
+    avgConfidence: 0.91,
+    colorLockUsed: true,
+    colorSignature: { hex: '#FACC15', hue: 50, sat: 0.9 },
+    coastedFrames: 0,
+    points: Array.from({ length: 46 }, (_, f) => {
+      const sc = 1 + f * 0.012;
+      return {
+        frame: f,
+        x: 120 + f * 6.5,
+        y: 30 + f * 1.4,
+        z: 620 * (1 - 1 / sc),
+        scale: sc,
+        rotation: 0,
+        rotX: 0,
+        rotY: -8,
+        score: 0.91
+      };
+    })
+  };
+  vid.trackData = track;
+
+  const txt = TimelineEngine.createTextLayer(proj, 0);
+  txt.textProps.text = 'PAGAR KUNING';
+  TimelineEngine.addLayer(proj, txt);
+
+  const ok = TrackerEngine.applyTrackToLayer(txt, track, {
+    use3DDepth: true,
+    applyTilt3D: true,
+    applyScale: true,
+    exitMode: 'passBy',
+    maxEndFrame: vid.endFrame
+  });
+  assert.equal(ok, true);
+  assert.equal(txt.pinnedSourceLayerId, vid.id);
+  assert.ok(txt.keyframes.z.length >= 46, '3D depth Z keyframes populated');
+  assert.ok(KeyframeEngine.getValueAtFrame(txt, 'z', 45, 0) > KeyframeEngine.getValueAtFrame(txt, 'z', 0, 0), 'Depth Z moves closer to camera as walker approaches');
+  assert.ok(txt.endFrame > 45 && txt.endFrame <= vid.endFrame, 'Pass-by tail extends past tracked exit');
+  assert.equal(KeyframeEngine.getValueAtFrame(txt, 'opacity', txt.endFrame, 1), 0, 'Text smoothly fades to 0 as it passes camera');
+
+  // Decoupled anchor: changing text string leaves 3D track keyframes untouched
+  const zBefore = txt.keyframes.z.length;
+  txt.textProps.text = 'BELOK KANAN';
+  assert.equal(txt.keyframes.z.length, zBefore);
+});
+
+test('Blender 3D Viewport Scene Orbit View stays isolated from Active Render Camera & Export framing', () => {
+  const proj = createEmptyProject('SceneView3DProj', { fps: 30, width: 1280, height: 720 });
+  proj.camera.enabled = true;
+  KeyframeEngine.commitStaged3DCameraPose(proj.camera, 0, { x: 0, y: 0, z: 0, rotX: 0, rotY: 0, rotZ: 0, zoom: 1.0 }, 'smooth');
+  KeyframeEngine.commitStaged3DCameraPose(proj.camera, 30, { x: 120, y: -20, z: 180, rotX: -5, rotY: 18, rotZ: 0, zoom: 1.25 }, 'smooth');
+
+  const fakeCanvas = {
+    width: 640,
+    height: 360,
+    style: {},
+    getContext: (t) => (t === '2d' ? { clearRect: () => {}, save: () => {}, restore: () => {} } : null),
+    getBoundingClientRect: () => ({ width: 640, height: 360 })
+  };
+  const renderer = new RendererEngine(fakeCanvas, fakeCanvas);
+  const sceneCam = { x: -80, y: 60, z: -320, rotX: -24, rotY: 42, rotZ: 0, zoom: 0.78 };
+  renderer.setViewport3DState({
+    enabled: true,
+    tool: 'move',
+    viewMode: 'scene',
+    axisLock: 'z',
+    sceneCam
+  });
+
+  // Preview (allowPending=true) in Scene Orbit Mode renders from sceneCam
+  const previewCam = renderer.resolveEffectiveCamera(proj, 15, false, true);
+  assert.equal(previewCam.rotY, 42);
+  assert.equal(previewCam.z, -320);
+
+  // Export (allowPending=false) MUST still render from Active Render Camera keyframes!
+  const exportCam = renderer.resolveEffectiveCamera(proj, 30, false, false);
+  assert.equal(exportCam.rotY, 18);
+  assert.equal(exportCam.z, 180);
+  assert.equal(exportCam.zoom, 1.25);
+});
+
 
 
 

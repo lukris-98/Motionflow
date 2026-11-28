@@ -80,6 +80,11 @@
         <button id="btn3DToolCam" class="btn btn-xs mf-hud-btn" title="Orbit Camera Only" aria-label="3D Camera Orbit">
           <i class="bi bi-camera-video"></i>
         </button>
+        <button id="btn3DAxisLock" class="btn btn-xs mf-hud-btn fw-bold" data-axis-lock="free" title="Kunci Sumbu Transformasi (Free / X / Y / Z)" aria-label="Axis Lock">Free</button>
+        <button id="btn3DViewToggle" class="btn btn-xs mf-hud-btn fw-semibold" title="Tukar Active Camera View vs Scene Orbit View" aria-label="Toggle Scene Orbit View">Cam</button>
+        <button id="btn3DSnapCam" class="btn btn-xs mf-hud-btn text-warning d-none fw-semibold" title="Snap Active Camera ke Scene View (Ctrl+Alt+0)" aria-label="Snap Active Camera to View">
+          <i class="bi bi-crosshair2"></i>
+        </button>
       </div>
       <span id="lbl3DHudReadout" class="badge mf-hud-pill text-info text-truncate min-w-0 mx-1">3D · 1F Orbit · 2F Zoom/Pan</span>
       <div class="mf-3d-pill-bar d-flex align-items-center gap-1 flex-shrink-0 pointer-auto">
@@ -251,8 +256,14 @@
           <button type="button" class="btn btn-dark border-secondary-subtle" data-media-cat="image">Photo</button>
           <button type="button" class="btn btn-dark border-secondary-subtle" data-media-cat="audio">Audio</button>
         </div>
-        <span id="lblMediaCount" class="small text-secondary"></span>
+        <div class="d-flex align-items-center gap-2 ms-auto">
+          <span id="lblMediaCount" class="small text-secondary"></span>
+          <button id="btnCleanupStorage" type="button" class="btn btn-xs btn-outline-warning px-2 py-1" title="Hapus media yang tidak terpakai dan bersihkan cache RAM">
+            <i class="bi bi-stars me-1"></i>Bersihkan
+          </button>
+        </div>
       </div>
+      <div id="lblStorageStats" class="small text-secondary mb-2" style="font-size:0.7rem;"></div>
       <div id="mediaLibraryEmpty" class="text-center py-4 text-secondary">
         <i class="bi bi-cloud-plus fs-2 d-block mb-2"></i>
         <p class="mb-2 small">Import videos, photos, GIFs, or audio from your device.</p>

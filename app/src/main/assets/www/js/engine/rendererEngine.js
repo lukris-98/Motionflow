@@ -18,6 +18,7 @@ export class RendererEngine {
     this.octx = overlayCanvas.getContext('2d');
 
     this.imageCache = new Map();       // mediaId -> HTMLImageElement
+    this.previewImageCache = new Map(); // mediaId -> { url, canvas, origW, origH }
     this.gifCache = new Map();         // mediaId -> { frames, totalMs } | 'loading'
     this.videoCache = new Map();       // mediaId -> HTMLVideoElement
     this.videoLastFrameCache = new Map(); // mediaId -> { canvas, width, height }
@@ -31,17 +32,21 @@ export class RendererEngine {
     this._samplePatchCanvas = null;
     this._chroma2dCanvas = null;
     this.onMediaFrameReady = null;
+    this.maxPreviewSide = 854;
+    this.maxPreviewImageSide = 1280;
+    this.maxVideoDecoders = 3;
 
-    this.glPreview = this.createWebGLCompositor(this.canvas);
+    this.glPreview = this.createWebGLCompositor(this.canvas, false);
     this.ctx2dFallback = this.glPreview ? null : this.canvas.getContext('2d', { alpha: false });
     this.exportCompositors = new WeakMap();
     this.lastOverlayBox = null;
     this.lastTrackerBox = null;
     this.lastGizmoHandles = null;
+    this.lastTriadHandles = null;
     this.renderedLayerQuads = [];
     this.trackerOverlay = null;
     this.chromaPickerOverlay = null;
-    this.viewport3D = { enabled: false, tool: 'move' }; // 'move' | 'rotate' | 'scale' | 'camera'
+    this.viewport3D = { enabled: false, tool: 'move', viewMode: 'camera', axisLock: 'free', sceneCam: null };
     this.pending3DLayerPose = null;
     this.pending3DCamPose = null;
   }
@@ -55,7 +60,7 @@ export class RendererEngine {
   }
 
   setViewport3DState(state) {
-    this.viewport3D = state || { enabled: false, tool: 'move' };
+    this.viewport3D = state || { enabled: false, tool: 'move', viewMode: 'camera', axisLock: 'free', sceneCam: null };
   }
 
   setPending3DPose(layerPose = null, camPose = null) {
@@ -63,16 +68,34 @@ export class RendererEngine {
     this.pending3DCamPose = camPose;
   }
 
-  resolveEffectiveCamera(project, frame, flat2D = false, allowPending = false) {
-    const camEnabled = !flat2D && Boolean(project.camera?.enabled);
-    if (!camEnabled) {
-      return { enabled: false, x: 0, y: 0, z: 0, rotX: 0, rotY: 0, rotZ: 0, zoom: 1 };
-    }
+  resolveRenderCameraPose(project, frame, allowPending = false) {
     const cam = KeyframeEngine.getCameraAtFrame(project.camera, frame);
     if (allowPending && this.pending3DCamPose && Math.round(frame) === Math.round(this.pending3DCamPose.frame)) {
       return { enabled: true, ...cam, ...this.pending3DCamPose.props };
     }
-    return { enabled: true, ...cam };
+    return { enabled: Boolean(project.camera?.enabled), ...cam };
+  }
+
+  resolveEffectiveCamera(project, frame, flat2D = false, allowPending = false) {
+    const camEnabled = !flat2D && (Boolean(project.camera?.enabled) || (allowPending && Boolean(this.viewport3D?.enabled)));
+    if (!camEnabled) {
+      return { enabled: false, x: 0, y: 0, z: 0, rotX: 0, rotY: 0, rotZ: 0, zoom: 1 };
+    }
+    if (allowPending && this.viewport3D?.enabled && this.viewport3D?.viewMode === 'scene' && this.viewport3D?.sceneCam) {
+      const sc = this.viewport3D.sceneCam;
+      return {
+        enabled: true,
+        x: Number(sc.x) || 0,
+        y: Number(sc.y) || 0,
+        z: Number(sc.z) || 0,
+        rotX: Number(sc.rotX) || 0,
+        rotY: Number(sc.rotY) || 0,
+        rotZ: Number(sc.rotZ) || 0,
+        zoom: Math.max(0.2, Number(sc.zoom) || 1)
+      };
+    }
+    const pose = this.resolveRenderCameraPose(project, frame, allowPending);
+    return { ...pose, enabled: true };
   }
 
   resolveEffectiveTransform(layer, frame, allowPending = false) {
@@ -101,6 +124,7 @@ export class RendererEngine {
   purgeMediaCache(mediaId) {
     if (!mediaId) return;
     this.imageCache.delete(mediaId);
+    this.previewImageCache.delete(mediaId);
     this.gifCache.delete(mediaId);
     this.videoLastFrameCache.delete(mediaId);
     this.videoThumbFallbackCache.delete(mediaId);
@@ -120,6 +144,54 @@ export class RendererEngine {
       this.glPreview.textures.delete(mediaId);
     }
     this.glPreview?.textureMeta?.delete(mediaId);
+  }
+
+  _releaseVideoDecoder(mediaId, captureFallback = true) {
+    const vid = this.videoCache.get(mediaId);
+    if (!vid) return;
+    if (captureFallback && vid.readyState >= 2 && vid.videoWidth > 0) {
+      this.captureVideoFallbackFrame(mediaId, vid);
+    }
+    try {
+      vid._wantsPlay = false;
+      vid._wantsPlaySinceMs = 0;
+      vid._pendingPlayTargetTime = null;
+      vid.pause();
+      vid.removeAttribute('src');
+      vid.load();
+      vid.remove();
+    } catch {}
+    this.videoCache.delete(mediaId);
+  }
+
+  _touchVideoLru(mediaId) {
+    if (!mediaId || !this.videoCache.has(mediaId)) return;
+    const vid = this.videoCache.get(mediaId);
+    this.videoCache.delete(mediaId);
+    this.videoCache.set(mediaId, vid);
+  }
+
+  _enforceVideoDecoderBudget(project, frame, protectedIds = null) {
+    const budget = Math.max(1, this.maxVideoDecoders || 3);
+    if (this.videoCache.size <= budget) return;
+
+    const keep = new Set(protectedIds || []);
+    const fps = Math.max(1, project?.fps || 30);
+    const lookahead = Math.round(fps * 2.0);
+    if (project && Array.isArray(project.layers)) {
+      for (const l of project.layers) {
+        if (!l || l.type !== 'video' || !l.visible || !l.mediaId) continue;
+        if (frame >= l.startFrame - 2 && frame <= l.endFrame + lookahead) {
+          keep.add(l.mediaId);
+        }
+      }
+    }
+
+    for (const mid of [...this.videoCache.keys()]) {
+      if (this.videoCache.size <= budget) break;
+      if (keep.has(mid)) continue;
+      this._releaseVideoDecoder(mid, true);
+    }
   }
 
   pruneUnusedCaches(project) {
@@ -156,6 +228,16 @@ export class RendererEngine {
         this.purgeMediaCache(mid);
       }
     }
+    for (const mid of [...this.imageCache.keys()]) {
+      if (!activeMediaIds.has(mid)) {
+        this.imageCache.delete(mid);
+      }
+    }
+    for (const mid of [...this.previewImageCache.keys()]) {
+      if (!activeMediaIds.has(mid)) {
+        this.previewImageCache.delete(mid);
+      }
+    }
     for (const mid of [...this.videoLastFrameCache.keys()]) {
       if (!activeMediaIds.has(mid)) this.videoLastFrameCache.delete(mid);
     }
@@ -165,10 +247,29 @@ export class RendererEngine {
     for (const mid of [...this.gifCache.keys()]) {
       if (!activeMediaIds.has(mid)) this.gifCache.delete(mid);
     }
+    if (this.glPreview?.textures) {
+      for (const texKey of [...this.glPreview.textures.keys()]) {
+        if (texKey === '__bg_grad') continue;
+        const baseLayerId = texKey.endsWith('__autobg') ? texKey.slice(0, -8) : null;
+        const isAlive = baseLayerId
+          ? activeLayerIds.has(baseLayerId)
+          : (activeMediaIds.has(texKey) || activeLayerIds.has(texKey));
+        if (!isAlive) {
+          this.glPreview.gl.deleteTexture(this.glPreview.textures.get(texKey));
+          this.glPreview.textures.delete(texKey);
+          this.glPreview.textureMeta?.delete(texKey);
+        }
+      }
+    }
   }
 
-  createWebGLCompositor(canvas) {
-    const gl = canvas.getContext('webgl', { alpha: false, preserveDrawingBuffer: true, antialias: true });
+  createWebGLCompositor(canvas, antialias = true) {
+    const gl = canvas.getContext('webgl', {
+      alpha: false,
+      preserveDrawingBuffer: true,
+      antialias: Boolean(antialias),
+      powerPreference: 'default'
+    });
     if (!gl) return null;
 
     const vsSrc = `
@@ -835,9 +936,24 @@ export class RendererEngine {
       textures.set(key, tex);
     } else {
       gl.bindTexture(gl.TEXTURE_2D, tex);
-      if (!isVideo && sw > 0 && sh > 0 && textureMeta) {
+      if (sw > 0 && sh > 0 && textureMeta) {
         const meta = textureMeta.get(key);
-        if (meta && meta.el === sourceEl && meta.src === srcId && meta.w === sw && meta.h === sh && meta.token === cacheToken) {
+        if (!isVideo) {
+          if (meta && meta.el === sourceEl && meta.src === srcId && meta.w === sw && meta.h === sh && meta.token === cacheToken) {
+            return tex;
+          }
+        } else if (
+          meta &&
+          meta.isVideo &&
+          meta.el === sourceEl &&
+          meta.src === srcId &&
+          meta.w === sw &&
+          meta.h === sh &&
+          sourceEl.paused &&
+          !sourceEl.seeking &&
+          !sourceEl._wantsPlay &&
+          Math.abs((meta.videoTime ?? -1) - (sourceEl.currentTime || 0)) < 0.001
+        ) {
           return tex;
         }
       }
@@ -888,9 +1004,20 @@ export class RendererEngine {
         gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, sourceEl);
       }
       if (!isVideo && sw > 0 && sh > 0 && textureMeta) {
-        textureMeta.set(key, { el: sourceEl, src: srcId, w: sw, h: sh, token: cacheToken });
-      } else if (isVideo && textureMeta) {
-        textureMeta.delete(key);
+        textureMeta.set(key, { isVideo: false, el: sourceEl, src: srcId, w: sw, h: sh, token: cacheToken });
+      } else if (isVideo && sw > 0 && sh > 0 && textureMeta) {
+        if (sourceEl.paused && !sourceEl.seeking && !sourceEl._wantsPlay && sourceEl.readyState >= 2) {
+          textureMeta.set(key, {
+            isVideo: true,
+            el: sourceEl,
+            src: srcId,
+            w: sw,
+            h: sh,
+            videoTime: sourceEl.currentTime || 0
+          });
+        } else {
+          textureMeta.delete(key);
+        }
       }
     } catch {
       if (sw > 0 && sh > 0) {
@@ -912,10 +1039,23 @@ export class RendererEngine {
     return tex;
   }
 
+  getPreviewCanvasSize(project) {
+    const pw = Math.max(2, Number(project?.width) || 1280);
+    const ph = Math.max(2, Number(project?.height) || 720);
+    const maxSide = Math.max(320, this.maxPreviewSide || 854);
+    const longest = Math.max(pw, ph);
+    if (longest <= maxSide) return { width: pw, height: ph };
+    const scale = maxSide / longest;
+    const w = Math.max(2, Math.round((pw * scale) / 2) * 2);
+    const h = Math.max(2, Math.round((ph * scale) / 2) * 2);
+    return { width: w, height: h };
+  }
+
   syncCanvasDimensions(project) {
-    if (this.canvas.width !== project.width || this.canvas.height !== project.height) {
-      this.canvas.width = project.width;
-      this.canvas.height = project.height;
+    const { width: prevW, height: prevH } = this.getPreviewCanvasSize(project);
+    if (this.canvas.width !== prevW || this.canvas.height !== prevH) {
+      this.canvas.width = prevW;
+      this.canvas.height = prevH;
     }
     this.canvas.style.aspectRatio = `${project.width} / ${project.height}`;
     const rect = this.canvas.getBoundingClientRect();
@@ -927,6 +1067,27 @@ export class RendererEngine {
       this.overlay.style.width = `${w}px`;
       this.overlay.style.height = `${h}px`;
     }
+  }
+
+  _getPreviewImageCanvas(mediaItem, img) {
+    const nw = img?.naturalWidth || 0;
+    const nh = img?.naturalHeight || 0;
+    const cap = Math.max(640, this.maxPreviewImageSide || 1280);
+    if (nw <= cap && nh <= cap) return null;
+    const cached = this.previewImageCache.get(mediaItem.id);
+    if (cached && cached.url === mediaItem.url && cached.origW === nw && cached.origH === nh && cached.canvas) {
+      return cached.canvas;
+    }
+    if (typeof document === 'undefined') return null;
+    const scale = Math.min(cap / nw, cap / nh);
+    const tw = Math.max(2, Math.round(nw * scale));
+    const th = Math.max(2, Math.round(nh * scale));
+    const c = document.createElement('canvas');
+    c.width = tw;
+    c.height = th;
+    c.getContext('2d')?.drawImage(img, 0, 0, tw, th);
+    this.previewImageCache.set(mediaItem.id, { url: mediaItem.url, canvas: c, origW: nw, origH: nh });
+    return c;
   }
 
   getImageElement(mediaItem) {
@@ -947,6 +1108,7 @@ export class RendererEngine {
         return existing;
       }
       this.imageCache.delete(mediaItem.id);
+      this.previewImageCache.delete(mediaItem.id);
     }
     const img = new Image();
     const isExternalHttp = typeof window !== 'undefined' &&
@@ -955,11 +1117,16 @@ export class RendererEngine {
     if (isExternalHttp) {
       img.crossOrigin = 'anonymous';
     }
+    img.decoding = 'async';
     img.dataset.srcUrl = urlStr;
     img.dataset.failed = '0';
     img.onload = () => {
       img.dataset.failed = '0';
-      this.onMediaFrameReady?.(mediaItem);
+      if (typeof img.decode === 'function') {
+        img.decode().catch(() => {}).finally(() => this.onMediaFrameReady?.(mediaItem));
+      } else {
+        this.onMediaFrameReady?.(mediaItem);
+      }
     };
     img.onerror = () => {
       if (img.crossOrigin) {
@@ -1040,16 +1207,12 @@ export class RendererEngine {
     if (this.videoCache.has(mediaItem.id)) {
       const existing = this.videoCache.get(mediaItem.id);
       if (existing.dataset.srcUrl === mediaItem.url) {
+        this._touchVideoLru(mediaItem.id);
         const host = this._ensureHiddenVideoHost();
         if (host && !existing.isConnected) host.appendChild(existing);
         return existing;
       }
-      try {
-        existing._wantsPlay = false;
-        existing.pause();
-        existing.remove();
-      } catch {}
-      this.videoCache.delete(mediaItem.id);
+      this._releaseVideoDecoder(mediaItem.id, false);
     }
     const vid = document.createElement('video');
     const urlStr = String(mediaItem.url);
@@ -1148,6 +1311,10 @@ export class RendererEngine {
     vid.addEventListener('loadedmetadata', () => {
       if (vid._wantsPlay) {
         maybeResumePendingPlay();
+      } else if (vid._pendingSeekTime !== undefined && vid._pendingSeekTime !== null) {
+        const nextT = vid._pendingSeekTime;
+        vid._pendingSeekTime = null;
+        try { vid.currentTime = nextT; } catch {}
       } else if (vid.readyState < 2 && vid.paused && !vid._primedFrame0) {
         vid._primedFrame0 = true;
         try { vid.currentTime = 0.001; } catch {}
@@ -1214,7 +1381,7 @@ export class RendererEngine {
     const fps = Math.max(1, project?.fps || 30);
     const activeMediaIds = new Set();
     const nowMs = typeof performance !== 'undefined' ? performance.now() : Date.now();
-    const maxConcurrentDecoders = 4;
+    const maxConcurrentDecoders = Math.max(1, this.maxVideoDecoders || 3);
 
     const triggerSafePlay = (vid) => {
       if (vid._playInFlight) return;
@@ -1378,11 +1545,13 @@ export class RendererEngine {
         }
       }
     }
+    this._enforceVideoDecoderBudget?.(project, frame, activeMediaIds);
   }
 
   async seekVideosForFrame(project, frame, mediaMap, awaitSeek = false) {
     const fps = Math.max(1, project.fps || 30);
     const promises = [];
+    const activeSeekIds = new Set();
 
     for (const layer of project.layers) {
       if (layer.type !== 'video' || !layer.visible || !layer.mediaId) continue;
@@ -1391,6 +1560,7 @@ export class RendererEngine {
       if (!mediaItem) continue;
       const vid = this.getVideoElement(mediaItem);
       if (!vid) continue;
+      activeSeekIds.add(mediaItem.id);
       if (!awaitSeek) {
         vid._wantsPlay = false;
         vid._wantsPlaySinceMs = 0;
@@ -1436,14 +1606,15 @@ export class RendererEngine {
               setTimeout(done, 480);
             })
           );
-        } else if (vid.seeking) {
-          // Coalesce rapid scrub seeks so hardware decoder actually finishes frames
+        } else if (vid.readyState < 1 || vid.seeking) {
+          // Coalesce rapid scrub seeks or pre-metadata seeks so hardware decoder finishes frames cleanly
           vid._pendingSeekTime = clampedTime;
         } else {
           try { vid.currentTime = clampedTime; } catch {}
         }
       }
     }
+    this._enforceVideoDecoderBudget?.(project, frame, activeSeekIds);
     if (awaitSeek && promises.length > 0) await Promise.all(promises);
   }
 
@@ -1674,7 +1845,7 @@ export class RendererEngine {
     ctx.closePath();
   }
 
-  resolveLayerDrawable(layer, frame, projectFps, mediaMap) {
+  resolveLayerDrawable(layer, frame, projectFps, mediaMap, isExport = false) {
     if (layer.type === 'image') {
       const item = mediaMap.get(layer.mediaId);
       if (!item) return null;
@@ -1684,7 +1855,13 @@ export class RendererEngine {
       }
       const img = this.getImageElement(item);
       if (img && img.complete && img.naturalWidth > 0) {
-        return { el: img, w: layer.width || img.naturalWidth, h: layer.height || img.naturalHeight, token: item.url };
+        const scaledPreview = !isExport ? this._getPreviewImageCanvas(item, img) : null;
+        return {
+          el: scaledPreview || img,
+          w: layer.width || img.naturalWidth,
+          h: layer.height || img.naturalHeight,
+          token: scaledPreview ? `${item.url}#prev` : item.url
+        };
       }
       return null;
     }
@@ -1737,7 +1914,7 @@ export class RendererEngine {
   }
 
   resolveProcessedDrawable(layer, frame, projectFps, mediaMap, isExport = false) {
-    const drawable = this.resolveLayerDrawable(layer, frame, projectFps, mediaMap);
+    const drawable = this.resolveLayerDrawable(layer, frame, projectFps, mediaMap, isExport);
     if (!drawable || !drawable.el) return null;
 
     const fx = layer.fx || {};
@@ -1948,13 +2125,13 @@ export class RendererEngine {
     if (targetCanvas) {
       compositor = this.exportCompositors.get(targetCanvas);
       if (!compositor) {
-        compositor = this.createWebGLCompositor(targetCanvas);
+        compositor = this.createWebGLCompositor(targetCanvas, true);
         if (compositor) this.exportCompositors.set(targetCanvas, compositor);
       }
     }
 
-    const w = targetW || project.width;
-    const h = targetH || project.height;
+    const w = targetW || (targetCanvas ? project.width : this.canvas.width) || project.width;
+    const h = targetH || (targetCanvas ? project.height : this.canvas.height) || project.height;
     const has3D = this.hasAny3DContentAtFrame(project, frame, !targetCanvas);
     const isFlat2DPreview = !targetCanvas && !this.viewport3D?.enabled && !has3D;
     const allowPending = !targetCanvas;
@@ -2217,7 +2394,7 @@ export class RendererEngine {
         (l) => l.visible && (l.type === 'video' || l.type === 'image') && frame >= l.startFrame && frame <= l.endFrame
       );
       if (bgLayer) {
-        const bgDrawable = this.resolveLayerDrawable(bgLayer, frame, project.fps || 30, mediaMap);
+        const bgDrawable = this.resolveLayerDrawable(bgLayer, frame, project.fps || 30, mediaMap, !allowPending);
         if (bgDrawable) {
           this.getOrCreateTexture(compositor, bgLayer.mediaId || bgLayer.id, bgDrawable.el, bgDrawable.token ?? null);
           this._resetDefaultShaderUniforms(compositor);
@@ -2233,8 +2410,8 @@ export class RendererEngine {
       }
     }
 
-    const camEnabled = !isFlat2DPreview && Boolean(project.camera?.enabled);
-    const useMotionBlur = camEnabled && Boolean(project.camera?.motionBlur);
+    const camEnabled = !isFlat2DPreview && (Boolean(project.camera?.enabled) || (allowPending && Boolean(this.viewport3D?.enabled)));
+    const useMotionBlur = camEnabled && this.viewport3D?.viewMode !== 'scene' && Boolean(project.camera?.motionBlur);
     const samples = useMotionBlur ? Math.max(2, Math.min(6, project.camera.motionBlurSamples || 4)) : 1;
 
     const layersById = new Map(project.layers.map((l) => [l.id, l]));
@@ -2797,12 +2974,14 @@ export class RendererEngine {
     };
   }
 
-  drawBlender3DFloorAndTriad(octx, project, mats, ow, oh) {
-    const { pvMat, cam } = mats;
+  drawBlender3DFloorAndTriad(octx, project, mats, ow, oh, frame = 0) {
+    const { pvMat, cam, camDist } = mats;
     const span = Math.max(project.width, project.height) * 0.9;
     const floorY = -project.height * 0.38; // World Y down -> negative is bottom half of frame
     const steps = 8;
     const stepSize = (span * 2) / steps;
+    const isSceneView = this.viewport3D?.viewMode === 'scene';
+    const axisLock = this.viewport3D?.axisLock || 'free';
 
     octx.save();
     for (let i = 0; i <= steps; i++) {
@@ -2813,8 +2992,10 @@ export class RendererEngine {
       const pZ0 = this.projectMatPoint(pvMat, v, floorY, -span, ow, oh);
       const pZ1 = this.projectMatPoint(pvMat, v, floorY, span, ow, oh);
       if (pZ0 && pZ1) {
-        octx.strokeStyle = isCenter ? 'rgba(64, 156, 255, 0.55)' : 'rgba(139, 152, 176, 0.16)';
-        octx.lineWidth = isCenter ? 1.4 : 1;
+        octx.strokeStyle = isCenter
+          ? (axisLock === 'z' ? 'rgba(64, 196, 255, 0.92)' : 'rgba(64, 156, 255, 0.55)')
+          : 'rgba(139, 152, 176, 0.16)';
+        octx.lineWidth = isCenter ? (axisLock === 'z' ? 2.2 : 1.4) : 1;
         octx.beginPath();
         octx.moveTo(pZ0.x, pZ0.y);
         octx.lineTo(pZ1.x, pZ1.y);
@@ -2825,13 +3006,78 @@ export class RendererEngine {
       const pX0 = this.projectMatPoint(pvMat, -span, floorY, v, ow, oh);
       const pX1 = this.projectMatPoint(pvMat, span, floorY, v, ow, oh);
       if (pX0 && pX1) {
-        octx.strokeStyle = isCenter ? 'rgba(255, 82, 82, 0.55)' : 'rgba(139, 152, 176, 0.16)';
-        octx.lineWidth = isCenter ? 1.4 : 1;
+        octx.strokeStyle = isCenter
+          ? (axisLock === 'x' ? 'rgba(255, 82, 82, 0.95)' : 'rgba(255, 82, 82, 0.55)')
+          : 'rgba(139, 152, 176, 0.16)';
+        octx.lineWidth = isCenter ? (axisLock === 'x' ? 2.2 : 1.4) : 1;
         octx.beginPath();
         octx.moveTo(pX0.x, pX0.y);
         octx.lineTo(pX1.x, pX1.y);
         octx.stroke();
       }
+    }
+
+    // In Blender Scene Orbit mode, visualize the Active Render Camera frustum in 3D space
+    if (isSceneView) {
+      const rc = this.resolveRenderCameraPose(project, frame, true);
+      const invZoom = 1 / Math.max(0.25, rc.zoom || 1);
+      let rcWorld = Mat4.identity();
+      rcWorld = Mat4.translate(rcWorld, rc.x || 0, -(rc.y || 0), rc.z || 0);
+      rcWorld = Mat4.rotateY(rcWorld, (-(rc.rotY || 0) * Math.PI) / 180);
+      rcWorld = Mat4.rotateX(rcWorld, (-(rc.rotX || 0) * Math.PI) / 180);
+      rcWorld = Mat4.rotateZ(rcWorld, ((rc.rotZ || 0) * Math.PI) / 180);
+      rcWorld = Mat4.scale(rcWorld, invZoom, invZoom, 1);
+
+      const mvpFrustum = Mat4.multiply(pvMat, rcWorld);
+      const depth = camDist * 0.34;
+      const hw = (project.width * 0.5) * (depth / camDist) * 0.85;
+      const hh = (project.height * 0.5) * (depth / camDist) * 0.85;
+      const pEye = this.projectMatPoint(mvpFrustum, 0, 0, camDist, ow, oh);
+      const cTL = this.projectMatPoint(mvpFrustum, -hw, hh, camDist - depth, ow, oh);
+      const cTR = this.projectMatPoint(mvpFrustum, hw, hh, camDist - depth, ow, oh);
+      const cBR = this.projectMatPoint(mvpFrustum, hw, -hh, camDist - depth, ow, oh);
+      const cBL = this.projectMatPoint(mvpFrustum, -hw, -hh, camDist - depth, ow, oh);
+      if (pEye && cTL && cTR && cBR && cBL) {
+        octx.strokeStyle = 'rgba(255, 193, 7, 0.88)';
+        octx.lineWidth = 1.6;
+        octx.beginPath();
+        octx.moveTo(cTL.x, cTL.y);
+        octx.lineTo(cTR.x, cTR.y);
+        octx.lineTo(cBR.x, cBR.y);
+        octx.lineTo(cBL.x, cBL.y);
+        octx.closePath();
+        octx.stroke();
+
+        octx.setLineDash([4, 3]);
+        octx.strokeStyle = 'rgba(255, 193, 7, 0.6)';
+        for (const corner of [cTL, cTR, cBR, cBL]) {
+          octx.beginPath();
+          octx.moveTo(pEye.x, pEye.y);
+          octx.lineTo(corner.x, corner.y);
+          octx.stroke();
+        }
+        octx.setLineDash([]);
+
+        octx.fillStyle = '#FFC107';
+        octx.beginPath();
+        octx.arc(pEye.x, pEye.y, 4.5, 0, Math.PI * 2);
+        octx.fill();
+        octx.font = 'bold 9px system-ui, sans-serif';
+        octx.textAlign = 'center';
+        octx.fillText('RENDER CAM', pEye.x, pEye.y - 9);
+      }
+    } else {
+      // Active Camera View: subtle Blender Passepartout viewfinder frame corners
+      const pad = 7;
+      const cLen = 14;
+      octx.strokeStyle = 'rgba(255, 193, 7, 0.48)';
+      octx.lineWidth = 1.4;
+      octx.beginPath();
+      octx.moveTo(pad, pad + cLen); octx.lineTo(pad, pad); octx.lineTo(pad + cLen, pad);
+      octx.moveTo(ow - pad - cLen, pad); octx.lineTo(ow - pad, pad); octx.lineTo(ow - pad, pad + cLen);
+      octx.moveTo(ow - pad, oh - pad - cLen); octx.lineTo(ow - pad, oh - pad); octx.lineTo(ow - pad - cLen, oh - pad);
+      octx.moveTo(pad + cLen, oh - pad); octx.lineTo(pad, oh - pad); octx.lineTo(pad, oh - pad - cLen);
+      octx.stroke();
     }
 
     // Corner 3D Blender Navigation Triad (bottom-left above 3D toolbar)
@@ -2855,11 +3101,11 @@ export class RendererEngine {
       return { ...a, px: triadX + rx * axisLen, py: triadY - ry * axisLen, z: rz };
     }).sort((a, b) => a.z - b.z);
 
-    octx.fillStyle = 'rgba(11, 14, 20, 0.7)';
+    octx.fillStyle = 'rgba(11, 14, 20, 0.72)';
     octx.beginPath();
     octx.arc(triadX, triadY, 26, 0, Math.PI * 2);
     octx.fill();
-    octx.strokeStyle = 'rgba(255,255,255,0.12)';
+    octx.strokeStyle = isSceneView ? 'rgba(255, 193, 7, 0.45)' : 'rgba(255,255,255,0.14)';
     octx.lineWidth = 1;
     octx.stroke();
 
@@ -2867,8 +3113,9 @@ export class RendererEngine {
     octx.textAlign = 'center';
     octx.textBaseline = 'middle';
     for (const a of projectedAxes) {
+      const isLocked = axisLock === a.label.toLowerCase();
       octx.strokeStyle = a.color;
-      octx.lineWidth = 2;
+      octx.lineWidth = isLocked ? 3 : 2;
       octx.beginPath();
       octx.moveTo(triadX, triadY);
       octx.lineTo(a.px, a.py);
@@ -2876,11 +3123,23 @@ export class RendererEngine {
 
       octx.fillStyle = a.color;
       octx.beginPath();
-      octx.arc(a.px, a.py, 5.5, 0, Math.PI * 2);
+      octx.arc(a.px, a.py, isLocked ? 7 : 5.5, 0, Math.PI * 2);
       octx.fill();
+      if (isLocked) {
+        octx.strokeStyle = '#FFFFFF';
+        octx.lineWidth = 1.2;
+        octx.stroke();
+      }
       octx.fillStyle = '#071018';
       octx.fillText(a.label, a.px, a.py + 0.5);
     }
+
+    this.lastTriadHandles = {
+      cx: triadX,
+      cy: triadY,
+      r: 28,
+      axes: projectedAxes.map((a) => ({ label: a.label, x: a.px, y: a.py }))
+    };
     octx.restore();
   }
 
@@ -2892,6 +3151,7 @@ export class RendererEngine {
     this.lastOverlayBox = null;
     this.lastTrackerBox = null;
     this.lastGizmoHandles = null;
+    this.lastTriadHandles = null;
     this.renderedLayerQuads = [];
 
     if (project.settings?.showGrid) {
@@ -2911,7 +3171,7 @@ export class RendererEngine {
     const usePerspectiveOverlay = is3DMode || this.hasAny3DContentAtFrame(project, frame, true);
     const mats = this.computeCameraMatrices(project, frame, !usePerspectiveOverlay, true);
     if (is3DMode) {
-      this.drawBlender3DFloorAndTriad(octx, project, mats, ow, oh);
+      this.drawBlender3DFloorAndTriad(octx, project, mats, ow, oh, frame);
     }
 
     if (this.trackerOverlay && this.trackerOverlay.active) {
@@ -3284,7 +3544,7 @@ export class RendererEngine {
         const p = points[i];
         const px = (project.width / 2 + p.x) * sx;
         const py = (project.height / 2 + p.y) * sy;
-        octx.fillStyle = p.extrapolated ? '#FF5252' : '#FFAB40';
+        octx.fillStyle = p.extrapolated ? '#FF5252' : p.coasting ? '#FFAB40' : '#69F0AE';
         octx.beginPath();
         octx.arc(px, py, 2.5, 0, Math.PI * 2);
         octx.fill();
@@ -3303,6 +3563,10 @@ export class RendererEngine {
 
     this.lastTrackerBox = { rx, ry, sx, sy, boxW };
 
+    const statusColor = matchedPt
+      ? (matchedPt.extrapolated ? '#FF5252' : matchedPt.coasting ? '#FFAB40' : (matchedPt.score >= 0.7 ? '#69F0AE' : '#FFAB40'))
+      : '#FFAB40';
+
     octx.save();
     octx.translate(rx, ry);
 
@@ -3316,7 +3580,7 @@ export class RendererEngine {
     // Inner template patch brackets
     const half = boxW / 2;
     const bLen = Math.min(12, half * 0.55);
-    octx.strokeStyle = '#FFAB40';
+    octx.strokeStyle = statusColor;
     octx.lineWidth = 2.2;
     octx.beginPath();
     // TL
@@ -3338,17 +3602,85 @@ export class RendererEngine {
     octx.stroke();
 
     // Label pill above reticle
-    const scoreTxt = matchedPt ? `TRACK ${Math.round((matchedPt.score || 1) * 100)}%` : 'DRAG TARGET';
+    const scoreTxt = matchedPt
+      ? `${matchedPt.extrapolated ? 'EXIT' : matchedPt.coasting ? 'COAST' : 'LOCK'} ${Math.round((matchedPt.score || 1) * 100)}%`
+      : 'AIM TARGET';
     octx.font = 'bold 10px system-ui, sans-serif';
     const tw = octx.measureText(scoreTxt).width + 10;
     octx.fillStyle = 'rgba(11, 14, 20, 0.85)';
     octx.fillRect(-tw / 2, -half - 20, tw, 15);
-    octx.fillStyle = '#FFAB40';
+    octx.fillStyle = statusColor;
     octx.textAlign = 'center';
     octx.textBaseline = 'middle';
     octx.fillText(scoreTxt, 0, -half - 12.5);
 
     octx.restore();
+
+    // Floating 2.6x precision Magnifier Loupe when dragging target on small mobile screens
+    if (tr.dragging && this.canvas && this.canvas.width > 0 && this.canvas.height > 0) {
+      const loupeR = 28;
+      const loupeX = Math.max(loupeR + 8, Math.min(ow - loupeR - 8, rx));
+      const loupeY = ry - 64 >= loupeR + 8 ? ry - 64 : Math.min(oh - loupeR - 8, ry + 64);
+      const scaleSrcX = this.canvas.width / Math.max(1, ow);
+      const scaleSrcY = this.canvas.height / Math.max(1, oh);
+      const zoom = 2.6;
+      const srcR = (loupeR / zoom) * scaleSrcX;
+      const srcX = rx * scaleSrcX;
+      const srcY = ry * scaleSrcY;
+
+      octx.save();
+      octx.beginPath();
+      octx.arc(loupeX, loupeY, loupeR, 0, Math.PI * 2);
+      octx.clip();
+      octx.fillStyle = '#05070B';
+      octx.fillRect(loupeX - loupeR, loupeY - loupeR, loupeR * 2, loupeR * 2);
+      try {
+        octx.drawImage(
+          this.canvas,
+          Math.max(0, srcX - srcR),
+          Math.max(0, srcY - srcR * (scaleSrcY / Math.max(0.01, scaleSrcX))),
+          Math.max(4, srcR * 2),
+          Math.max(4, srcR * 2 * (scaleSrcY / Math.max(0.01, scaleSrcX))),
+          loupeX - loupeR,
+          loupeY - loupeR,
+          loupeR * 2,
+          loupeR * 2
+        );
+      } catch {}
+
+      // Precision crosshair inside loupe
+      octx.strokeStyle = 'rgba(0, 229, 255, 0.9)';
+      octx.lineWidth = 1.2;
+      octx.beginPath();
+      octx.moveTo(loupeX - 10, loupeY); octx.lineTo(loupeX + 10, loupeY);
+      octx.moveTo(loupeX, loupeY - 10); octx.lineTo(loupeX, loupeY + 10);
+      octx.stroke();
+      octx.restore();
+
+      // Ring & Color-Lock preview swatch badge
+      octx.save();
+      octx.beginPath();
+      octx.arc(loupeX, loupeY, loupeR, 0, Math.PI * 2);
+      octx.lineWidth = 2.5;
+      octx.strokeStyle = '#FFAB40';
+      octx.stroke();
+
+      if (tr.sampledColorHex) {
+        const badgeY = loupeY + loupeR + 10;
+        const lbl = tr.sampledColorHex;
+        octx.font = 'bold 9px system-ui, sans-serif';
+        const bw = octx.measureText(lbl).width + 20;
+        octx.fillStyle = 'rgba(11, 14, 20, 0.9)';
+        octx.fillRect(loupeX - bw / 2, badgeY - 8, bw, 15);
+        octx.fillStyle = tr.sampledColorHex;
+        octx.fillRect(loupeX - bw / 2 + 4, badgeY - 4.5, 8, 8);
+        octx.fillStyle = '#FFFFFF';
+        octx.textAlign = 'left';
+        octx.textBaseline = 'middle';
+        octx.fillText(lbl, loupeX - bw / 2 + 15, badgeY - 0.5);
+      }
+      octx.restore();
+    }
   }
 
   hitTestOverlay(px, py) {
@@ -3356,6 +3688,19 @@ export class RendererEngine {
       const tb = this.lastTrackerBox;
       if (Math.hypot(px - tb.rx, py - tb.ry) <= Math.max(32, tb.boxW * 0.75)) {
         return 'tracker';
+      }
+    }
+
+    // Check interactive bottom-left Blender 3D Triad handles
+    if (this.viewport3D?.enabled && this.lastTriadHandles) {
+      const th = this.lastTriadHandles;
+      for (const a of th.axes || []) {
+        if (Math.hypot(px - a.x, py - a.y) <= 13) {
+          return `triad_${a.label.toLowerCase()}`;
+        }
+      }
+      if (Math.hypot(px - th.cx, py - th.cy) <= th.r) {
+        return 'triad_reset';
       }
     }
 

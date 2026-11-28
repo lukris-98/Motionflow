@@ -432,6 +432,7 @@ export class PanelsUI {
       frag.appendChild(col);
     });
     grid.appendChild(frag);
+    this.app.refreshMediaStorageStats?.();
   }
 
   renderInspector(opts = {}) {
@@ -2608,6 +2609,8 @@ export class PanelsUI {
     if (!body) return;
     const cam = this.app.project.camera;
     const autoRec = Boolean(this.app.viewport3D?.autoRecord);
+    const viewMode = this.app.viewport3D?.viewMode || 'camera';
+    const axisLock = this.app.viewport3D?.axisLock || 'free';
     const curF = Math.round(this.app.currentFrame);
     const curCam = this.app.getEffectiveCamera(curF);
     const pendingCam = Boolean(this.app._pending3DCamPose && this.app._pending3DCamPose.frame === curF);
@@ -2634,6 +2637,22 @@ export class PanelsUI {
           <label class="form-check-label small" for="camMotionBlur">Motion Blur</label>
         </div>
       </div>
+
+      <div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mb-2 p-2 rounded bg-dark border border-secondary-subtle">
+        <div class="btn-group btn-group-sm" role="group" aria-label="3D Viewport Mode">
+          <button id="btnCamViewCamera" type="button" class="btn ${viewMode === 'camera' ? 'btn-info text-dark fw-semibold' : 'btn-outline-secondary'}">Camera View</button>
+          <button id="btnCamViewScene" type="button" class="btn ${viewMode === 'scene' ? 'btn-warning text-dark fw-semibold' : 'btn-outline-secondary'}">Scene Orbit</button>
+        </div>
+        <button id="btnCamSnapToView" type="button" class="btn btn-xs btn-outline-warning py-1 px-2 ${viewMode === 'scene' ? '' : 'd-none'}">
+          <i class="bi bi-crosshair2 me-1"></i>Snap Render Cam ke View
+        </button>
+        <div class="btn-group btn-group-xs" role="group" aria-label="Axis Lock">
+          ${['free', 'x', 'y', 'z'].map((ax) => `
+            <button type="button" class="btn ${axisLock === ax ? 'btn-info text-dark fw-bold' : 'btn-outline-secondary'}" data-cam-axis-lock="${ax}">${ax === 'free' ? 'Free' : ax.toUpperCase()}</button>
+          `).join('')}
+        </div>
+      </div>
+
       <div class="row g-2">
         <div class="col-4 col-sm-3"><label class="form-label small text-secondary mb-0">Cam X</label><input id="camX" type="number" class="form-control form-control-sm" value="${Math.round(curCam.x)}" /></div>
         <div class="col-4 col-sm-3"><label class="form-label small text-secondary mb-0">Cam Y</label><input id="camY" type="number" class="form-control form-control-sm" value="${Math.round(curCam.y)}" /></div>
@@ -2669,6 +2688,12 @@ export class PanelsUI {
       this.app.setViewport3DAutoRecord(e.target.checked);
     });
     body.querySelector('#camMotionBlur').onchange = (e) => this.app.mutateProject(() => { cam.motionBlur = e.target.checked; });
+    body.querySelector('#btnCamViewCamera')?.addEventListener('click', () => this.app.setViewport3DViewMode('camera'));
+    body.querySelector('#btnCamViewScene')?.addEventListener('click', () => this.app.setViewport3DViewMode('scene'));
+    body.querySelector('#btnCamSnapToView')?.addEventListener('click', () => this.app.snapActiveCameraToSceneView());
+    body.querySelectorAll('[data-cam-axis-lock]').forEach((btn) => {
+      btn.addEventListener('click', () => this.app.setViewport3DAxisLock(btn.dataset.camAxisLock));
+    });
     const bindCam = (id, prop, fallback = 0, minVal = -Infinity, maxVal = Infinity) => {
       body.querySelector(id).onchange = (e) => {
         const parsed = Number(e.target.value);
@@ -5117,12 +5142,21 @@ export class PanelsUI {
     const pinnableLayers = this.app.project.layers.filter(
       (l) => l.id !== srcLayer?.id && l.type !== 'audio' && l.type !== 'adjustment'
     );
+    const pinnedTextLayers = this.app.project.layers.filter(
+      (l) => l.type === 'text' && l.pinnedSourceLayerId === srcLayer?.id
+    );
 
     if (!srcLayer) {
       return `<div class="text-center text-secondary py-4 small">Import and add a Video (or Image) clip to the timeline first to use Motion Tracking.</div>`;
     }
 
     const ptCount = trackData?.points?.length || 0;
+    const swatchHex = tr.sampledColorHex || trackData?.colorSignature?.hex || '#FFEB3B';
+    const coastBadge = trackData?.coastedFrames > 0 ? ` · ${trackData.coastedFrames} coasted` : '';
+    const colorBadge = trackData?.colorSignature?.hex
+      ? `<span class="d-inline-block rounded-circle ms-1 align-middle border border-light" style="width:10px;height:10px;background:${trackData.colorSignature.hex};" title="Color-Lock ${trackData.colorSignature.hex}"></span>`
+      : '';
+
     return `
       <div class="row g-2 mb-2 align-items-end">
         <div class="col-7">
@@ -5166,6 +5200,24 @@ export class PanelsUI {
         </div>
       </div>
 
+      <div class="row g-2 mb-2 align-items-center">
+        <div class="col-7">
+          <label class="form-label small text-secondary mb-0">Pixel / Color-Lock Mode</label>
+          <select id="trkColorLock" class="form-select form-select-sm" ${tr.isTracking ? 'disabled' : ''}>
+            <option value="auto" ${(tr.colorLock || 'auto') === 'auto' ? 'selected' : ''}>Auto (Bentuk + Warna)</option>
+            <option value="on" ${tr.colorLock === 'on' ? 'selected' : ''}>Kunci Warna Ketat (e.g. Tanda Kuning)</option>
+            <option value="off" ${tr.colorLock === 'off' ? 'selected' : ''}>Bentuk / Luma Saja</option>
+          </select>
+        </div>
+        <div class="col-5">
+          <label class="form-label small text-secondary mb-0">Sampled Pixel</label>
+          <div class="d-flex align-items-center gap-2 px-2 py-1 rounded bg-dark border border-secondary-subtle">
+            <span id="trkSwatchDot" class="rounded-circle border border-light flex-shrink-0" style="width:14px;height:14px;background:${swatchHex};"></span>
+            <span id="trkSwatchHex" class="small fw-semibold text-light text-truncate">${tr.sampledColorHex || 'Drag [+]'}</span>
+          </div>
+        </div>
+      </div>
+
       <div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mb-2">
         <div class="d-flex flex-wrap gap-3">
           <div class="form-check form-switch mb-0">
@@ -5187,7 +5239,7 @@ export class PanelsUI {
       ${tr.isTracking ? `
         <div class="p-2 rounded bg-dark border border-warning-subtle mb-2">
           <div class="d-flex justify-content-between small mb-1">
-            <span class="text-warning fw-semibold">Tracking 3D motion &amp; orientation...</span>
+            <span class="text-warning fw-semibold">Tracking 3D motion &amp; color lock...</span>
             <span id="trkPctLbl">${tr.progressPct}%</span>
           </div>
           <div class="progress mf-export-progress mb-1">
@@ -5209,20 +5261,31 @@ export class PanelsUI {
       ${ptCount > 0 ? `
         <div class="p-2 rounded bg-dark border border-secondary-subtle">
           <div class="d-flex justify-content-between align-items-center mb-2">
-            <span class="small fw-semibold text-info">Tracked F${trackData.startFrame} → F${trackData.endFrame} (${ptCount} pts · ${Math.round((trackData.avgConfidence || 0) * 100)}%)</span>
+            <span class="small fw-semibold text-info">Tracked F${trackData.startFrame} → F${trackData.endFrame} (${ptCount} pts · ${Math.round((trackData.avgConfidence || 0) * 100)}%${coastBadge})${colorBadge}</span>
             <button id="btnTrkClear" class="btn btn-xs btn-outline-danger py-0 px-2">Clear</button>
           </div>
           <div class="input-group input-group-sm mb-2">
-            <input id="trkNewTextVal" type="text" class="form-control" placeholder="e.g. Pinggir Jalan / Lokasi" value="LANDMARK" />
+            <input id="trkNewTextVal" type="text" class="form-control" placeholder="e.g. Pinggir Jalan / Pagar Kuning" value="LANDMARK" />
             <input id="trkOffsetY" type="number" class="form-control" style="max-width:68px;" value="0" title="Y Offset (0 = Right on Mark)" />
             <button id="btnPinNewText" class="btn mf-btn-accent fw-semibold"><i class="bi bi-pin-angle-fill me-1"></i>Pin Text</button>
           </div>
           ${pinnableLayers.length > 0 ? `
-            <div class="input-group input-group-sm">
+            <div class="input-group input-group-sm mb-2">
               <select id="trkTargetLayerSel" class="form-select">
                 ${pinnableLayers.map((l) => `<option value="${l.id}">${this.esc(l.name)} (${l.type})</option>`).join('')}
               </select>
               <button id="btnPinExistingLayer" class="btn btn-outline-info">Pin Layer</button>
+            </div>
+          ` : ''}
+          ${pinnedTextLayers.length > 0 ? `
+            <div class="border-top border-secondary-subtle pt-2 mt-1">
+              <div class="small text-secondary mb-1">Anchor Ter-Pin (Ubah teks tanpa track ulang):</div>
+              ${pinnedTextLayers.map((pl) => `
+                <div class="input-group input-group-sm mb-1">
+                  <input type="text" class="form-control" data-pinned-text-input="${pl.id}" value="${this.esc(pl.textProps?.text || pl.name)}" />
+                  <button type="button" class="btn btn-outline-warning" data-pinned-text-save="${pl.id}">Ubah</button>
+                </div>
+              `).join('')}
             </div>
           ` : ''}
         </div>
@@ -5267,6 +5330,9 @@ export class PanelsUI {
     body.querySelector('#trkExitMode')?.addEventListener('change', (e) => {
       tr.exitMode = e.target.value;
     });
+    body.querySelector('#trkColorLock')?.addEventListener('change', (e) => {
+      tr.colorLock = e.target.value || 'auto';
+    });
     body.querySelector('#trkScaleChk')?.addEventListener('change', (e) => {
       tr.trackScale = e.target.checked;
     });
@@ -5295,6 +5361,14 @@ export class PanelsUI {
     body.querySelector('#btnPinExistingLayer')?.addEventListener('click', () => {
       const targetId = body.querySelector('#trkTargetLayerSel')?.value;
       if (targetId) this.app.pinExistingLayerToTrack(srcLayer, targetId);
+    });
+
+    body.querySelectorAll('[data-pinned-text-save]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const lid = btn.dataset.pinnedTextSave;
+        const inp = body.querySelector(`[data-pinned-text-input="${lid}"]`);
+        if (inp) this.app.updatePinnedTrackedText(lid, inp.value);
+      });
     });
   }
 
