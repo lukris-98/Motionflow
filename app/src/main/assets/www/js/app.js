@@ -1061,6 +1061,9 @@ class MotionFlowApp {
       await this.renderer.seekVideosForFrame(this.project, this.currentFrame, this.mediaMap, false);
     }
     if (token !== this._seekVersion) return;
+    if (this.trackerState?.active && !this.trackerState?.isTracking) {
+      this.updateTrackerSampleSwatch();
+    }
     this.renderPreview();
     if (this.isPlaying) {
       this.audioEngine.startPlayback(this.project, this.currentFrame, this.mediaMap);
@@ -1088,6 +1091,9 @@ class MotionFlowApp {
     this.updateTransportLabels();
     this.syncViewport3DUI();
     this.renderer.seekVideosForFrame(this.project, this.currentFrame, this.mediaMap, false).catch(() => {});
+    if (this.trackerState?.active && !this.trackerState?.isTracking) {
+      this.updateTrackerSampleSwatch();
+    }
     this.renderPreview();
 
     if (this._scrollPanelRefreshTimer) clearTimeout(this._scrollPanelRefreshTimer);
@@ -1730,8 +1736,9 @@ class MotionFlowApp {
     const next = Boolean(enabled);
     this.viewport3D.autoRecord = next;
     if (next) {
-      if (!this.viewport3D.enabled) {
+      if (!this.viewport3D.enabled || this.viewport3D.viewMode === 'scene') {
         this.viewport3D.enabled = true;
+        this.viewport3D.viewMode = 'camera';
         this.renderer.setViewport3DState(this.viewport3D);
       }
       const curFrame = Math.max(0, Math.round(this.currentFrame));
@@ -3532,7 +3539,11 @@ class MotionFlowApp {
         src.trackData = result;
       });
       await this.seekToFrame(result.anchorFrame);
-      this.showToast(`Tracked ${result.points.length} frames (${Math.round(result.avgConfidence * 100)}% lock)`);
+      if (this.trackerState.colorLock === 'on' && !result.colorLockUsed) {
+        this.showToast(`Tracked ${result.points.length} frames (Area netral — Color-Lock fallback ke ZNCC)`);
+      } else {
+        this.showToast(`Tracked ${result.points.length} frames (${Math.round(result.avgConfidence * 100)}% lock)`);
+      }
     } catch (err) {
       this.trackerState.isTracking = false;
       src.trackData = prevTrackData;
@@ -3634,7 +3645,7 @@ class MotionFlowApp {
     this.renderPreview();
   }
 
-  pinNewTrackedText(srcLayer, textContent, offsetY = 0) {
+  pinNewTrackedText(srcLayer, textContent, offsetY = 0, offsetX = 0) {
     if (!srcLayer?.trackData?.points?.length) return this.showToast('Track the video target first');
     const startF = srcLayer.trackData.startFrame;
     this.mutateProject(() => {
@@ -3644,7 +3655,7 @@ class MotionFlowApp {
       txtLayer.textProps.fontSize = 54;
       TimelineEngine.addLayer(this.project, txtLayer);
       TrackerEngine.applyTrackToLayer(txtLayer, srcLayer.trackData, {
-        offsetX: 0,
+        offsetX,
         offsetY,
         applyScale: this.trackerState.trackScale,
         use3DDepth: this.trackerState.use3DDepth,
@@ -4899,6 +4910,17 @@ class MotionFlowApp {
       } else if (key === 'b') {
         e.preventDefault();
         this.toggleBeatAtPlayhead();
+      } else if (this.viewport3D?.enabled && !e.shiftKey && (key === 'x' || key === 'y' || key === 'z')) {
+        e.preventDefault();
+        const curAxis = this.viewport3D.axisLock || 'free';
+        this.setViewport3DAxisLock(curAxis === key ? 'free' : key);
+      } else if (this.viewport3D?.enabled && (key === 'g' || key === 'r' || key === 's')) {
+        e.preventDefault();
+        const toolMap = { g: 'move', r: 'rotate', s: 'scale' };
+        this.setViewport3DTool(toolMap[key]);
+      } else if (this.viewport3D?.enabled && (key === '0' || key === 'v')) {
+        e.preventDefault();
+        this.toggleViewport3DViewMode();
       } else if (key === 'z' && e.shiftKey) {
         e.preventDefault();
         this.timelineView.zoomToFit(this.project);

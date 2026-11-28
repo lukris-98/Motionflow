@@ -5266,7 +5266,8 @@ export class PanelsUI {
           </div>
           <div class="input-group input-group-sm mb-2">
             <input id="trkNewTextVal" type="text" class="form-control" placeholder="e.g. Pinggir Jalan / Pagar Kuning" value="LANDMARK" />
-            <input id="trkOffsetY" type="number" class="form-control" style="max-width:68px;" value="0" title="Y Offset (0 = Right on Mark)" />
+            <input id="trkOffsetX" type="number" class="form-control" style="max-width:58px;" value="0" placeholder="X" title="Offset X dari tanda (px)" />
+            <input id="trkOffsetY" type="number" class="form-control" style="max-width:58px;" value="0" placeholder="Y" title="Offset Y dari tanda (px)" />
             <button id="btnPinNewText" class="btn mf-btn-accent fw-semibold"><i class="bi bi-pin-angle-fill me-1"></i>Pin Text</button>
           </div>
           ${pinnableLayers.length > 0 ? `
@@ -5354,8 +5355,9 @@ export class PanelsUI {
 
     body.querySelector('#btnPinNewText')?.addEventListener('click', () => {
       const txt = body.querySelector('#trkNewTextVal')?.value?.trim() || 'LANDMARK';
+      const offX = Number(body.querySelector('#trkOffsetX')?.value);
       const offY = Number(body.querySelector('#trkOffsetY')?.value);
-      this.app.pinNewTrackedText(srcLayer, txt, isFinite(offY) ? offY : 0);
+      this.app.pinNewTrackedText(srcLayer, txt, isFinite(offY) ? offY : 0, isFinite(offX) ? offX : 0);
     });
 
     body.querySelector('#btnPinExistingLayer')?.addEventListener('click', () => {

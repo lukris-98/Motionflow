@@ -2516,7 +2516,52 @@ test('Blender 3D Viewport Scene Orbit View stays isolated from Active Render Cam
   assert.equal(exportCam.zoom, 1.25);
 });
 
+test('Roadside text pinning preserves custom offsetX & offsetY beside tracked color mark with perspective scaling', () => {
+  const proj = createEmptyProject('OffsetPinProj', { fps: 30, width: 1280, height: 720 });
+  const vid = TimelineEngine.createMediaLayer(proj, { id: 'm_road', type: 'video', name: 'Street.mp4', durationMs: 3000 }, 0, { trackRole: 'main' });
+  TimelineEngine.addToMainTrack(proj, vid);
 
+  const track = {
+    sourceLayerId: vid.id,
+    anchorFrame: 0,
+    startFrame: 0,
+    endFrame: 20,
+    avgConfidence: 0.9,
+    points: [
+      { frame: 0, x: 100, y: 20, z: 0, scale: 1.0, rotation: 0, rotX: 0, rotY: 0, score: 0.92 },
+      { frame: 20, x: 220, y: 40, z: 180, scale: 1.4, rotation: 0, rotX: 0, rotY: -6, score: 0.89 }
+    ]
+  };
 
+  const txt = TimelineEngine.createTextLayer(proj, 0);
+  txt.textProps.text = 'SAMPING PAGAR';
+  TimelineEngine.addLayer(proj, txt);
 
+  const ok = TrackerEngine.applyTrackToLayer(txt, track, {
+    offsetX: -80,
+    offsetY: -50,
+    applyScale: true,
+    use3DDepth: true,
+    exitMode: 'passBy',
+    maxEndFrame: vid.endFrame
+  });
+  assert.equal(ok, true);
+  assert.equal(KeyframeEngine.getValueAtFrame(txt, 'x', 0, 0), 20);
+  assert.equal(KeyframeEngine.getValueAtFrame(txt, 'y', 0, 0), -30);
+  // At frame 20 (scale = 1.4) with True 3D Depth, world X = (pt.x + offsetX * sc) / sc so WebGL projects to pt.x + offsetX * sc
+  assert.equal(KeyframeEngine.getValueAtFrame(txt, 'x', 20, 0), Number(((220 + -80 * 1.4) / 1.4).toFixed(1)));
+  assert.equal(KeyframeEngine.getValueAtFrame(txt, 'y', 20, 0), Number(((40 + -50 * 1.4) / 1.4).toFixed(1)));
 
+  // Also verify 2D scaled fallback (use3DDepth: false) applies offsetX * scale directly
+  const txt2d = TimelineEngine.createTextLayer(proj, 0);
+  TimelineEngine.addLayer(proj, txt2d);
+  TrackerEngine.applyTrackToLayer(txt2d, track, {
+    offsetX: -80,
+    offsetY: -50,
+    applyScale: true,
+    use3DDepth: false,
+    exitMode: 'none'
+  });
+  assert.equal(KeyframeEngine.getValueAtFrame(txt2d, 'x', 20, 0), Number((220 + -80 * 1.4).toFixed(1)));
+  assert.equal(KeyframeEngine.getValueAtFrame(txt2d, 'y', 20, 0), Number((40 + -50 * 1.4).toFixed(1)));
+});
