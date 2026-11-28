@@ -342,6 +342,12 @@ test('App launches to Home menu first and Editor requires an explicitly selected
   // Home page surfaces Pilih Project prominently before Quick Create and cards have Buka button
   assert.ok(homePageSrc.indexOf('lkRecentProjectsContainer') < homePageSrc.indexOf('renderQuickCreate()'));
   assert.ok(cardSrc.includes('class="lk-open-proj-btn"'));
+
+  // Search box is left-aligned with Welcome back! greeting in TopHeader
+  const topHeaderSrc = fs.readFileSync(path.resolve('app/src/main/assets/www/js/home/components/header/TopHeader.js'), 'utf8');
+  assert.ok(topHeaderSrc.includes('class="lk-header-left-stack'));
+  assert.ok(topHeaderSrc.indexOf('Welcome back!') < topHeaderSrc.indexOf('lk-search-wrap'));
+  assert.ok(!topHeaderSrc.includes('lk-header-actions d-flex align-items-center gap-2 ms-auto'));
 });
 
 

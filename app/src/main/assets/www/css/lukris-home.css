@@ -284,12 +284,18 @@ body.lk-sidebar-collapsed .lk-nav-item {
   color: var(--lk-muted);
 }
 
+.lk-header-left-stack {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+}
+
 .lk-search-wrap {
   position: relative;
   display: flex;
   align-items: center;
-  width: 260px;
-  max-width: 44vw;
+  width: 100%;
+  max-width: 420px;
 }
 
 .lk-search-icon {
@@ -1222,7 +1228,7 @@ html.lk-theme-light .lk-hero-card {
 @media (max-width: 767.98px) {
   .lk-sidebar { display: none; }
   .lk-mobile-bottom-nav { display: flex; }
-  .lk-search-wrap { width: 170px; }
+  .lk-search-wrap { width: 100%; max-width: 100%; }
   .lk-hero-card { padding: 20px; }
 }
 
