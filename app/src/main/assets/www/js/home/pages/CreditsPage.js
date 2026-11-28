@@ -38,9 +38,12 @@ export function renderCreditsPage(container) {
               <button type="button" class="btn lk-btn-primary btn-sm" data-nav="home">
                 <i class="bi bi-house-door me-1"></i>Beranda Home
               </button>
-              <a href="./editor.html" class="btn lk-btn-secondary btn-sm">
-                <i class="bi bi-film me-1"></i>Buka Studio Editor
-              </a>
+              <button type="button" class="btn lk-btn-secondary btn-sm" data-nav="projects">
+                <i class="bi bi-folder2-open me-1"></i>Pilih Project
+              </button>
+              <button type="button" class="btn lk-btn-secondary btn-sm" data-action="open-new-project">
+                <i class="bi bi-plus-lg me-1"></i>Buat Project Baru
+              </button>
             </div>
           </div>
         </div>

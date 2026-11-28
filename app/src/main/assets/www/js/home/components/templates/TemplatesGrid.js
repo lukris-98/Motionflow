@@ -52,7 +52,7 @@ export function renderTemplatesSection(templates, { showExploreAll = true, title
           <div class="col-12 col-sm-6 col-lg-4">
             <article class="lk-template-card">
               <div class="lk-template-thumb-wrap" data-action="use-template" data-template-id="${escapeHtml(tpl.id)}" role="button" tabindex="0">
-                <img class="lk-template-thumb" src="${buildTemplateThumbSvg(tpl)}" alt="${escapeHtml(tpl.name)}" loading="lazy" />
+                <img class="lk-template-thumb" src="${buildTemplateThumbSvg(tpl)}" alt="${escapeHtml(tpl.name)}" loading="lazy" decoding="async" />
                 <span class="lk-tpl-badge">${escapeHtml(tpl.badge)}</span>
                 <span class="lk-tpl-ratio">${escapeHtml(tpl.aspectRatio)}</span>
                 <span class="lk-tpl-use-overlay">

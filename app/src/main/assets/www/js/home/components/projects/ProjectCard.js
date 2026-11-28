@@ -50,8 +50,8 @@ export function renderProjectGridCard(p, { isTrash = false, lazyThumb = true } =
         <div class="lk-project-thumb-wrap" data-proj-act="${isTrash ? 'restore' : 'open'}" data-proj-id="${id}" role="button" tabindex="0" aria-label="Open ${name}">
           ${thumbSrc
             ? (lazyThumb
-                ? `<img class="lk-project-thumb is-lazy" data-lazy-src="${thumbSrc}" alt="${name}" loading="lazy" />`
-                : `<img class="lk-project-thumb" src="${thumbSrc}" alt="${name}" loading="lazy" />`)
+                ? `<img class="lk-project-thumb is-lazy" data-lazy-src="${thumbSrc}" alt="${name}" loading="lazy" decoding="async" />`
+                : `<img class="lk-project-thumb" src="${thumbSrc}" alt="${name}" loading="lazy" decoding="async" />`)
             : `<div class="lk-project-thumb-fallback"><i class="bi ${tMeta.icon}"></i></div>`
           }
           <span class="lk-thumb-badge-type"><i class="bi ${tMeta.icon} me-1"></i>${tMeta.label}</span>
@@ -78,16 +78,28 @@ export function renderProjectGridCard(p, { isTrash = false, lazyThumb = true } =
             </div>
           </div>
 
-          <div class="dropdown flex-shrink-0">
-            <button type="button"
-              class="lk-dots-btn"
-              data-bs-toggle="dropdown"
-              aria-expanded="false"
-              aria-label="Project options for ${name}"
-              title="More Options">
-              <i class="bi bi-three-dots-vertical"></i>
-            </button>
-            ${buildMenuHtml(p, isTrash)}
+          <div class="d-flex align-items-center gap-1 flex-shrink-0">
+            ${!isTrash ? `
+              <button type="button"
+                class="lk-open-proj-btn"
+                data-proj-act="open"
+                data-proj-id="${id}"
+                aria-label="Buka ${name} di Editor"
+                title="Buka di Editor">
+                <i class="bi bi-play-fill"></i><span>Buka</span>
+              </button>
+            ` : ''}
+            <div class="dropdown flex-shrink-0">
+              <button type="button"
+                class="lk-dots-btn"
+                data-bs-toggle="dropdown"
+                aria-expanded="false"
+                aria-label="Project options for ${name}"
+                title="More Options">
+                <i class="bi bi-three-dots-vertical"></i>
+              </button>
+              ${buildMenuHtml(p, isTrash)}
+            </div>
           </div>
         </div>
       </article>
@@ -109,8 +121,8 @@ export function renderProjectListRow(p, { isTrash = false, lazyThumb = true } = 
       <div class="lk-row-thumb-wrap" data-proj-act="${isTrash ? 'restore' : 'open'}" data-proj-id="${id}" role="button">
         ${thumbSrc
           ? (lazyThumb
-              ? `<img class="lk-project-thumb is-lazy" data-lazy-src="${thumbSrc}" alt="${name}" loading="lazy" />`
-              : `<img class="lk-project-thumb" src="${thumbSrc}" alt="${name}" loading="lazy" />`)
+              ? `<img class="lk-project-thumb is-lazy" data-lazy-src="${thumbSrc}" alt="${name}" loading="lazy" decoding="async" />`
+              : `<img class="lk-project-thumb" src="${thumbSrc}" alt="${name}" loading="lazy" decoding="async" />`)
           : `<div class="lk-project-thumb-fallback"><i class="bi ${tMeta.icon}"></i></div>`
         }
       </div>
@@ -131,6 +143,14 @@ export function renderProjectListRow(p, { isTrash = false, lazyThumb = true } = 
 
       <div class="d-flex align-items-center gap-1 flex-shrink-0">
         ${!isTrash ? `
+          <button type="button"
+            class="lk-open-proj-btn"
+            data-proj-act="open"
+            data-proj-id="${id}"
+            aria-label="Buka ${name} di Editor"
+            title="Buka di Editor">
+            <i class="bi bi-play-fill"></i><span>Buka</span>
+          </button>
           <button type="button"
             class="lk-dots-btn ${p.favorite ? 'text-warning' : ''}"
             data-proj-act="favorite"

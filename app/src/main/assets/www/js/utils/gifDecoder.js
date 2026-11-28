@@ -54,7 +54,7 @@ export async function decodeAnimatedGif(url) {
   const compCanvas = document.createElement('canvas');
   compCanvas.width = width;
   compCanvas.height = height;
-  const compCtx = compCanvas.getContext('2d');
+  const compCtx = compCanvas.getContext('2d', { willReadFrequently: true });
 
   const frames = [];
   let delayMs = 100;

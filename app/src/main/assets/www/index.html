@@ -8,6 +8,10 @@
   <link rel="stylesheet" href="./vendor/bootstrap.min.css" />
   <link rel="stylesheet" href="./vendor/bootstrap-icons.min.css" />
   <link rel="stylesheet" href="./css/lukris-home.css" />
+  <link rel="modulepreload" href="./js/home/coreEngine.js" />
+  <link rel="modulepreload" href="./js/home/projectManager.js" />
+  <link rel="modulepreload" href="./js/home/assetMetadataManager.js" />
+  <link rel="modulepreload" href="./js/home/homeModule.js" />
 </head>
 <body>
   <div class="lk-shell">
@@ -215,7 +219,7 @@
     </div>
   </div>
 
-  <script src="./vendor/bootstrap.bundle.min.js"></script>
+  <script defer src="./vendor/bootstrap.bundle.min.js"></script>
   <script type="module" src="./js/home/homeModule.js"></script>
 </body>
 </html>

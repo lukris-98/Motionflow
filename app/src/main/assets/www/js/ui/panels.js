@@ -155,7 +155,7 @@ export class PanelsUI {
     const c = document.createElement('canvas');
     c.width = w;
     c.height = h;
-    const ctx = c.getContext('2d');
+    const ctx = c.getContext('2d', { willReadFrequently: true });
     const img = this._landscapeImg;
     const iw = img.naturalWidth || w;
     const ih = img.naturalHeight || h;

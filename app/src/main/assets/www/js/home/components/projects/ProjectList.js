@@ -56,6 +56,11 @@ export function mountProjectsList(container, projects, {
 } = {}) {
   if (!container) return;
 
+  if (container._lkBatchObserver) {
+    container._lkBatchObserver.disconnect();
+    container._lkBatchObserver = null;
+  }
+
   if (!Array.isArray(projects) || projects.length === 0) {
     container.innerHTML = renderProjectEmptyState({ isTrash, favoritesOnly, hasSearch });
     return;
@@ -110,9 +115,13 @@ export function mountProjectsList(container, projects, {
       const batchObs = new IntersectionObserver((entries) => {
         if (entries.some((e) => e.isIntersecting)) {
           appendNextBatch();
-          if (renderedCount >= projects.length) batchObs.disconnect();
+          if (renderedCount >= projects.length) {
+            batchObs.disconnect();
+            if (container._lkBatchObserver === batchObs) container._lkBatchObserver = null;
+          }
         }
       }, { rootMargin: '160px' });
+      container._lkBatchObserver = batchObs;
       batchObs.observe(sentinel);
     }
   }

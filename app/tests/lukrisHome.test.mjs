@@ -6,6 +6,8 @@ import path from 'node:path';
 // Minimal localStorage shim for Node unit tests
 const memStore = new Map();
 globalThis.localStorage = {
+  get length() { return memStore.size; },
+  key: (i) => Array.from(memStore.keys())[i] ?? null,
   getItem: (k) => (memStore.has(k) ? memStore.get(k) : null),
   setItem: (k, v) => { memStore.set(k, String(v)); },
   removeItem: (k) => { memStore.delete(k); },
@@ -202,3 +204,145 @@ test('Dedicated CreditsPage renders Lukris copyright and is accessible via butto
   assert.ok(creditsSrc.includes('./assets/lukris-logo.png'));
   assert.ok(fs.existsSync(path.resolve('app/src/main/assets/www/assets/lukris-logo.png')));
 });
+
+test('Performance optimizations across Android WebView, Home CSS, RendererEngine, and TimelineView', () => {
+  const mainAct = fs.readFileSync(path.resolve('app/src/main/java/com/example/MainActivity.kt'), 'utf8');
+  const storageHelper = fs.readFileSync(path.resolve('app/src/main/java/com/example/MediaStorageHelper.kt'), 'utf8');
+  const homeCss = fs.readFileSync(path.resolve('app/src/main/assets/www/css/lukris-home.css'), 'utf8');
+  const studioCss = fs.readFileSync(path.resolve('app/src/main/assets/www/css/studio.css'), 'utf8');
+  const rendererSrc = fs.readFileSync(path.resolve('app/src/main/assets/www/js/engine/rendererEngine.js'), 'utf8');
+  const timelineSrc = fs.readFileSync(path.resolve('app/src/main/assets/www/js/ui/timelineView.js'), 'utf8');
+  const appSrc = fs.readFileSync(path.resolve('app/src/main/assets/www/js/app.js'), 'utf8');
+
+  assert.ok(mainAct.includes('override fun onTrimMemory'));
+  assert.ok(mainAct.includes('LAYER_TYPE_HARDWARE'));
+  assert.ok(mainAct.includes('RENDERER_PRIORITY_IMPORTANT'));
+  assert.ok(storageHelper.includes('public, max-age=86400'));
+  assert.ok(homeCss.includes('content-visibility: auto'));
+  assert.ok(!studioCss.includes('will-change: left, width, transform;'));
+  assert.ok(rendererSrc.includes('handleMemoryPressure('));
+  assert.ok(rendererSrc.includes('desynchronized: !antialias'));
+  assert.ok(timelineSrc.includes('this._scrollRafId'));
+  assert.ok(appSrc.includes('onMemoryTrim:'));
+  assert.ok(appSrc.includes("addEventListener('pagehide'"));
+
+  const indexHtml = fs.readFileSync(path.resolve('app/src/main/assets/www/index.html'), 'utf8');
+  const editorHtml = fs.readFileSync(path.resolve('app/src/main/assets/www/editor.html'), 'utf8');
+  const gifSrc = fs.readFileSync(path.resolve('app/src/main/assets/www/js/utils/gifDecoder.js'), 'utf8');
+  const proguardSrc = fs.readFileSync(path.resolve('app/proguard-rules.pro'), 'utf8');
+
+  assert.ok(indexHtml.includes('rel="modulepreload"'));
+  assert.ok(editorHtml.includes('rel="modulepreload"'));
+  assert.ok(!studioCss.includes('backdrop-filter'));
+  assert.ok(gifSrc.includes('willReadFrequently: true'));
+  assert.ok(storageHelper.includes('BufferedInputStream'));
+  assert.ok(proguardSrc.includes('@android.webkit.JavascriptInterface'));
+});
+
+test('Safe Clear Cache button exists in Home & Editor Settings and clears temporary cache without deleting saved assets', async () => {
+  memStore.clear();
+  localStorage.setItem('lukris_projects_meta_v1', JSON.stringify([{ id: 'proj_keep', name: 'Important Project' }]));
+  localStorage.setItem('lukris_tmp_preview_1', 'temp-preview-data');
+  localStorage.setItem('mf_tmp_frame_buf', 'temp-frame-data');
+
+  let nativeArgSeen = null;
+  globalThis.window = {
+    AndroidBridge: {
+      clearTempCache(arg) {
+        nativeArgSeen = arg;
+        return JSON.stringify({ deletedCount: 3, freedBytes: 4096 });
+      }
+    }
+  };
+
+  const { ProjectStorage } = await import('../src/main/assets/www/js/storage/projectStorage.js');
+  const res = await ProjectStorage.clearSafeTempCache();
+  assert.equal(localStorage.getItem('lukris_tmp_preview_1'), null);
+  assert.equal(localStorage.getItem('mf_tmp_frame_buf'), null);
+  assert.ok(localStorage.getItem('lukris_projects_meta_v1')?.includes('Important Project'));
+  assert.equal(nativeArgSeen, '__SKIP_MEDIA__');
+  assert.ok(res.deletedCount >= 5);
+  assert.ok(res.freedBytes >= 4096);
+  delete globalThis.window;
+
+  const dialogsSrc = fs.readFileSync(path.resolve('app/src/main/assets/www/js/home/components/dialogs/Dialogs.js'), 'utf8');
+  const editorHtml = fs.readFileSync(path.resolve('app/src/main/assets/www/editor.html'), 'utf8');
+  const appSrc = fs.readFileSync(path.resolve('app/src/main/assets/www/js/app.js'), 'utf8');
+  const mainAct = fs.readFileSync(path.resolve('app/src/main/java/com/example/MainActivity.kt'), 'utf8');
+  const storageHelper = fs.readFileSync(path.resolve('app/src/main/java/com/example/MediaStorageHelper.kt'), 'utf8');
+
+  assert.ok(dialogsSrc.includes('ProjectStorage.clearSafeTempCache()'));
+  assert.ok(!dialogsSrc.includes("cleanupUnusedNativeFiles('[]')"));
+  assert.ok(dialogsSrc.includes('btnClearAssetCache'));
+  assert.ok(dialogsSrc.includes('btnGeneralClearCache'));
+  assert.ok(editorHtml.includes('id="btnSettingsClearCache"'));
+  assert.ok(appSrc.includes('clearTemporaryCacheSafely('));
+  assert.ok(mainAct.includes('fun clearTempCache('));
+  assert.ok(storageHelper.includes('fun clearTempCache('));
+});
+
+test('Draggable horizontal divider separates preview canvas and timeline in editor', () => {
+  const editorHtml = fs.readFileSync(path.resolve('app/src/main/assets/www/editor.html'), 'utf8');
+  const studioCss = fs.readFileSync(path.resolve('app/src/main/assets/www/css/studio.css'), 'utf8');
+  const appSrc = fs.readFileSync(path.resolve('app/src/main/assets/www/js/app.js'), 'utf8');
+
+  const previewIdx = editorHtml.indexOf('class="mf-preview-section');
+  const resizerIdx = editorHtml.indexOf('id="previewTimelineResizer"');
+  const transportIdx = editorHtml.indexOf('class="mf-transport-bar');
+  const timelineIdx = editorHtml.indexOf('class="mf-timeline-wrapper');
+
+  assert.ok(previewIdx > 0 && resizerIdx > previewIdx && transportIdx > resizerIdx && timelineIdx > transportIdx);
+  assert.ok(studioCss.includes('.mf-split-resizer'));
+  assert.ok(studioCss.includes('cursor: ns-resize'));
+  assert.ok(studioCss.includes('touch-action: none'));
+  assert.ok(studioCss.includes('.mf-preview-section.is-fullview + .mf-split-resizer'));
+  assert.ok(appSrc.includes('initPreviewTimelineResizer()'));
+  assert.ok(appSrc.includes('mf_preview_split_height'));
+});
+
+test('Timeline provides direct Pisah Audio buttons on selected video clips, transport bar, and track wheel menu', () => {
+  const editorHtml = fs.readFileSync(path.resolve('app/src/main/assets/www/editor.html'), 'utf8');
+  const studioCss = fs.readFileSync(path.resolve('app/src/main/assets/www/css/studio.css'), 'utf8');
+  const timelineSrc = fs.readFileSync(path.resolve('app/src/main/assets/www/js/ui/timelineView.js'), 'utf8');
+  const appSrc = fs.readFileSync(path.resolve('app/src/main/assets/www/js/app.js'), 'utf8');
+
+  assert.ok(editorHtml.includes('id="btnDetachAudioQuick"'));
+  assert.ok(studioCss.includes('.mf-clip-detach-btn'));
+  assert.ok(timelineSrc.includes("detachBtn.className = 'mf-clip-detach-btn'"));
+  assert.ok(timelineSrc.includes('this.cb.onDetachAudio?.('));
+  assert.ok(appSrc.includes('onDetachAudio: (id) => this.detachAudioFromSelected(id)'));
+  assert.ok(appSrc.includes('detachAudioFromSelected(targetLayerId = null)'));
+});
+
+test('App launches to Home menu first and Editor requires an explicitly selected or created project', () => {
+  const storageHelper = fs.readFileSync(path.resolve('app/src/main/java/com/example/MediaStorageHelper.kt'), 'utf8');
+  const mainAct = fs.readFileSync(path.resolve('app/src/main/java/com/example/MainActivity.kt'), 'utf8');
+  const editorHtml = fs.readFileSync(path.resolve('app/src/main/assets/www/editor.html'), 'utf8');
+  const appSrc = fs.readFileSync(path.resolve('app/src/main/assets/www/js/app.js'), 'utf8');
+  const homeModSrc = fs.readFileSync(path.resolve('app/src/main/assets/www/js/home/homeModule.js'), 'utf8');
+  const creditsSrc = fs.readFileSync(path.resolve('app/src/main/assets/www/js/home/pages/CreditsPage.js'), 'utf8');
+  const homePageSrc = fs.readFileSync(path.resolve('app/src/main/assets/www/js/home/pages/HomePage.js'), 'utf8');
+  const cardSrc = fs.readFileSync(path.resolve('app/src/main/assets/www/js/home/components/projects/ProjectCard.js'), 'utf8');
+
+  assert.ok(storageHelper.includes('const val BASE_URL = "https://$APP_HOST/index.html"'));
+  assert.ok(mainAct.includes('loadUrl(MediaStorageHelper.BASE_URL)'));
+
+  // Editor entry guards (both early HTML script & app.js init)
+  assert.ok(editorHtml.includes("if (!params.get('projectId') && !params.get('new'))"));
+  assert.ok(editorHtml.includes("window.location.replace('./index.html')"));
+  assert.ok(appSrc.includes("window.location.replace('./index.html')"));
+  assert.ok(!appSrc.includes('deserializeProject(activeProjects[0])'));
+
+  // All transitions from Home/Credits into Editor go via a real projectId
+  assert.ok(!creditsSrc.includes('href="./editor.html"'));
+  assert.ok(!homeModSrc.includes("'./editor.html?importMedia=1'"));
+  assert.ok(!homeModSrc.includes('`./editor.html?aiTool='));
+  assert.ok(homeModSrc.includes("addEventListener('pageshow'"));
+
+  // Home page surfaces Pilih Project prominently before Quick Create and cards have Buka button
+  assert.ok(homePageSrc.indexOf('lkRecentProjectsContainer') < homePageSrc.indexOf('renderQuickCreate()'));
+  assert.ok(cardSrc.includes('class="lk-open-proj-btn"'));
+});
+
+
+

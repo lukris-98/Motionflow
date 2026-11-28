@@ -146,6 +146,7 @@ class MotionFlowApp {
       },
       onSelectLayer: (id, opts) => this.selectLayer(id, opts),
       onToggleMute: (id) => this.toggleMute(id),
+      onDetachAudio: (id) => this.detachAudioFromSelected(id),
       onToggleVisibility: (id) => this.toggleVisibility(id),
       onToggleLock: (id) => this.toggleLock(id),
       onToggleTrackCompact: (id) => this.toggleTrackCompact(id),
@@ -307,10 +308,8 @@ class MotionFlowApp {
     let loadedTarget = null;
     if (reqProjectId) {
       const found = savedProjects.find((p) => p.id === reqProjectId) || await ProjectStorage.getProject(reqProjectId);
-      if (found) loadedTarget = deserializeProject(found);
+      if (found && !found.deletedAt) loadedTarget = deserializeProject(found);
     }
-
-    const activeProjects = savedProjects.filter((p) => !p.deletedAt);
 
     if (reqNewType) {
       const reqName = urlParams.get('name') || (reqNewType === 'image' ? 'New Image Design' : reqNewType === 'canvas' ? 'New Canvas' : 'Untitled Project');
@@ -326,18 +325,17 @@ class MotionFlowApp {
         durationSec: reqDur
       });
       await ProjectStorage.saveProject(this.project);
+      try {
+        window.history?.replaceState(null, '', `./editor.html?projectId=${encodeURIComponent(this.project.id)}`);
+      } catch {}
     } else if (loadedTarget) {
       this.project = loadedTarget;
-    } else if (activeProjects.length > 0) {
-      this.project = deserializeProject(activeProjects[0]);
     } else {
-      // First open: completely empty timeline (zero dummy layers/projects)
-      this.project = createEmptyProject('Untitled Project', {
-        width: 1280,
-        height: 720,
-        fps: 30,
-        durationSec: 10
-      });
+      // Must select or create a project from the Home menu before entering the editor
+      if (typeof window !== 'undefined' && window.location?.replace) {
+        window.location.replace('./index.html');
+      }
+      return;
     }
 
     if (this.project.layers.length > 0) {
@@ -816,6 +814,154 @@ class MotionFlowApp {
     }
   }
 
+  initPreviewTimelineResizer() {
+    const resizer = document.getElementById('previewTimelineResizer');
+    const previewSection = document.querySelector('.mf-preview-section');
+    if (!resizer || !previewSection) return;
+
+    const SPLIT_HEIGHT_KEY = 'mf_preview_split_height';
+    let syncRaf = 0;
+
+    const getPreviewBounds = () => {
+      const toolbarH = document.querySelector('.mf-toolbar')?.offsetHeight || 42;
+      const resizerH = resizer.offsetHeight || 14;
+      const transportH = document.querySelector('.mf-transport-bar')?.offsetHeight || 40;
+      const navH = document.getElementById('mfBottomNav')?.offsetHeight || 52;
+      const minTimelineH = 110;
+      const minPreviewH = 110;
+      const viewportH = window.innerHeight || document.documentElement.clientHeight || 720;
+      const maxPreviewH = Math.max(
+        minPreviewH + 40,
+        viewportH - toolbarH - resizerH - transportH - navH - minTimelineH
+      );
+      return { minPreviewH, maxPreviewH };
+    };
+
+    const scheduleVisualSync = () => {
+      if (syncRaf) return;
+      syncRaf = requestAnimationFrame(() => {
+        syncRaf = 0;
+        this.renderer?.syncCanvasDimensions(this.project);
+        this.renderPreview();
+        this.timelineView?._syncOverlayLineHeights?.();
+        this.timelineView?.redrawRulerOnly?.();
+      });
+    };
+
+    const applyPreviewHeight = (rawPx, persist = false) => {
+      if (this.isPreviewFullview) return;
+      const { minPreviewH, maxPreviewH } = getPreviewBounds();
+      const clamped = Math.round(Math.max(minPreviewH, Math.min(maxPreviewH, rawPx)));
+      previewSection.style.height = `${clamped}px`;
+      if (persist) {
+        try {
+          localStorage.setItem(SPLIT_HEIGHT_KEY, String(clamped));
+        } catch {}
+      }
+      scheduleVisualSync();
+    };
+
+    const resetPreviewHeight = () => {
+      previewSection.style.height = '';
+      try {
+        localStorage.removeItem(SPLIT_HEIGHT_KEY);
+      } catch {}
+      scheduleVisualSync();
+      this.showToast('Preview & timeline height reset');
+    };
+
+    this._clampPreviewSplitHeight = () => {
+      if (this.isPreviewFullview || !previewSection.style.height) return;
+      const current = parseFloat(previewSection.style.height);
+      if (Number.isFinite(current)) {
+        applyPreviewHeight(current, false);
+      }
+    };
+
+    try {
+      const saved = Number(localStorage.getItem(SPLIT_HEIGHT_KEY));
+      if (Number.isFinite(saved) && saved >= 100) {
+        applyPreviewHeight(saved, false);
+      }
+    } catch {}
+
+    let dragging = false;
+    let startY = 0;
+    let startHeight = 0;
+    let moved = false;
+    let activePointerId = null;
+    let lastTapAt = 0;
+
+    const endDrag = (e) => {
+      if (!dragging) return;
+      dragging = false;
+      resizer.classList.remove('is-dragging');
+      document.body.classList.remove('mf-resizing-split');
+      if (activePointerId !== null) {
+        try {
+          resizer.releasePointerCapture(activePointerId);
+        } catch {}
+      }
+      activePointerId = null;
+      if (moved) {
+        const finalHeight = parseFloat(previewSection.style.height) || previewSection.getBoundingClientRect().height;
+        applyPreviewHeight(finalHeight, true);
+      } else if (e?.type === 'pointerup') {
+        const now = Date.now();
+        if (now - lastTapAt < 320) {
+          lastTapAt = 0;
+          resetPreviewHeight();
+        } else {
+          lastTapAt = now;
+        }
+      }
+    };
+
+    resizer.addEventListener('pointerdown', (e) => {
+      if (this.isPreviewFullview) return;
+      if (e.button && e.button !== 0) return;
+      e.preventDefault();
+      dragging = true;
+      moved = false;
+      startY = e.clientY;
+      startHeight = previewSection.getBoundingClientRect().height;
+      activePointerId = e.pointerId;
+      resizer.classList.add('is-dragging');
+      document.body.classList.add('mf-resizing-split');
+      try {
+        resizer.setPointerCapture(e.pointerId);
+      } catch {}
+    });
+
+    resizer.addEventListener('pointermove', (e) => {
+      if (!dragging) return;
+      const dy = e.clientY - startY;
+      if (Math.abs(dy) > 3) moved = true;
+      applyPreviewHeight(startHeight + dy, false);
+    });
+
+    resizer.addEventListener('pointerup', endDrag);
+    resizer.addEventListener('pointercancel', endDrag);
+    resizer.addEventListener('dblclick', () => {
+      if (!this.isPreviewFullview) resetPreviewHeight();
+    });
+
+    resizer.addEventListener('keydown', (e) => {
+      if (this.isPreviewFullview) return;
+      const current = previewSection.getBoundingClientRect().height;
+      if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        applyPreviewHeight(current - 16, true);
+      } else if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        applyPreviewHeight(current + 16, true);
+      } else if (e.key === 'Home' || e.key === 'Enter') {
+        e.preventDefault();
+        resetPreviewHeight();
+      }
+    });
+  }
+
   _syncCameraTimelineItemIfNeeded(autoCreate = false) {
     if (!this.project) return null;
     const camLayer = autoCreate
@@ -943,6 +1089,16 @@ class MotionFlowApp {
     const nextBtn = document.getElementById('btnNextKeyframe');
     if (prevBtn) prevBtn.disabled = KeyframeEngine.getPrevKeyframeFrame(jumpFrames, curFrame) === null;
     if (nextBtn) nextBtn.disabled = KeyframeEngine.getNextKeyframeFrame(jumpFrames, curFrame) === null;
+
+    const detachQuickBtn = document.getElementById('btnDetachAudioQuick');
+    if (detachQuickBtn) {
+      const isVideoSel = Boolean(layer && layer.type === 'video');
+      detachQuickBtn.classList.toggle('d-none', !isVideoSel);
+      detachQuickBtn.classList.toggle('is-detached', Boolean(layer?.audioDetached));
+      detachQuickBtn.title = layer?.audioDetached
+        ? 'Audio sudah dipisahkan (Tap untuk pisah audio lagi)'
+        : 'Pisah Audio dari Video di Timeline';
+    }
   }
 
   renderPreview() {
@@ -2395,8 +2551,10 @@ class MotionFlowApp {
     }
   }
 
-  detachAudioFromSelected() {
-    const layer = this.getSelectedLayer();
+  detachAudioFromSelected(targetLayerId = null) {
+    const layer = targetLayerId
+      ? this.project.layers.find((l) => l.id === targetLayerId)
+      : this.getSelectedLayer();
     if (!layer || layer.type !== 'video') return;
     let audioLayer = null;
     this.mutateProject(() => {
@@ -3316,6 +3474,7 @@ class MotionFlowApp {
         commonDelRight,
         ['bi-speedometer2 text-info', 'Speed', () => this.openSheet('sheetEdit')],
         ['bi-volume-up', 'Volume/FX', () => this.openSheet('sheetEdit')],
+        ['bi-music-note-beamed text-warning', 'Pisah Audio', () => this.detachAudioFromSelected()],
         clipItemAnim,
         clipTransition,
         trackToggleBtn,
@@ -3334,7 +3493,6 @@ class MotionFlowApp {
         commonTransform,
         commonCopyStyle,
         ...(commonPasteStyle ? [commonPasteStyle] : []),
-        ['bi-music-note text-warning', 'Pisah Audio', () => this.detachAudioFromSelected()],
         ['bi-arrow-left-right', 'Replace', () => this.replaceSelectedClip()],
         ['bi-arrow-counterclockwise', 'Reverse', () => {
           this.mutateProject(() => { layer.reversed = !layer.reversed; });
@@ -4035,6 +4193,49 @@ class MotionFlowApp {
         ? `Cache dibersihkan · ${removedCount} file tak terpakai dihapus${freedMsg}`
         : 'Cache RAM & thumbnail dibersihkan'
     );
+  }
+
+  refreshSettingsCacheStats() {
+    const lbl = document.getElementById('lblSettingsCacheStats');
+    if (!lbl) return;
+    let cacheBytes = 0;
+    if (window.AndroidBridge?.getStorageStatsJson) {
+      try {
+        const stats = JSON.parse(window.AndroidBridge.getStorageStatsJson() || '{}');
+        cacheBytes = Number(stats.cacheBytes ?? stats.exportBytes ?? 0);
+      } catch {}
+    }
+    const filmstripCount = this.timelineView?.filmstripCache?.size || 0;
+    const filterCount = this.panels?.filterThumbCache?.size || 0;
+    const memHints = filmstripCount + filterCount;
+    if (cacheBytes > 0) {
+      lbl.textContent = `Temp cache & expired exports: ${formatBytes(cacheBytes)} · Saved media stays safe`;
+    } else if (memHints > 0) {
+      lbl.textContent = `${memHints} cached preview buffers in RAM · Saved project media stays safe`;
+    } else {
+      lbl.textContent = 'Temp previews, RAM buffers & expired exports · Saved media stays safe';
+    }
+  }
+
+  async clearTemporaryCacheSafely(triggerBtn = null) {
+    if (triggerBtn) triggerBtn.disabled = true;
+    try {
+      this.pruneAllUnusedCaches();
+      this.renderer?.handleMemoryPressure?.(100, this.project);
+      this.panels?.filterThumbCache?.clear?.();
+      this.timelineView?.filmstripCache?.clear?.();
+      const res = await ProjectStorage.clearSafeTempCache(this.project);
+      await this.refreshMediaStorageStats();
+      this.refreshSettingsCacheStats();
+      this.renderPreview();
+      const freedMsg = res.freedBytes > 0 ? ` (${formatBytes(res.freedBytes)} freed)` : '';
+      const countMsg = res.deletedCount > 0 ? ` · ${res.deletedCount} temp files removed` : '';
+      this.showToast(`Temporary cache cleared safely${countMsg}${freedMsg}`);
+    } catch {
+      this.showToast('Temporary RAM cache cleared');
+    } finally {
+      if (triggerBtn) triggerBtn.disabled = false;
+    }
   }
 
   async deleteMediaFromLibrary(mediaItem) {
@@ -4812,8 +5013,14 @@ class MotionFlowApp {
         } else {
           this.showToast(res?.error || 'Gagal menyimpan file ke lokasi pilihan');
         }
-      }
+      },
+      onMemoryTrim: (level) => this.handleMemoryTrim(level)
     };
+  }
+
+  handleMemoryTrim(level = 40) {
+    this.renderer?.handleMemoryPressure?.(level, this.project, this.currentFrame);
+    this.audioEngine?.pruneUnusedCaches?.(this.project);
   }
 
   updateExportLocationUI() {
@@ -4835,6 +5042,23 @@ class MotionFlowApp {
   bindUIEvents() {
     document.addEventListener('hidden.bs.offcanvas', () => {
       this.stopTemplateLivePreview();
+    });
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) {
+        this.pause();
+        this.stopTemplateLivePreview({ skipRender: true });
+        this.handleMemoryTrim(40);
+      }
+    });
+    window.addEventListener('pagehide', () => {
+      this.pause();
+      this.stopTemplateLivePreview({ skipRender: true });
+      if (this._mediaRafId) {
+        cancelAnimationFrame(this._mediaRafId);
+        this._mediaRafId = null;
+      }
+      clearTimeout(this.autosaveTimer);
+      this.handleMemoryTrim(60);
     });
 
     const btnGroupChecked = document.getElementById('btnGroupChecked');
@@ -4918,8 +5142,13 @@ class MotionFlowApp {
       const curTheme = this.project.settings?.themeMode || this._getStoredThemeMode();
       pendingThemeBeforeSettings = curTheme;
       this._syncThemeButtonsUI(curTheme);
+      this.refreshSettingsCacheStats();
       bootstrap.Modal.getOrCreateInstance(modalSettingsEl).show();
     };
+
+    document.getElementById('btnSettingsClearCache')?.addEventListener('click', (e) => {
+      this.clearTemporaryCacheSafely(e.currentTarget);
+    });
 
     document.getElementById('btnApplySettings').onclick = () => {
       const [w, h] = document.getElementById('selProjectRes').value.split('x').map(Number);
@@ -4989,6 +5218,7 @@ class MotionFlowApp {
     document.getElementById('btnPlayPause').onclick = () => this.togglePlay();
     document.getElementById('btnStepForward').onclick = () => { this.pause(); this.seekToFrame(this.currentFrame + 1); };
     document.getElementById('btnSplitClip').onclick = () => this.splitSelectedAtPlayhead();
+    document.getElementById('btnDetachAudioQuick')?.addEventListener('click', () => this.detachAudioFromSelected());
     document.getElementById('btnToggleSnap').onclick = () => {
       this.project.settings.snapToTimeline = !this.project.settings.snapToTimeline;
       this.onTimelineMutated();
@@ -5100,7 +5330,9 @@ class MotionFlowApp {
     document.getElementById('btnFullviewPlayPause')?.addEventListener('click', () => {
       this.togglePlay();
     });
+    this.initPreviewTimelineResizer();
     window.addEventListener('resize', () => {
+      this._clampPreviewSplitHeight?.();
       this.timelineView.redrawRulerOnly();
       this.renderer?.syncCanvasDimensions(this.project);
       this.renderPreview();
@@ -5356,7 +5588,7 @@ class MotionFlowApp {
     // Doodle Draw Modal bindings
     const drawCanvas = document.getElementById('drawPadCanvas');
     if (drawCanvas) {
-      const dctx = drawCanvas.getContext('2d');
+      const dctx = drawCanvas.getContext('2d', { willReadFrequently: true });
       let drawing = false;
       let lastPt = null;
       const toCanvasPt = (ev) => {

@@ -318,6 +318,130 @@ export const ProjectStorage = {
       req.onsuccess = () => resolve(req.result || []);
       req.onerror = () => reject(req.error);
     });
+  },
+
+  async collectKeepFileNames(extraProject = null) {
+    if (typeof indexedDB === 'undefined') {
+      return null;
+    }
+    const keepFiles = new Set();
+    const referencedMediaIds = new Set();
+    const scanProject = (proj) => {
+      if (!proj || typeof proj !== 'object') return;
+      if (Array.isArray(proj.layers)) {
+        for (const l of proj.layers) {
+          if (l?.mediaId) referencedMediaIds.add(l.mediaId);
+          if (l?.fileName) keepFiles.add(String(l.fileName));
+        }
+      }
+      if (Array.isArray(proj.mediaRefs)) {
+        for (const r of proj.mediaRefs) {
+          if (typeof r === 'string') referencedMediaIds.add(r);
+          else if (r?.id) referencedMediaIds.add(r.id);
+          if (r?.fileName) keepFiles.add(String(r.fileName));
+        }
+      }
+    };
+
+    try {
+      const projects = await this.listProjects();
+      for (const p of projects) scanProject(p);
+    } catch {
+      return null;
+    }
+    if (extraProject) scanProject(extraProject);
+
+    let mediaItems = [];
+    try {
+      mediaItems = await this.listMediaItems();
+    } catch {
+      return null;
+    }
+
+    const tempUnusedItems = [];
+    const recentGraceMs = 5 * 60 * 1000;
+    const now = Date.now();
+    for (const item of mediaItems) {
+      if (!item) continue;
+      const isReferenced = referencedMediaIds.has(item.id);
+      const isExplicitTemp = Boolean(item.isTemp || item.temporary);
+      const isRecent = (now - (Number(item.addedAt) || 0)) < recentGraceMs;
+      if (isExplicitTemp && !isReferenced && !isRecent) {
+        tempUnusedItems.push(item);
+      } else if (item.fileName) {
+        keepFiles.add(String(item.fileName));
+      }
+    }
+
+    return {
+      keepFiles: Array.from(keepFiles),
+      tempUnusedItems,
+      referencedMediaIds
+    };
+  },
+
+  async clearSafeTempCache(extraProject = null) {
+    let deletedCount = 0;
+    let freedBytes = 0;
+    let scan = null;
+    try {
+      scan = await this.collectKeepFileNames(extraProject);
+    } catch {
+      scan = null;
+    }
+
+    if (scan && Array.isArray(scan.tempUnusedItems) && scan.tempUnusedItems.length > 0) {
+      for (const item of scan.tempUnusedItems) {
+        try {
+          await this.deleteMediaItem(item.id);
+          deletedCount++;
+          freedBytes += Number(item.sizeBytes) || 0;
+          if (typeof item.url === 'string' && item.url.startsWith('blob:')) {
+            try { URL.revokeObjectURL(item.url); } catch {}
+          }
+          if (typeof item.thumbUrl === 'string' && item.thumbUrl.startsWith('blob:') && item.thumbUrl !== item.url) {
+            try { URL.revokeObjectURL(item.thumbUrl); } catch {}
+          }
+        } catch {}
+      }
+    }
+
+    // Clear only explicitly temporary localStorage cache keys (never projects, settings, or profile)
+    if (typeof localStorage !== 'undefined') {
+      try {
+        const allKeys = typeof localStorage.key === 'function' && Number.isFinite(localStorage.length)
+          ? Array.from({ length: localStorage.length }, (_, i) => localStorage.key(i))
+          : Object.keys(localStorage);
+        for (const k of allKeys) {
+          if (k && (k.startsWith('lukris_tmp_') || k.startsWith('mf_tmp_') || k.startsWith('lukris_preview_cache_'))) {
+            freedBytes += (localStorage.getItem(k) || '').length * 2;
+            localStorage.removeItem(k);
+            deletedCount++;
+          }
+        }
+      } catch {}
+    }
+
+    const nativeArg = scan ? JSON.stringify(scan.keepFiles) : '__SKIP_MEDIA__';
+    if (typeof window !== 'undefined' && window.AndroidBridge?.clearTempCache) {
+      try {
+        const res = JSON.parse(window.AndroidBridge.clearTempCache(nativeArg) || '{}');
+        deletedCount += Number(res.deletedCount) || 0;
+        freedBytes += Number(res.freedBytes) || 0;
+      } catch {}
+    } else if (scan && typeof window !== 'undefined' && window.AndroidBridge?.cleanupUnusedNativeFiles) {
+      try {
+        const res = JSON.parse(window.AndroidBridge.cleanupUnusedNativeFiles(JSON.stringify(scan.keepFiles)) || '{}');
+        deletedCount += Number(res.deletedCount) || 0;
+        freedBytes += Number(res.freedBytes) || 0;
+      } catch {}
+    }
+
+    return {
+      deletedCount,
+      freedBytes,
+      protectedCount: scan ? scan.keepFiles.length : null
+    };
   }
 };
 

@@ -64,6 +64,14 @@ export class LukrisHomeApp {
 
     this.refreshChrome();
     await this.refreshCurrentPage();
+
+    window.addEventListener('pageshow', async (evt) => {
+      if (evt.persisted) {
+        await this.projectManager.init();
+        this.refreshChrome();
+        await this.refreshCurrentPage();
+      }
+    });
   }
 
   refreshChrome() {
@@ -98,7 +106,8 @@ export class LukrisHomeApp {
     const inp = document.getElementById('inpHeaderSearch');
     const clearBtn = document.getElementById('btnClearHeaderSearch');
     const kbdEl = document.getElementById('kbdHeaderSearch');
-    if (inp) {
+    if (inp && !inp.dataset.lkSearchBound) {
+      inp.dataset.lkSearchBound = '1';
       const onDebouncedSearch = debounce((val) => {
         this.state.searchQuery = val;
         this.refreshCurrentPage();
@@ -110,26 +119,6 @@ export class LukrisHomeApp {
         onDebouncedSearch(val);
       });
     }
-    if (clearBtn) {
-      clearBtn.onclick = () => {
-        this.state.searchQuery = '';
-        if (inp) inp.value = '';
-        this.refreshChrome();
-        this.refreshCurrentPage();
-      };
-    }
-    document.getElementById('btnMarkAllNotifsRead')?.addEventListener('click', (e) => {
-      e.stopPropagation();
-      this.core.markAllNotificationsRead();
-      this.refreshChrome();
-      this.core.showToast('All notifications marked read', 'info');
-    });
-    document.getElementById('btnMobileMenu')?.addEventListener('click', () => {
-      const drawer = document.getElementById('lkMobileDrawer');
-      if (drawer && window.bootstrap?.Offcanvas) {
-        window.bootstrap.Offcanvas.getOrCreateInstance(drawer).show();
-      }
-    });
   }
 
   async navigateTo(route) {
@@ -260,6 +249,31 @@ export class LukrisHomeApp {
         return;
       }
 
+      if (e.target.closest('#btnClearHeaderSearch')) {
+        this.state.searchQuery = '';
+        const inp = document.getElementById('inpHeaderSearch');
+        if (inp) inp.value = '';
+        this.refreshChrome();
+        await this.refreshCurrentPage();
+        return;
+      }
+
+      if (e.target.closest('#btnMarkAllNotifsRead')) {
+        e.stopPropagation();
+        this.core.markAllNotificationsRead();
+        this.refreshChrome();
+        this.core.showToast('All notifications marked read', 'info');
+        return;
+      }
+
+      if (e.target.closest('#btnMobileMenu')) {
+        const drawer = document.getElementById('lkMobileDrawer');
+        if (drawer && window.bootstrap?.Offcanvas) {
+          window.bootstrap.Offcanvas.getOrCreateInstance(drawer).show();
+        }
+        return;
+      }
+
       if (e.target.closest('#btnToggleSidebarCollapse')) {
         const cur = Boolean(this.core.settings.appearance.compactSidebar);
         this.core.updateSettings({ appearance: { compactSidebar: !cur } });
@@ -330,8 +344,18 @@ export class LukrisHomeApp {
       }));
       await this.projectManager.saveImportedMediaItems(items);
       e.target.value = '';
-      this.core.showToast(`Imported ${items.length} media file(s) — launching editor`, 'success');
-      window.location.href = './editor.html?importMedia=1';
+      const firstItem = items[0];
+      const baseName = String(firstItem?.name || 'Imported Media').replace(/\.[^.]+$/, '').slice(0, 40) || 'Imported Project';
+      const created = await this.projectManager.createProject({
+        name: baseName,
+        projectType: firstItem?.type === 'image' ? 'image' : 'video',
+        width: firstItem?.width || 1920,
+        height: firstItem?.height || 1080,
+        fps: this.core.settings.general.defaultFps || 30,
+        durationSec: Math.max(5, Math.round((firstItem?.durationMs || 15000) / 1000))
+      });
+      this.core.showToast(`Imported ${items.length} media file(s) — opening project`, 'success');
+      window.location.href = `./editor.html?projectId=${encodeURIComponent(created.id)}&importMedia=1`;
     });
   }
 
@@ -533,8 +557,17 @@ export class LukrisHomeApp {
     window.location.href = `./editor.html?projectId=${encodeURIComponent(projectId)}`;
   }
 
-  launchEditorWithAiTool(editorTool) {
-    window.location.href = `./editor.html?aiTool=${encodeURIComponent(editorTool || 'effects')}`;
+  async launchEditorWithAiTool(editorTool) {
+    const toolMeta = this.assetManager.getAiToolsSummary().find((t) => t.editorTool === editorTool);
+    const created = await this.projectManager.createProject({
+      name: toolMeta?.title || 'AI Studio Project',
+      projectType: 'video',
+      width: 1920,
+      height: 1080,
+      fps: this.core.settings.general.defaultFps || 30,
+      durationSec: 15
+    });
+    window.location.href = `./editor.html?projectId=${encodeURIComponent(created.id)}&aiTool=${encodeURIComponent(editorTool || 'effects')}`;
   }
 
   triggerMediaImport() {
@@ -574,8 +607,18 @@ export class LukrisHomeApp {
       onMediaImported: async (items) => {
         if (!Array.isArray(items) || items.length === 0) return;
         await this.projectManager.saveImportedMediaItems(items);
+        const firstItem = items[0];
+        const baseName = String(firstItem?.name || 'Imported Media').replace(/\.[^.]+$/, '').slice(0, 40) || 'Imported Project';
+        const created = await this.projectManager.createProject({
+          name: baseName,
+          projectType: firstItem?.type === 'image' ? 'image' : 'video',
+          width: firstItem?.width || 1920,
+          height: firstItem?.height || 1080,
+          fps: this.core.settings.general.defaultFps || 30,
+          durationSec: Math.max(5, Math.round((firstItem?.durationMs || 15000) / 1000))
+        });
         this.core.showToast(`Imported ${items.length} media file(s)`, 'success');
-        window.location.href = './editor.html?importMedia=1';
+        window.location.href = `./editor.html?projectId=${encodeURIComponent(created.id)}&importMedia=1`;
       },
       onTtsState: (state, msg) => {
         if (state === 'done') this.core.showToast(msg || 'Voiceover saved to Media Library', 'success');

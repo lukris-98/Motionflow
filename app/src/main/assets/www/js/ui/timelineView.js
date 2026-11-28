@@ -1079,6 +1079,7 @@ export class TimelineView {
       if (!e.ctrlKey && !e.metaKey) markManualPan(1500);
     }, { passive: true });
 
+    this._scrollRafId = null;
     this.scrollEl.addEventListener('scroll', () => {
       this._cancelHoverTooltip();
       this.headersList.scrollTop = this.scrollEl.scrollTop;
@@ -1086,16 +1087,21 @@ export class TimelineView {
       if (now >= (this._suppressScrollSeekUntil || 0) && !this._isPinching && !this._isClipGestureActive) {
         this._manualPanHoldUntil = Math.max(this._manualPanHoldUntil || 0, now + 900);
       }
-      const curScrollLeft = Math.max(0, this.scrollEl.scrollLeft || 0);
-      this._ensureRulerCoversViewport();
-      if (Math.abs(curScrollLeft - this._lastClipSliceScrollLeft) >= 12) {
-        this._lastClipSliceScrollLeft = curScrollLeft;
-        this.redrawVisibleClipCanvases();
-      }
-    });
+      if (this._scrollRafId) return;
+      this._scrollRafId = requestAnimationFrame(() => {
+        this._scrollRafId = null;
+        if (!this.scrollEl) return;
+        const curScrollLeft = Math.max(0, this.scrollEl.scrollLeft || 0);
+        this._ensureRulerCoversViewport();
+        if (Math.abs(curScrollLeft - this._lastClipSliceScrollLeft) >= 12) {
+          this._lastClipSliceScrollLeft = curScrollLeft;
+          this.redrawVisibleClipCanvases();
+        }
+      });
+    }, { passive: true });
     this.headersList.addEventListener('scroll', () => {
       this.scrollEl.scrollTop = this.headersList.scrollTop;
-    });
+    }, { passive: true });
     if (typeof ResizeObserver !== 'undefined' && this.scrollEl) {
       let lastObservedW = this.scrollEl.clientWidth || 0;
       this._rulerResizeObs = new ResizeObserver(() => {
@@ -1750,6 +1756,25 @@ export class TimelineView {
     label.textContent = layer.name || 'Clip';
     contentRow.appendChild(label);
 
+    if (isSelected && layer.type === 'video' && widthPx >= 64 && !layer.audioDetached) {
+      const detachBtn = document.createElement('button');
+      detachBtn.type = 'button';
+      detachBtn.className = 'mf-clip-detach-btn';
+      detachBtn.dataset.act = 'detach-audio';
+      detachBtn.title = 'Pisah Audio ke Track Audio';
+      detachBtn.setAttribute('aria-label', 'Pisah Audio');
+      detachBtn.innerHTML = `<i class="bi bi-music-note-beamed"></i>${widthPx >= 132 ? '<span>Pisah Audio</span>' : ''}`;
+      const stopEvt = (ev) => ev.stopPropagation();
+      detachBtn.addEventListener('pointerdown', stopEvt);
+      detachBtn.addEventListener('mousedown', stopEvt);
+      detachBtn.addEventListener('touchstart', stopEvt, { passive: true });
+      detachBtn.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        this.cb.onDetachAudio?.(layer.id);
+      });
+      contentRow.appendChild(detachBtn);
+    }
+
     const badges = getClipStatusBadges(layer);
     if (badges.length > 0) {
       const badgeStrip = document.createElement('div');
@@ -2093,6 +2118,18 @@ export class TimelineView {
               onClick: () => this.cb.onToggleMute?.(liveLayer.id)
             });
           }
+          if (liveLayer.type === 'video') {
+            actions.push({
+              icon: 'bi-music-note-beamed',
+              label: 'Pisah Audio',
+              stateClass: liveLayer.audioDetached ? 'is-active' : '',
+              title: 'Pisah Audio Video ke Track Bawah',
+              onClick: () => {
+                this.closeTrackWheelMenu();
+                this.cb.onDetachAudio?.(liveLayer.id);
+              }
+            });
+          }
           actions.push(
             {
               icon: liveLayer.visible ? 'bi-eye-fill' : 'bi-eye-slash',
@@ -2322,6 +2359,16 @@ export class TimelineView {
               title: liveMuted ? 'Aktifkan Audio Main Track' : 'Bisukan Audio Main Track',
               onClick: () => this.cb.onToggleMainTrackProp?.('muted')
             },
+            ...(liveActive?.type === 'video' ? [{
+              icon: 'bi-music-note-beamed',
+              label: 'Pisah Audio',
+              stateClass: liveActive.audioDetached ? 'is-active' : '',
+              title: 'Pisah Audio dari Video Aktif ke Track Audio',
+              onClick: () => {
+                this.closeTrackWheelMenu();
+                this.cb.onDetachAudio?.(liveActive.id);
+              }
+            }] : []),
             {
               icon: !liveHidden ? 'bi-eye-fill' : 'bi-eye-slash',
               label: !liveHidden ? 'Tampil' : 'Sembunyi',

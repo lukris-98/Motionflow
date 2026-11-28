@@ -8,14 +8,17 @@ export function renderHeroSection() {
             <span class="lk-eyebrow-dot"></span>
             <span>LUKRIS CREATIVE SUITE</span>
           </div>
-          <h2 class="lk-hero-title mb-2">Bring Your Ideas to Life.</h2>
-          <p class="lk-hero-subtitle mb-4">Create something extraordinary with Lukris.</p>
+          <h2 class="lk-hero-title mb-2">Pilih atau Buat Project</h2>
+          <p class="lk-hero-subtitle mb-4">Pilih project yang ingin dibuka atau buat project baru untuk masuk ke editor.</p>
           <div class="d-flex flex-wrap align-items-center gap-2">
             <button type="button" id="btnHeroNewProject" class="btn lk-btn-primary" data-action="open-new-project">
-              <i class="bi bi-plus-lg me-2"></i>New Project
+              <i class="bi bi-plus-lg me-2"></i>Buat Project Baru
+            </button>
+            <button type="button" id="btnHeroBrowseProjects" class="btn lk-btn-secondary" data-nav="projects">
+              <i class="bi bi-folder2-open me-2"></i>Semua Project
             </button>
             <button type="button" id="btnHeroExploreTemplates" class="btn lk-btn-secondary" data-nav="templates">
-              <i class="bi bi-grid-1x2 me-2"></i>Explore Templates
+              <i class="bi bi-grid-1x2 me-2"></i>Templates
             </button>
           </div>
         </div>

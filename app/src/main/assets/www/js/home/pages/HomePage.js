@@ -28,11 +28,10 @@ export function renderHomePage(container, state) {
   container.innerHTML = `
     <div class="lk-page-stack">
       ${renderHeroSection()}
-      ${renderQuickCreate()}
 
       <section class="lk-section" aria-label="Recent Projects">
         ${renderProjectControls({
-          title: 'Recent Projects',
+          title: 'Pilih Project',
           totalCount: totalRecentCount,
           viewMode,
           sortBy,
@@ -42,6 +41,8 @@ export function renderHomePage(container, state) {
         })}
         <div id="lkRecentProjectsContainer"></div>
       </section>
+
+      ${renderQuickCreate()}
 
       ${renderLibraryGrid(libraryCategories, {
         activeCategory: activeLibraryCategory,

@@ -2,6 +2,7 @@ package com.example
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.content.ComponentCallbacks2
 import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
@@ -11,12 +12,15 @@ import android.media.AudioRecord
 import android.media.MediaMetadataRetriever
 import android.media.MediaRecorder
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.provider.DocumentsContract
 import android.provider.OpenableColumns
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
+import android.view.View
 import android.view.ViewGroup
+import android.view.WindowManager
 import android.webkit.ConsoleMessage
 import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
@@ -228,6 +232,7 @@ class MainActivity : ComponentActivity() {
             navigationBarStyle = SystemBarStyle.dark(Color.TRANSPARENT)
         )
         super.onCreate(savedInstanceState)
+        window.addFlags(WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED)
 
         storageHelper = MediaStorageHelper(applicationContext)
         mp4Exporter = NativeMp4Exporter(applicationContext, storageHelper.exportsDir)
@@ -265,10 +270,15 @@ class MainActivity : ComponentActivity() {
                                 ViewGroup.LayoutParams.MATCH_PARENT
                             )
                             setBackgroundColor(Color.parseColor("#0B0E14"))
+                            setLayerType(View.LAYER_TYPE_HARDWARE, null)
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                                setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, true)
+                            }
                             settings.apply {
                                 javaScriptEnabled = true
                                 domStorageEnabled = true
                                 databaseEnabled = true
+                                cacheMode = WebSettings.LOAD_DEFAULT
                                 mediaPlaybackRequiresUserGesture = false
                                 allowFileAccess = false
                                 allowContentAccess = false
@@ -533,13 +543,30 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        if (level >= ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN) {
+            evalJs("window.__mfNative && window.__mfNative.onMemoryTrim && window.__mfNative.onMemoryTrim($level);")
+        }
+        if (level >= ComponentCallbacks2.TRIM_MEMORY_MODERATE) {
+            webView?.clearCache(false)
+        }
+    }
+
     override fun onDestroy() {
         isRecordingVoiceover.set(false)
         voiceoverJob?.cancel()
         try { textToSpeech?.stop(); textToSpeech?.shutdown() } catch (_: Exception) {}
         textToSpeech = null
         ioScope.cancel()
-        webView?.destroy()
+        webView?.let { wv ->
+            (wv.parent as? ViewGroup)?.removeView(wv)
+            wv.stopLoading()
+            wv.clearHistory()
+            wv.removeJavascriptInterface("AndroidBridge")
+            wv.removeAllViews()
+            wv.destroy()
+        }
         webView = null
         super.onDestroy()
     }
@@ -609,6 +636,30 @@ class MainActivity : ComponentActivity() {
                 storageHelper.cleanupUnusedFiles(keepSet).toString()
             } catch (_: Exception) {
                 "{\"deletedCount\":0,\"freedBytes\":0}"
+            }
+        }
+
+        @JavascriptInterface
+        fun clearTempCache(usedFileNamesJson: String): String {
+            runOnUiThread {
+                try {
+                    webView?.clearCache(true)
+                } catch (_: Exception) {}
+            }
+            return try {
+                if (usedFileNamesJson == "__SKIP_MEDIA__") {
+                    storageHelper.clearTempCache(null, cleanOrphanMedia = false).toString()
+                } else {
+                    val arr = JSONArray(usedFileNamesJson)
+                    val keepSet = HashSet<String>(arr.length())
+                    for (i in 0 until arr.length()) {
+                        val name = arr.optString(i, "").trim()
+                        if (name.isNotEmpty()) keepSet.add(File(name).name)
+                    }
+                    storageHelper.clearTempCache(keepSet, cleanOrphanMedia = true).toString()
+                }
+            } catch (_: Exception) {
+                storageHelper.clearTempCache(null, cleanOrphanMedia = false).toString()
             }
         }
 

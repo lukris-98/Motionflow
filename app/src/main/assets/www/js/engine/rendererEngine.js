@@ -277,11 +277,32 @@ export class RendererEngine {
     }
   }
 
+  handleMemoryPressure(level = 40, project = null, frame = 0) {
+    if (project) {
+      this.pruneUnusedCaches(project);
+    }
+    this.videoLastFrameCache.clear();
+    if (level >= 60) {
+      this.rasterCache.clear();
+      this.previewImageCache.clear();
+      this.maxVideoDecoders = 1;
+    } else if (this.previewImageCache.size > 16) {
+      const drop = this.previewImageCache.size - 16;
+      let i = 0;
+      for (const k of this.previewImageCache.keys()) {
+        if (i++ >= drop) break;
+        this.previewImageCache.delete(k);
+      }
+    }
+    this._enforceVideoDecoderBudget(project, frame);
+  }
+
   createWebGLCompositor(canvas, antialias = true) {
     const gl = canvas.getContext('webgl', {
       alpha: false,
       preserveDrawingBuffer: true,
       antialias: Boolean(antialias),
+      desynchronized: !antialias,
       powerPreference: 'default'
     });
     if (!gl) return null;

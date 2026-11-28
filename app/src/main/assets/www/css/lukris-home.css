@@ -579,7 +579,7 @@ html.lk-theme-light .lk-hero-card {
   color: var(--lk-muted);
   font-size: 0.78rem;
   font-weight: 600;
-  transition: all 0.15s ease;
+  transition: background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease;
 }
 
 .lk-chip-btn:hover {
@@ -639,6 +639,9 @@ html.lk-theme-light .lk-hero-card {
   background: var(--lk-card);
   border: 1px solid var(--lk-border);
   overflow: hidden;
+  contain: layout style paint;
+  content-visibility: auto;
+  contain-intrinsic-size: 230px;
   transition: transform 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease;
 }
 
@@ -690,9 +693,8 @@ html.lk-theme-light .lk-hero-card {
   font-weight: 700;
   padding: 2px 7px;
   border-radius: 6px;
-  background: rgba(9, 11, 16, 0.78);
+  background: rgba(9, 11, 16, 0.88);
   color: #f8fafc;
-  backdrop-filter: blur(6px);
 }
 
 .lk-thumb-badge-type { left: 8px; }
@@ -754,6 +756,27 @@ html.lk-theme-light .lk-hero-card {
   background: var(--lk-surface-2);
   color: var(--lk-text);
   border-color: var(--lk-border);
+}
+
+.lk-open-proj-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  height: 30px;
+  padding: 0 9px;
+  border-radius: 8px;
+  border: 1px solid rgba(0, 212, 229, 0.38);
+  background: rgba(0, 212, 229, 0.14);
+  color: var(--lk-accent, #00d4e5);
+  font-size: 0.74rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease, transform 0.12s ease;
+}
+
+.lk-open-proj-btn:hover {
+  background: rgba(0, 212, 229, 0.24);
+  border-color: rgba(0, 212, 229, 0.65);
 }
 
 .lk-projects-list-stack {

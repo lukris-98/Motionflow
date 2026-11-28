@@ -12,6 +12,7 @@ import android.webkit.MimeTypeMap
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import org.json.JSONObject
+import java.io.BufferedInputStream
 import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.FileInputStream
@@ -223,6 +224,43 @@ class MediaStorageHelper(private val context: Context) {
         File(mediaDir, "thumb_${id}.jpg").delete()
     }
 
+    private fun dirSize(dir: File?): Long {
+        if (dir == null || !dir.exists()) return 0L
+        var total = 0L
+        val children = dir.listFiles() ?: return 0L
+        for (f in children) {
+            total += if (f.isDirectory) dirSize(f) else f.length()
+        }
+        return total
+    }
+
+    private fun deleteDirContents(dir: File?, skipRootNames: Set<String> = emptySet()): Pair<Int, Long> {
+        if (dir == null || !dir.exists() || !dir.isDirectory) return 0 to 0L
+        var count = 0
+        var bytes = 0L
+        val children = dir.listFiles() ?: return 0 to 0L
+        for (f in children) {
+            if (skipRootNames.contains(f.name)) continue
+            if (f.isDirectory) {
+                val (c, b) = deleteDirContents(f)
+                count += c
+                bytes += b
+                try {
+                    if (f.listFiles()?.isEmpty() == true) f.delete()
+                } catch (_: Exception) {}
+            } else {
+                val len = f.length()
+                try {
+                    if (f.delete()) {
+                        count++
+                        bytes += len
+                    }
+                } catch (_: Exception) {}
+            }
+        }
+        return count to bytes
+    }
+
     fun getStorageStatsJson(): JSONObject {
         var mediaCount = 0
         var mediaBytes = 0L
@@ -240,12 +278,50 @@ class MediaStorageHelper(private val context: Context) {
                 exportBytes += f.length()
             }
         }
+        val appCacheBytes = dirSize(context.cacheDir) + dirSize(context.codeCacheDir)
         return JSONObject().apply {
             put("mediaCount", mediaCount)
             put("mediaBytes", mediaBytes)
             put("exportCount", exportCount)
             put("exportBytes", exportBytes)
-            put("totalBytes", mediaBytes + exportBytes)
+            put("appCacheBytes", appCacheBytes)
+            put("cacheBytes", exportBytes + appCacheBytes)
+            put("totalBytes", mediaBytes + exportBytes + appCacheBytes)
+        }
+    }
+
+    fun clearTempCache(usedFileNames: Set<String>?, cleanOrphanMedia: Boolean): JSONObject {
+        var deletedCount = 0
+        var freedBytes = 0L
+
+        val (cacheDel, cacheBytes) = deleteDirContents(context.cacheDir, setOf("WebView"))
+        deletedCount += cacheDel
+        freedBytes += cacheBytes
+
+        val (codeDel, codeBytes) = deleteDirContents(context.codeCacheDir)
+        deletedCount += codeDel
+        freedBytes += codeBytes
+
+        val now = System.currentTimeMillis()
+        exportsDir.listFiles()?.forEach { f ->
+            if (f.isFile && (now - f.lastModified() > 15_000L)) {
+                val len = f.length()
+                if (f.delete()) {
+                    deletedCount++
+                    freedBytes += len
+                }
+            }
+        }
+
+        if (cleanOrphanMedia && usedFileNames != null) {
+            val orphanRes = cleanupUnusedFiles(usedFileNames)
+            deletedCount += orphanRes.optInt("deletedCount", 0)
+            freedBytes += orphanRes.optLong("freedBytes", 0L)
+        }
+
+        return JSONObject().apply {
+            put("deletedCount", deletedCount)
+            put("freedBytes", freedBytes)
         }
     }
 
@@ -370,11 +446,13 @@ class MediaStorageHelper(private val context: Context) {
 
         val assetPath = if (path.isEmpty()) "www/index.html" else "www/$path"
         return try {
-            val stream = context.assets.open(assetPath)
+            val stream = BufferedInputStream(context.assets.open(assetPath), 16 * 1024)
             val mime = guessMimeType(assetPath)
+            val isStaticImmutable = !assetPath.endsWith(".html", ignoreCase = true)
+            val cacheHeader = if (isStaticImmutable) "public, max-age=86400" else "no-cache"
             val headers = mapOf(
                 "Access-Control-Allow-Origin" to "*",
-                "Cache-Control" to "no-cache"
+                "Cache-Control" to cacheHeader
             )
             WebResourceResponse(mime, "UTF-8", 200, "OK", headers, stream)
         } catch (_: Exception) {
@@ -435,7 +513,7 @@ class MediaStorageHelper(private val context: Context) {
             "Cache-Control" to cacheControl,
             "Access-Control-Allow-Origin" to "*"
         )
-        return WebResourceResponse(mime, null, 200, "OK", headers, FileInputStream(file))
+        return WebResourceResponse(mime, null, 200, "OK", headers, BufferedInputStream(FileInputStream(file), 32 * 1024))
     }
 
     private fun notFoundResponse(): WebResourceResponse {

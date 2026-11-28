@@ -1,4 +1,5 @@
 import { escapeHtml, formatBytesShort } from '../../coreEngine.js';
+import { ProjectStorage } from '../../../storage/projectStorage.js';
 
 function showModal(id) {
   const el = document.getElementById(id);
@@ -180,6 +181,15 @@ export class HomeDialogs {
             </select>
           </div>
         </div>
+        <div class="lk-setting-row mt-3">
+          <div>
+            <div class="small fw-semibold">Temporary Project Cache</div>
+            <div class="lk-muted-xs">Safely remove temp previews &amp; expired exports while keeping saved project media</div>
+          </div>
+          <button type="button" id="btnGeneralClearCache" class="btn btn-sm lk-btn-secondary">
+            <i class="bi bi-stars me-1 text-info"></i>Clear Cache
+          </button>
+        </div>
       `;
     } else if (activeTab === 'appearance') {
       paneHtml = `
@@ -287,14 +297,18 @@ export class HomeDialogs {
       const metaBytes = (() => {
         try { return new Blob([localStorage.getItem('lukris_projects_meta_v1') || '']).size; } catch { return 0; }
       })();
+      const nativeCacheBytes = Number(nativeStats?.cacheBytes ?? nativeStats?.exportBytes ?? 0);
+      const totalTempBytes = metaBytes + nativeCacheBytes;
       paneHtml = `
         <h6 class="fw-semibold mb-3">Cache Management</h6>
         <div class="lk-setting-row">
           <div>
-            <div class="small fw-semibold">Asset Metadata Cache</div>
-            <div class="lk-muted-xs">Cached category indices &amp; project cards (${formatBytesShort(metaBytes)})</div>
+            <div class="small fw-semibold">Temporary Project Assets &amp; Cache</div>
+            <div class="lk-muted-xs">Temp renders, preview buffers &amp; asset indices (${formatBytesShort(totalTempBytes)}) · Saved project media stays safe</div>
           </div>
-          <button type="button" id="btnClearAssetCache" class="btn btn-sm lk-btn-secondary">Clear Cache</button>
+          <button type="button" id="btnClearAssetCache" class="btn btn-sm lk-btn-secondary">
+            <i class="bi bi-stars me-1 text-info"></i>Clear Cache
+          </button>
         </div>
         <div class="lk-setting-row">
           <div>
@@ -425,21 +439,45 @@ export class HomeDialogs {
       }
     });
 
-    body.querySelector('#btnClearAssetCache')?.addEventListener('click', () => {
-      this.app.assetManager._catalogCache.clear();
-      this.app.core.showToast('Asset & preview cache cleared', 'success');
+    const handleSafeClearCache = async (btn) => {
+      if (btn) btn.disabled = true;
+      try {
+        this.app.assetManager?._catalogCache?.clear?.();
+        const res = await ProjectStorage.clearSafeTempCache();
+        const freedLabel = res.freedBytes > 0 ? ` (${formatBytesShort(res.freedBytes)} freed)` : '';
+        const countLabel = res.deletedCount > 0 ? ` · ${res.deletedCount} temp files removed` : '';
+        this.app.core.showToast(`Cache cleared safely${countLabel}${freedLabel}`, 'success');
+        this._renderSettingsBody();
+      } catch {
+        this.app.core.showToast('In-memory cache cleared', 'success');
+      } finally {
+        if (btn) btn.disabled = false;
+      }
+    };
+
+    body.querySelector('#btnClearAssetCache')?.addEventListener('click', (e) => {
+      handleSafeClearCache(e.currentTarget);
     });
 
-    body.querySelector('#btnSettingsCleanupMedia')?.addEventListener('click', () => {
-      if (window.AndroidBridge?.cleanupUnusedNativeFiles) {
-        try {
-          const res = JSON.parse(window.AndroidBridge.cleanupUnusedNativeFiles('[]') || '{}');
-          this.app.core.showToast(`Cleaned ${res.deletedCount || 0} unused files`, 'success');
-          this._renderSettingsBody();
-          return;
-        } catch {}
+    body.querySelector('#btnGeneralClearCache')?.addEventListener('click', (e) => {
+      handleSafeClearCache(e.currentTarget);
+    });
+
+    body.querySelector('#btnSettingsCleanupMedia')?.addEventListener('click', async (e) => {
+      const btn = e.currentTarget;
+      if (btn) btn.disabled = true;
+      try {
+        const res = await ProjectStorage.clearSafeTempCache();
+        if (res.deletedCount > 0 || res.freedBytes > 0) {
+          const freedLabel = res.freedBytes > 0 ? ` (${formatBytesShort(res.freedBytes)} freed)` : '';
+          this.app.core.showToast(`Cleaned ${res.deletedCount} unused temp files${freedLabel}`, 'success');
+        } else {
+          this.app.core.showToast('Storage verified — no orphaned cache found', 'info');
+        }
+        this._renderSettingsBody();
+      } finally {
+        if (btn) btn.disabled = false;
       }
-      this.app.core.showToast('Storage verified — no orphaned cache found', 'info');
     });
   }
 
