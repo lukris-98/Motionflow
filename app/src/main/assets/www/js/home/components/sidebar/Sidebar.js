@@ -22,17 +22,7 @@ export function renderSidebar(container, { activeRoute, counts, profile, collaps
       <div class="lk-brand-row d-flex align-items-center justify-content-between gap-2">
         <button type="button" class="lk-brand-btn d-flex align-items-center gap-2 border-0 bg-transparent p-0 text-start" data-nav="home" aria-label="LUKRIS Home">
           <span class="lk-logo-mark" aria-hidden="true">
-            <svg viewBox="0 0 32 32" width="28" height="28" fill="none">
-              <defs>
-                <linearGradient id="lkLogoGrad" x1="0" y1="0" x2="32" y2="32" gradientUnits="userSpaceOnUse">
-                  <stop offset="0%" stop-color="#00D4E5"/>
-                  <stop offset="100%" stop-color="#6366F1"/>
-                </linearGradient>
-              </defs>
-              <rect x="2" y="2" width="28" height="28" rx="8" fill="url(#lkLogoGrad)" fill-opacity="0.14" stroke="url(#lkLogoGrad)" stroke-width="1.6"/>
-              <path d="M11 9.5V22.5H20.5" stroke="#F8FAFC" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
-              <circle cx="21" cy="11.5" r="2.5" fill="#00D4E5"/>
-            </svg>
+            <img src="./assets/lukris-logo.png" alt="LUKRIS" width="30" height="30" class="lk-logo-img" />
           </span>
           <span class="lk-brand-text-wrap">
             <span class="lk-brand-name">LUKRIS</span>
@@ -70,6 +60,10 @@ export function renderSidebar(container, { activeRoute, counts, profile, collaps
             <span class="lk-profile-name">${safeName}</span>
             <span class="lk-profile-plan">${safePlan}</span>
           </span>
+        </button>
+        <button type="button" class="lk-nav-item ${activeRoute === 'credits' ? 'active' : ''}" data-nav="credits" id="btnSidebarCredits" title="Hak Cipta &amp; Credit">
+          <i class="bi bi-c-circle lk-nav-icon"></i>
+          <span class="lk-nav-label">Hak Cipta &amp; Credit</span>
         </button>
         <button type="button" class="lk-nav-item" data-action="open-settings" title="Settings">
           <i class="bi bi-gear lk-nav-icon"></i>

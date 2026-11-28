@@ -73,6 +73,7 @@ export function renderTopHeader(container, { searchQuery, unreadCount, notificat
             </li>
             <li><button type="button" class="dropdown-item lk-menu-item" data-action="open-profile"><i class="bi bi-person me-2"></i>User Profile</button></li>
             <li><button type="button" class="dropdown-item lk-menu-item" data-action="open-settings"><i class="bi bi-gear me-2"></i>Settings &amp; Performance</button></li>
+            <li><button type="button" class="dropdown-item lk-menu-item" data-nav="credits"><i class="bi bi-c-circle me-2"></i>Hak Cipta &amp; Credit</button></li>
             <li><button type="button" class="dropdown-item lk-menu-item" data-action="open-help"><i class="bi bi-question-circle me-2"></i>Help &amp; Support</button></li>
           </ul>
         </div>

@@ -178,3 +178,27 @@ test('120 FPS is supported in ProjectManager, ExportEngine, timecode, and UI opt
   assert.ok(editorHtml.includes('data-fps-idx="5">120</button>'));
   assert.ok(indexHtml.includes('<option value="120">'));
 });
+
+test('Dedicated CreditsPage renders Lukris copyright and is accessible via buttons', async () => {
+  const { renderCreditsPage } = await import('../src/main/assets/www/js/home/pages/CreditsPage.js');
+  const fakeEl = { innerHTML: '' };
+  renderCreditsPage(fakeEl);
+  assert.ok(fakeEl.innerHTML.includes('Dibuat oleh Lukris'));
+  assert.ok(fakeEl.innerHTML.includes('&copy; 2026 Lukris'));
+  assert.ok(fakeEl.innerHTML.includes('data-nav="home"'));
+
+  const sidebarSrc = fs.readFileSync(path.resolve('app/src/main/assets/www/js/home/components/sidebar/Sidebar.js'), 'utf8');
+  const headerSrc = fs.readFileSync(path.resolve('app/src/main/assets/www/js/home/components/header/TopHeader.js'), 'utf8');
+  const homePageSrc = fs.readFileSync(path.resolve('app/src/main/assets/www/js/home/pages/HomePage.js'), 'utf8');
+  const homeModSrc = fs.readFileSync(path.resolve('app/src/main/assets/www/js/home/homeModule.js'), 'utf8');
+
+  assert.ok(sidebarSrc.includes('data-nav="credits"'));
+  assert.ok(sidebarSrc.includes('./assets/lukris-logo.png'));
+  assert.ok(headerSrc.includes('data-nav="credits"'));
+  assert.ok(homePageSrc.includes('data-nav="credits"'));
+  assert.ok(homeModSrc.includes("route === 'credits'"));
+
+  const creditsSrc = fs.readFileSync(path.resolve('app/src/main/assets/www/js/home/pages/CreditsPage.js'), 'utf8');
+  assert.ok(creditsSrc.includes('./assets/lukris-logo.png'));
+  assert.ok(fs.existsSync(path.resolve('app/src/main/assets/www/assets/lukris-logo.png')));
+});

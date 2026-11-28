@@ -53,6 +53,10 @@ export class LukrisHomeApp {
   async init() {
     await this.projectManager.init();
     await this.assetManager.refreshDynamicCounts();
+    try {
+      const reqPage = new URLSearchParams(window.location.search || '').get('page');
+      if (reqPage === 'credits') this.state.activeRoute = 'credits';
+    } catch {}
     this.dialogs.bindStaticModalListeners();
     this._bindDelegatedEvents();
     this._bindNativeBridge();
@@ -129,7 +133,7 @@ export class LukrisHomeApp {
   }
 
   async navigateTo(route) {
-    const valid = ['home', 'projects', 'templates', 'library', 'ai-tools', 'favorites', 'trash'];
+    const valid = ['home', 'projects', 'templates', 'library', 'ai-tools', 'favorites', 'trash', 'credits'];
     const target = valid.includes(route) ? route : 'home';
     if (this.state.activeRoute === target) {
       this._hideMobileDrawer();
@@ -237,6 +241,13 @@ export class LukrisHomeApp {
       renderAiToolsPage(mountEl, {
         aiTools: this.assetManager.getAiToolsSummary()
       });
+      return;
+    }
+
+    if (route === 'credits') {
+      const { renderCreditsPage } = await import('./pages/CreditsPage.js');
+      if (seq !== this._pageRenderSeq) return;
+      renderCreditsPage(mountEl);
     }
   }
 

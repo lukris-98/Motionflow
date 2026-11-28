@@ -56,6 +56,15 @@ export function renderHomePage(container, state) {
       })}
 
       ${renderAiToolsSection(aiTools, { compact: true })}
+
+      <footer class="lk-home-footer d-flex flex-wrap align-items-center justify-content-between gap-2">
+        <div class="lk-muted-xs">
+          &copy; 2026 <strong>Lukris</strong> · LUKRIS Studio Video &amp; Motion Editor
+        </div>
+        <button type="button" id="btnHomeOpenCredits" class="btn btn-sm lk-btn-secondary" data-nav="credits">
+          <i class="bi bi-c-circle me-1 text-info"></i>Hak Cipta &amp; Credit
+        </button>
+      </footer>
     </div>
   `;
 

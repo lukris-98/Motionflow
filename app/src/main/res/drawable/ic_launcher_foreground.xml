@@ -3,6 +3,6 @@
     <item
         android:width="66dp"
         android:height="66dp"
-        android:drawable="@drawable/ic_motionflow_fg"
+        android:drawable="@drawable/ic_lukris_fg"
         android:gravity="center" />
 </layer-list>
